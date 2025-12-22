@@ -199,18 +199,14 @@ class RobActorRolloutRefWorker(ActorRolloutRefWorker):
         import_external_libs(self.config.model.get("external_lib", None))
 
         from omegaconf import OmegaConf
-
         override_model_config = OmegaConf.to_container(self.config.model.get("override_config", OmegaConf.create()))
-        from transformers import AutoConfig, AutoImageProcessor, AutoModelForVision2Seq, AutoProcessor
 
-        from recipe.vla.models.openvla_oft.configuration_prismatic import OpenVLAConfig
-        from recipe.vla.models.openvla_oft.modeling_prismatic import OpenVLAForActionPrediction
-        from recipe.vla.models.openvla_oft.processing_prismatic import PrismaticImageProcessor, PrismaticProcessor
+        from recipe.vla.models import register_vla_models
+        register_vla_models()
 
-        AutoConfig.register("openvla", OpenVLAConfig)
-        AutoImageProcessor.register(OpenVLAConfig, PrismaticImageProcessor)
-        AutoProcessor.register(OpenVLAConfig, PrismaticProcessor)
-        AutoModelForVision2Seq.register(OpenVLAConfig, OpenVLAForActionPrediction)
+        from transformers import AutoProcessor
+        self.processor = AutoProcessor.from_pretrained(self.config.model.path, trust_remote_code=True)
+
         if self._is_actor or self._is_rollout:
             # we need the model for actor and rollout
             if self._is_actor:
