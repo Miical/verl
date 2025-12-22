@@ -108,29 +108,37 @@ class RobActorRolloutRefWorker(ActorRolloutRefWorker):
     async def rollout_mode(self):
         """Context switch hybridengine to rollout mode."""
         aggressive_empty_cache(force_sync=True)
-        fsdp_unshard_exit_stack = contextlib.ExitStack()
-        optional_state = _get_module_fsdp_state(self.actor_module_fsdp)
-        if optional_state is None:
-            self.fsdp_unshard_exit_stack = fsdp_unshard_exit_stack
-        states_and_modules = ([optional_state], [self.actor_module_fsdp])
-
         self.base_sync_done = True
+
         # important: need to manually set the random states of each tp to be identical.
         self.torch_random_states = get_torch_device().get_rng_state()
         get_torch_device().set_rng_state(self.gen_random_states)
-        for state, fsdp_module in zip(*states_and_modules, strict=False):
-            fsdp_unshard_exit_stack.enter_context(
-                _unshard_params_for_summon(
-                    module=fsdp_module,
-                    state=state,
-                    writeback=False,
-                    rank0_only=False,
-                    offload_to_cpu=False,
-                    with_grads=False,
-                )
-            )
 
-        self.fsdp_unshard_exit_stack = fsdp_unshard_exit_stack
+        if fsdp_version(self.actor_module_fsdp) == 1:
+            fsdp_unshard_exit_stack = contextlib.ExitStack()
+            optional_state = _get_module_fsdp_state(self.actor_module_fsdp)
+            if optional_state is None:
+                self.fsdp_unshard_exit_stack = fsdp_unshard_exit_stack
+            states_and_modules = ([optional_state], [self.actor_module_fsdp])
+
+            for state, fsdp_module in zip(*states_and_modules, strict=False):
+                fsdp_unshard_exit_stack.enter_context(
+                    _unshard_params_for_summon(
+                        module=fsdp_module,
+                        state=state,
+                        writeback=False,
+                        rank0_only=False,
+                        offload_to_cpu=False,
+                        with_grads=False,
+                    )
+                )
+
+            self.fsdp_unshard_exit_stack = fsdp_unshard_exit_stack
+        elif fsdp_version(self.actor_module_fsdp) == 2:
+            self.actor_module_fsdp.unshard()
+        else:
+            raise NotImplementedError(f"Unsupported fsdp version {fsdp_version(self.actor_module_fsdp)}")
+
         logger.info("rollout mode")
 
     async def trainer_mode(self):
@@ -140,15 +148,21 @@ class RobActorRolloutRefWorker(ActorRolloutRefWorker):
 
         # add empty cache after each compute
         aggressive_empty_cache(force_sync=True)
-
         set_expandable_segments(True)
 
         # restore random states
         self.gen_random_states = get_torch_device().get_rng_state()
         get_torch_device().set_rng_state(self.torch_random_states)
-        if self.fsdp_unshard_exit_stack is not None:
-            self.fsdp_unshard_exit_stack.close()
-            self.fsdp_unshard_exit_stack = None
+
+        if fsdp_version(self.actor_module_fsdp) == 1:
+            if self.fsdp_unshard_exit_stack is not None:
+                self.fsdp_unshard_exit_stack.close()
+                self.fsdp_unshard_exit_stack = None
+        elif fsdp_version(self.actor_module_fsdp) == 2:
+            self.actor_module_fsdp.reshard()
+        else:
+            raise NotImplementedError(f"Unsupported fsdp version {fsdp_version(self.actor_module_fsdp)}")
+
         logger.info("trainer mode")
 
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="rollout"), blocking=False)
