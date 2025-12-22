@@ -72,20 +72,24 @@ class RobActorRolloutRefWorker(ActorRolloutRefWorker):
         self.gen_random_states = get_torch_device().get_rng_state()
         get_torch_device().set_rng_state(self.torch_random_states)
 
-        if torch.distributed.get_world_size() == 1 and fsdp_version(self.actor_module_fsdp) == 1:
+        fsdp_ver = fsdp_version(self.actor_module_fsdp)
+        if torch.distributed.get_world_size() == 1 and fsdp_ver == 1:
             FSDP.set_state_dict_type(
                 self.actor_module_fsdp,
                 state_dict_type=StateDictType.FULL_STATE_DICT,
                 state_dict_config=FullStateDictConfig(),
             )
-        elif fsdp_version(self.actor_module_fsdp) == 1:
+        elif fsdp_ver == 1:
             FSDP.set_state_dict_type(
                 self.actor_module_fsdp,
                 state_dict_type=StateDictType.SHARDED_STATE_DICT,
                 state_dict_config=ShardedStateDictConfig(),
             )
+        elif fsdp_ver == 2:
+            # FSDP2 already handles state dict logic via torch.distributed.checkpoint APIs.
+            pass
         else:
-            raise NotImplementedError(f"Unsupported fsdp version {fsdp_version(self.actor_module_fsdp)}")
+            raise NotImplementedError(f"Unsupported fsdp version {fsdp_ver}")
 
         self._register_dispatch_collect_info("rollout", dp_rank=self.rank, is_collect=True)
         self.rollout = NaiveRolloutRob(module=self.actor_module_fsdp, model_config=self.config.model)
