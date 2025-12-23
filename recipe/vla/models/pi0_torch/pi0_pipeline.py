@@ -89,7 +89,7 @@ class Pi0Pipeline():
     def __call__(
         self,
         images: dict[str, torch.Tensor],
-        task: str,
+        task: list[str],
         state: torch.Tensor,
     ) -> torch.Tensor:
         """Run one forward pass from raw inputs to final action sequence.
@@ -100,7 +100,7 @@ class Pi0Pipeline():
             state: The robot joint state tensor with shape (state_dim,).
 
         Returns:
-            A tensor of predicted actions with shape (num_steps, original_action_dim) on the original input device.
+            A tensor of predicted actions with shape (batch, num_steps, original_action_dim) on the original input device.
         """
         # Input transforms
         ori_device = state.device
@@ -108,28 +108,20 @@ class Pi0Pipeline():
         for key in images:
             images[key] = images[key].to(self.device)
 
-        state = self.aloha_inputs_transform({'observation.state': state})['observation.state']
+        state = self.aloha_inputs_transform.call_batch({'observation.state': state})['observation.state']
         state = self.state_normalize_transform(state)
-        images, img_masks = self.image_transform(images)
-        lang_tokens, lang_masks = self.prompt_tokenizer_transform({'task': task, 'observation.state': state})
+        images, img_masks = self.image_transform.call_batch(images)
+        lang_tokens, lang_masks = self.prompt_tokenizer_transform.call_batch({'task': task, 'observation.state': state})
         state = self.pad_states_and_actions_transform({'observation.state': state})['observation.state']
-
-        state = state[None, ...]
-        for i in range(len(images)):
-            images[i] = images[i][None, ...]
-            img_masks[i] = img_masks[i][None, ...]
-        lang_tokens = lang_tokens[None, ...]
-        lang_masks = lang_masks[None, ...]
 
         # Inference
         pred_action = self.policy.sample_actions(images, img_masks, lang_tokens, lang_masks, state=state)
 
         # Output transforms
-        output_dict = {'action': pred_action[0], 'observation.state': state[0]}
+        output_dict = {'action': pred_action, 'observation.state': state}
         output_dict['observation.state'] = self.state_unnormalize_transform(output_dict['observation.state'])
         output_dict['action'] = self.action_unnormalize_transform(output_dict['action'])
         output_dict = self.absolute_actions_transform(output_dict)
-        pred_action = self.aloha_outputs_transform(output_dict)['action'].to(ori_device)
+        pred_action = self.aloha_outputs_transform.call_batch(output_dict)['action'].to(ori_device)
 
         return pred_action, images, img_masks, lang_tokens, lang_masks, state
-

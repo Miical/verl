@@ -35,6 +35,7 @@ from recipe.vla.models.openvla_oft.processing_prismatic import PrismaticProcesso
 from recipe.vla.models.pi0_torch import Pi0Pipeline
 from verl import DataProto
 from verl.utils.device import get_device_id, get_device_name, get_torch_device
+from verl.utils.profiler import simple_timer
 from verl.workers.rollout.base import BaseRollout
 
 logger = logging.getLogger(__name__)
@@ -314,17 +315,17 @@ class PI0RolloutRob(NaiveRolloutRob):
         images = prompts.batch["full_image"]
         state = prompts.batch["state"]
         task_descriptions = prompts.non_tensor_batch["task_descriptions"]
-        actions = []
-        full_actions = []
-        all_images = []
-        all_img_masks = []
-        all_lang_tokens = []
-        all_lang_masks = []
-        all_states = []
 
-        # TODO(liu jincheng): Batch Inference
-        for i in range(images.shape[0]):
+        timing_generate = {}
+        with simple_timer("pi0_generate_loop", timing_generate):
             with torch.autocast(device_type=get_device_name(), dtype=torch.bfloat16), torch.no_grad():
+                batch_size = images.shape[0]
+                cam_high = images.permute(0, 3, 1, 2).to(prompts.batch.device, dtype=torch.float32)
+                zeros = torch.zeros(
+                    (batch_size, 3, cam_high.shape[2], cam_high.shape[3]),
+                    device=prompts.batch.device,
+                    dtype=torch.float32,
+                )
                 (
                     action,
                     images_out,
@@ -334,36 +335,27 @@ class PI0RolloutRob(NaiveRolloutRob):
                     state_out,
                 ) = self.pipeline(
                     images={
-                        "observation.images.cam_high": images[i].permute(2, 0, 1).to(
-                            prompts.batch.device, dtype=torch.float32),
-                        "observation.images.cam_left_wrist": torch.zeros(3, 512, 512).to(
-                            prompts.batch.device, dtype=torch.float32),
-                        "observation.images.cam_right_wrist": torch.zeros(3, 512, 512).to(
-                            prompts.batch.device, dtype=torch.float32),
+                        "observation.images.cam_high": cam_high,
+                        "observation.images.cam_left_wrist": zeros,
+                        "observation.images.cam_right_wrist": zeros,
                     },
-                    task=task_descriptions[i],
+                    task=task_descriptions.tolist() if hasattr(task_descriptions, "tolist") else list(task_descriptions),
                     state=torch.nn.functional.pad(
-                        state[i], (0, max(0, 32 - state[i].shape[0])), "constant", 0,
+                        state, (0, max(0, 32 - state.shape[-1])), "constant", 0,
                     ).to(prompts.batch.device, dtype=torch.float32),
                 )
 
-            actions.append(action[:, :7])
-            full_actions.append(action)
-            all_images.append(torch.stack(images_out, dim=0).squeeze(1))
-            all_img_masks.append(torch.stack(img_masks, dim=0).squeeze(1))
-            all_lang_tokens.append(lang_tokens.squeeze(0))
-            all_lang_masks.append(lang_masks.squeeze(0))
-            all_states.append(state_out.squeeze(0))
+        print("pi0_generate_loop time (s): %s" % timing_generate.get("pi0_generate_loop", 0.0))
 
         ret = DataProto.from_dict(
             {
-                "action": torch.stack(actions, dim=0),
-                "full_action": torch.stack(full_actions, dim=0),
-                "images": torch.stack(all_images, dim=0),
-                "image_masks": torch.stack(all_img_masks, dim=0),
-                "lang_tokens": torch.stack(all_lang_tokens, dim=0),
-                "lang_masks": torch.stack(all_lang_masks, dim=0),
-                "states": torch.stack(all_states, dim=0),
+                "action": action[..., :7],
+                "full_action": action,
+                "images": torch.stack(images_out, dim=1),
+                "image_masks": torch.stack(img_masks, dim=1),
+                "lang_tokens": lang_tokens,
+                "lang_masks": lang_masks,
+                "states": state_out,
             }
         )
 

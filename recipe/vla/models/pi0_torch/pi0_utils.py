@@ -188,6 +188,29 @@ class AlohaInputs:
             data['action'] = actions
         return data
 
+    # VeRL: Batch Inference
+
+    def _encode_actions_inv_batch(self, actions: torch.Tensor) -> torch.Tensor:
+        if self.adapt_to_pi:
+            actions[..., :14] = self.joint_flip_mask * actions[..., :14]
+            actions[..., [6, 13]] = self._gripper_from_angular_inv(actions[..., [6, 13]])
+        return actions
+
+    def _decode_state_batch(self, state: torch.Tensor) -> torch.Tensor:
+        if self.adapt_to_pi:
+            state[..., :14] = self.joint_flip_mask * state[..., :14]
+            state[..., [6, 13]] = self._gripper_to_angular(state[..., [6, 13]])
+        return state
+
+    def call_batch(self, data: dict[str, Any]) -> dict[str, Any]:
+        state = self._decode_state_batch(data['observation.state'])
+        data['observation.state'] = state
+        if 'action' in data:
+            actions = data['action']
+            actions = self._encode_actions_inv_batch(actions)
+            data['action'] = actions
+        return data
+
 
 class AlohaOutputs:
     """Outputs for the Aloha policy."""
@@ -228,6 +251,18 @@ class AlohaOutputs:
     def __call__(self, data: dict[str, Any]) -> dict[str, Any]:
         actions = data['action'][:, : self.original_action_dim]
         return {'action': self._encode_actions(actions)}
+
+    # VeRL: Batch Inference
+
+    def _encode_actions_batch(self, actions: torch.Tensor) -> torch.Tensor:
+        if self.adapt_to_pi:
+            actions[..., :14] = self.joint_flip_mask * actions[..., :14]
+            actions[..., [6, 13]] = self._gripper_from_angular(actions[..., [6, 13]])
+        return actions
+
+    def call_batch(self, data: dict[str, Any]) -> dict[str, Any]:
+        actions = data['action'][..., : self.original_action_dim]
+        return {'action': self._encode_actions_batch(actions)}
 
 
 class PadStatesAndActions:
@@ -362,6 +397,51 @@ class ImageTransform:
 
         return images, img_masks
 
+    # VeRL: Batch Inference
+
+    def call_batch(self, data: dict[str, torch.Tensor]) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
+        images = []
+        img_masks = []
+
+        for key in self.present_img_keys:
+            if key not in data:
+                raise ValueError(f'{key} not found in data. Please check the present_img_keys in the config or the dataset.')
+
+            img = data[key]
+            if img.ndim != 4:
+                raise ValueError(f'(B,C,H,W) expected, but got {img.shape}')
+
+            if self.resize_imgs_with_padding is not None:
+                original_height, original_width = img.shape[2:]
+                target_height, target_width = self.resize_imgs_with_padding
+                if original_height != target_height or original_width != target_width:
+                    ratio = max(original_width / target_width, original_height / target_height)
+                    resized_height = int(original_height / ratio)
+                    resized_width = int(original_width / ratio)
+                    img = F.interpolate(img, size=(resized_height, resized_width), mode='bilinear', align_corners=False)
+                    pad_height = max(0, int(target_height - resized_height))
+                    pad_width = max(0, int(target_width - resized_width))
+                    pad_top = pad_height // 2
+                    pad_bottom = pad_height - pad_top
+                    pad_left = pad_width // 2
+                    pad_right = pad_width - pad_left
+                    img = F.pad(img, (pad_left, pad_right, pad_top, pad_bottom), value=0)
+
+            if self.enable_image_aug:
+                imgs = []
+                for sample in img:
+                    if 'wrist' not in key:
+                        sample = self.pose_transform(sample)
+                    sample = self.color_jitter_transform(sample)
+                    imgs.append(sample)
+                img = torch.stack(imgs, dim=0)
+
+            img = img * 2.0 - 1.0
+            images.append(img)
+            img_masks.append(torch.ones((img.shape[0],), dtype=torch.bool, device=img.device))
+
+        return images, img_masks
+
 
 class PromptTokenizerTransform:
     def __init__(self, tokenizer_model_path: str, max_length: int, discrete_state_input: bool = False) -> None:
@@ -401,5 +481,43 @@ class PromptTokenizerTransform:
         )
         lang_tokens = tokenized_prompt['input_ids'][0].to(dtype=torch.int32, device=device)
         lang_masks = tokenized_prompt['attention_mask'][0].to(dtype=torch.bool, device=device)
+
+        return lang_tokens, lang_masks
+
+    # VeRL: Batch Inference
+
+    def call_batch(self, data: dict[str, Any]) -> tuple[torch.Tensor, torch.Tensor]:
+        task = data['task']
+        if hasattr(task, "tolist") and not isinstance(task, str):
+            tasks = task.tolist()
+        else:
+            tasks = list(task)
+        tasks = [str(t).strip().replace('_', ' ').replace('\n', ' ') for t in tasks]
+
+        device = data['observation.state'].device if 'observation.state' in data else torch.device('cpu')
+
+        if self.discrete_state_input:
+            assert 'observation.state' in data, 'discrete_state_input is True, but observation.state is not found.'
+            state = data['observation.state']
+            discretized_state = torch.bucketize(
+                state, torch.linspace(-1, 1, 256 + 1, device=device)[:-1]
+            ) - 1
+            state_values = [' '.join([str(int(x)) for x in row.tolist()]) for row in discretized_state]
+            tasks = [
+                f'Task: {task_item}, State: {state_value};\nAction: '
+                for task_item, state_value in zip(tasks, state_values)
+            ]
+        else:
+            tasks = [f'{task_item}\n' for task_item in tasks]
+
+        tokenized_prompt = self.tokenizer(
+            tasks,
+            padding='max_length',
+            padding_side='right',
+            max_length=self.tokenizer_max_length,
+            return_tensors='pt',
+        )
+        lang_tokens = tokenized_prompt['input_ids'].to(dtype=torch.int32, device=device)
+        lang_masks = tokenized_prompt['attention_mask'].to(dtype=torch.bool, device=device)
 
         return lang_tokens, lang_masks
