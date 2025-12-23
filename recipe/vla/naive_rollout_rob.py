@@ -32,6 +32,7 @@ from torch.nn.utils.rnn import pad_sequence
 from recipe.vla.envs.action_utils import center_crop_image, resize_image
 from recipe.vla.models.openvla_oft.modeling_prismatic import OpenVLAForActionPrediction
 from recipe.vla.models.openvla_oft.processing_prismatic import PrismaticProcessor
+from recipe.vla.models.pi0_torch import Pi0Pipeline
 from verl import DataProto
 from verl.utils.device import get_device_id, get_device_name, get_torch_device
 from verl.workers.rollout.base import BaseRollout
@@ -39,7 +40,7 @@ from verl.workers.rollout.base import BaseRollout
 logger = logging.getLogger(__name__)
 
 
-__all__ = ["NaiveRolloutRob"]
+__all__ = ["NaiveRolloutRob", "PI0RolloutRob"]
 
 
 def pad_sequence_to_length(tensors, max_seq_len, pad_token_id, left_pad=False):
@@ -224,3 +225,146 @@ class NaiveRolloutRob(BaseRollout):
             logger.info(f"Resuming rollout model to device: {target_device}.")
             self.module.to(target_device)
             self.device = torch.device(target_device)
+
+class PI0RolloutRob(NaiveRolloutRob):
+    def __init__(
+        self,
+        model_config: dict,
+        module: torch.nn.Module,
+    ):
+        self.model_config = model_config
+        self.module = module
+        self.module.eval()
+
+        self.pipeline = Pi0Pipeline(
+            self.module.policy,
+            tokenizer_model_path='google/paligemma-3b-pt-224',
+            state_norm_stats={'mean': [0.0] * 32, 'std': [1.0] * 32},
+            action_norm_stats={'mean': [0.0] * 32, 'std': [1.0] * 32},
+            original_action_dim=32,
+        )
+        self.pipeline.to(module.device)
+        # self.pipeline.compile(fullgraph=True)
+
+        # dummy forward
+        with torch.no_grad(), torch.autocast(device_type=get_device_name(), dtype=torch.bfloat16):
+            _ = self.module(
+                images=[torch.zeros((1, 3, 224, 224), device=self.pipeline.device, dtype=torch.float32)],
+                img_masks=[torch.ones((1,), device=self.pipeline.device, dtype=torch.bool)],
+                lang_tokens=torch.zeros((1, 1), device=self.pipeline.device, dtype=torch.long),
+                lang_masks=torch.ones((1, 1), device=self.pipeline.device, dtype=torch.bool),
+                state=torch.zeros((1, self.module.policy.max_state_dim), device=self.pipeline.device, dtype=torch.float32),
+                x_t=self.module.policy.sample_noise(
+                    (1, self.module.policy.n_action_steps, self.module.policy.max_action_dim),
+                    device=self.pipeline.device,
+                ),
+                timestep=torch.full((1,), 0.5, device=self.pipeline.device, dtype=torch.float32),
+            )
+
+    @torch.no_grad()
+    def generate_sequences(self, prompts: DataProto) -> DataProto:
+        """Generate sequences
+
+        Example prompts:
+            DataProto(
+            batch = TensorDict(
+                fields = {
+                full_image: Tensor(
+                    shape = torch.Size([4, 512, 512, 3]),
+                    device = cuda:0,
+                    dtype = torch.uint8,
+                    is_shared = True
+                ),
+                state: Tensor(
+                    shape = torch.Size([4, 7]),
+                    device = cuda:0,
+                    dtype = torch.float32,
+                    is_shared = True
+                )
+                },
+                batch_size = torch.Size([4]),
+                device = cuda:0,
+                is_shared = True
+            ),
+
+            non_tensor_batch = {
+                'task_descriptions': array(
+                [
+                    'put both moka pots on the stove',
+                    'put both moka pots on the stove',
+                    'put both moka pots on the stove',
+                    'put both moka pots on the stove'
+                ],
+                dtype = object
+                )
+            },
+
+            meta_info = {
+                'global_steps': 1,
+                'do_sample': True,
+                'temperature': 1.6,
+                'prompt_length': 512,
+                'eos_token_id': None,
+                'n_samples': 8,
+                'pad_token_id': None
+            }
+            )
+        """
+
+        images = prompts.batch["full_image"]
+        state = prompts.batch["state"]
+        task_descriptions = prompts.non_tensor_batch["task_descriptions"]
+        actions = []
+        full_actions = []
+        all_images = []
+        all_img_masks = []
+        all_lang_tokens = []
+        all_lang_masks = []
+        all_states = []
+
+        # TODO(liu jincheng): Batch Inference
+        for i in range(images.shape[0]):
+            with torch.autocast(device_type=get_device_name(), dtype=torch.bfloat16), torch.no_grad():
+                (
+                    action,
+                    images_out,
+                    img_masks,
+                    lang_tokens,
+                    lang_masks,
+                    state_out,
+                ) = self.pipeline(
+                    images={
+                        "observation.images.cam_high": images[i].permute(2, 0, 1).to(
+                            prompts.batch.device, dtype=torch.float32),
+                        "observation.images.cam_left_wrist": torch.zeros(3, 512, 512).to(
+                            prompts.batch.device, dtype=torch.float32),
+                        "observation.images.cam_right_wrist": torch.zeros(3, 512, 512).to(
+                            prompts.batch.device, dtype=torch.float32),
+                    },
+                    task=task_descriptions[i],
+                    state=torch.nn.functional.pad(
+                        state[i], (0, max(0, 32 - state[i].shape[0])), "constant", 0,
+                    ).to(prompts.batch.device, dtype=torch.float32),
+                )
+
+            actions.append(action[:, :7])
+            full_actions.append(action)
+            all_images.append(torch.stack(images_out, dim=0).squeeze(1))
+            all_img_masks.append(torch.stack(img_masks, dim=0).squeeze(1))
+            all_lang_tokens.append(lang_tokens.squeeze(0))
+            all_lang_masks.append(lang_masks.squeeze(0))
+            all_states.append(state_out.squeeze(0))
+
+        ret = DataProto.from_dict(
+            {
+                "action": torch.stack(actions, dim=0),
+                "full_action": torch.stack(full_actions, dim=0),
+                "images": torch.stack(all_images, dim=0),
+                "image_masks": torch.stack(all_img_masks, dim=0),
+                "lang_tokens": torch.stack(all_lang_tokens, dim=0),
+                "lang_masks": torch.stack(all_lang_masks, dim=0),
+                "states": torch.stack(all_states, dim=0),
+            }
+        )
+
+        return ret
