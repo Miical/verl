@@ -19,10 +19,12 @@ import asyncio
 import contextlib
 import logging
 import os
+from packaging import version
 
 import torch
 import torch.distributed
 from torch.distributed.device_mesh import init_device_mesh
+from torch.distributed.fsdp import FSDPModule
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.distributed.fsdp._unshard_param_utils import _get_module_fsdp_state, _unshard_params_for_summon
 from torch.distributed.fsdp.api import FullStateDictConfig, ShardedStateDictConfig, StateDictType
@@ -33,7 +35,7 @@ from verl.utils.checkpoint.fsdp_checkpoint_manager import FSDPCheckpointManager
 from verl.utils.config import omega_conf_to_dataclass
 from verl.utils.device import get_device_id, get_device_name, get_torch_device, set_expandable_segments
 from verl.utils.flops_counter import FlopsCounter
-from verl.utils.fsdp_utils import fsdp_version
+from verl.utils.fsdp_utils import fsdp_version, set_reshard_after_forward
 from verl.utils.import_utils import import_external_libs
 from verl.utils.memory_utils import aggressive_empty_cache
 from verl.utils.profiler import DistProfiler, log_gpu_memory_usage, simple_timer
@@ -111,6 +113,9 @@ class RobActorRolloutRefWorker(ActorRolloutRefWorker):
 
     async def rollout_mode(self):
         """Context switch hybridengine to rollout mode."""
+
+        self.actor_module_fsdp.eval()
+
         aggressive_empty_cache(force_sync=True)
         self.base_sync_done = True
 
@@ -140,6 +145,13 @@ class RobActorRolloutRefWorker(ActorRolloutRefWorker):
             self.fsdp_unshard_exit_stack = fsdp_unshard_exit_stack
         elif fsdp_version(self.actor_module_fsdp) == 2:
             self.actor_module_fsdp.unshard()
+            for m in self.actor_module_fsdp.modules():
+                if isinstance(m, FSDPModule) or hasattr(m, "unshard"):
+                    m.unshard()
+            if version.parse(torch.__version__) < version.parse("2.8"):
+                set_reshard_after_forward(self.actor_module_fsdp, False)
+            else:
+                self.actor_module_fsdp.set_reshard_after_forward(False)
         else:
             raise NotImplementedError(f"Unsupported fsdp version {fsdp_version(self.actor_module_fsdp)}")
 
@@ -164,6 +176,13 @@ class RobActorRolloutRefWorker(ActorRolloutRefWorker):
                 self.fsdp_unshard_exit_stack = None
         elif fsdp_version(self.actor_module_fsdp) == 2:
             self.actor_module_fsdp.reshard()
+            for m in self.actor_module_fsdp.modules():
+                if isinstance(m, FSDPModule) or hasattr(m, "reshard"):
+                    m.reshard()
+            if version.parse(torch.__version__) < version.parse("2.8"):
+                set_reshard_after_forward(self.actor_module_fsdp, True)
+            else:
+                self.actor_module_fsdp.set_reshard_after_forward(True)
         else:
             raise NotImplementedError(f"Unsupported fsdp version {fsdp_version(self.actor_module_fsdp)}")
 
