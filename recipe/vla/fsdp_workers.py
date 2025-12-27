@@ -59,6 +59,7 @@ class RobActorRolloutRefWorker(ActorRolloutRefWorker):
 
     def _build_rollout(self, trust_remote_code=False):
         from recipe.vla.naive_rollout_rob import NaiveRolloutRob
+        from recipe.vla.sac.naive_rollout_pi05 import PI0RolloutRob
 
         self.base_sync_done = False
         world_size = torch.distributed.get_world_size()
@@ -94,7 +95,8 @@ class RobActorRolloutRefWorker(ActorRolloutRefWorker):
             raise NotImplementedError(f"Unsupported fsdp version {fsdp_ver}")
 
         self._register_dispatch_collect_info("rollout", dp_rank=self.rank, is_collect=True)
-        self.rollout = NaiveRolloutRob(module=self.actor_module_fsdp, model_config=self.config.model)
+        # TODO(liujincheng): configurable
+        self.rollout = PI0RolloutRob(module=self.actor_module_fsdp, model_config=self.config.model)
 
         model_config: HFModelConfig = omega_conf_to_dataclass(self.config.model, dataclass_type=HFModelConfig)
         self.model_config = model_config
@@ -230,7 +232,8 @@ class RobActorRolloutRefWorker(ActorRolloutRefWorker):
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def init_model(self):
-        from recipe.vla.dp_rob import RobDataParallelPPOActor
+        # from recipe.vla.dp_rob import RobDataParallelPPOActor
+        from recipe.vla.sac.sac_actor import PI0RobDataParallelPPOActor
 
         # This is used to import external_lib into the huggingface systems
         import_external_libs(self.config.model.get("external_lib", None))
@@ -269,7 +272,8 @@ class RobActorRolloutRefWorker(ActorRolloutRefWorker):
 
         if self._is_actor:
             OmegaConf.set_struct(self.config.actor, True)
-            self.actor = RobDataParallelPPOActor(
+            # TODO(liujincheng): configurable
+            self.actor = PI0RobDataParallelPPOActor(
                 config=self.config.actor, actor_module=self.actor_module_fsdp, actor_optimizer=self.actor_optimizer
             )
 

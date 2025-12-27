@@ -213,7 +213,6 @@ class PI0RobDataParallelPPOActor(BasePPOActor):
             for micro_batch in micro_batches:
                 micro_batch = micro_batch.to(get_device_id())  # actor device is cpu when using offload
                 bsz = micro_batch['full_action'].shape[0]
-                print("micro_batch bsz", bsz)
                 loss = self.forward_step({
                     'images': list(micro_batch['images'].unbind(1)),
                     'image_masks': list(micro_batch['image_masks'].unbind(1)),
