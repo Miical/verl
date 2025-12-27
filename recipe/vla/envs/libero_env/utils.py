@@ -23,20 +23,24 @@ import numpy as np
 from recipe.vla.envs.action_utils import resize_image
 
 
-def get_libero_image(obs: dict[str, np.ndarray]) -> np.ndarray:
+def get_libero_image(obs: dict[str, np.ndarray], resize_size: int | tuple[int, int]) -> np.ndarray:
     """
     Extracts image from observations and preprocesses it.
 
     Args:
         obs: Observation dictionary from LIBERO environment
+        resize_size: Target size for resizing
 
     Returns:
         Preprocessed image as numpy array
     """
+    assert isinstance(resize_size, int) or isinstance(resize_size, tuple)
+    if isinstance(resize_size, int):
+        resize_size = (resize_size, resize_size)
     img = obs["agentview_image"]
     img = img[::-1, ::-1]  # IMPORTANT: rotate 180 degrees to match train preprocessing
+    img = resize_image(img, resize_size)
     return img
-
 
 def get_libero_wrist_image(obs: dict[str, np.ndarray], resize_size: int | tuple[int, int]) -> np.ndarray:
     """
@@ -56,7 +60,6 @@ def get_libero_wrist_image(obs: dict[str, np.ndarray], resize_size: int | tuple[
     img = img[::-1, ::-1]  # IMPORTANT: rotate 180 degrees to match train preprocessing
     img = resize_image(img, resize_size)
     return img
-
 
 def quat2axisangle(quat: np.ndarray) -> np.ndarray:
     """

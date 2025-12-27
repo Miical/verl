@@ -1,12 +1,8 @@
 import torch
 
 from .pi0_utils import (
-    AbsoluteActions,
-    AlohaInputs,
-    AlohaOutputs,
     ImageTransform,
     Normalize,
-    PadStatesAndActions,
     PromptTokenizerTransform,
     Unnormalize,
 )
@@ -19,7 +15,6 @@ class Pi0Pipeline():
 
     def __init__(
         self,
-        # model_path: str,
         policy,
         tokenizer_model_path: str,
         state_norm_stats: dict,
@@ -41,22 +36,18 @@ class Pi0Pipeline():
         self.device = 'cpu'
         self.pi05_enabled = self.policy.pi05_enabled
         # Input transforms
-        self.aloha_inputs_transform = AlohaInputs()
         self.state_normalize_transform = Normalize(state_norm_stats, use_quantiles=self.pi05_enabled)
-        self.pad_states_and_actions_transform = PadStatesAndActions(action_dim=32)
         self.image_transform = ImageTransform(
             resize_imgs_with_padding=(224, 224),
             enable_image_aug=False,
         )
         max_length = 200 if self.pi05_enabled else 48
         self.prompt_tokenizer_transform = PromptTokenizerTransform(
-            tokenizer_model_path=tokenizer_model_path, max_length=max_length, discrete_state_input=self.pi05_enabled
+            tokenizer_model_path=tokenizer_model_path, max_length=max_length, discrete_state_input=False
         )
         # Output transforms
         self.state_unnormalize_transform = Unnormalize(state_norm_stats, use_quantiles=self.pi05_enabled)
         self.action_unnormalize_transform = Unnormalize(action_norm_stats, use_quantiles=self.pi05_enabled)
-        self.absolute_actions_transform = AbsoluteActions()
-        self.aloha_outputs_transform = AlohaOutputs(original_action_dim=original_action_dim)
 
     def to(self, device: torch.device | str):
         """Move the policy and all transforms to the specified device.
@@ -69,12 +60,9 @@ class Pi0Pipeline():
         """
         self.device = device
         self.policy.to(device)
-        self.aloha_inputs_transform.to(device)
         self.state_normalize_transform.to(device)
         self.state_unnormalize_transform.to(device)
         self.action_unnormalize_transform.to(device)
-        self.absolute_actions_transform.to(device)
-        self.aloha_outputs_transform.to(device)
         return self
 
     def compile(self, **kwargs) -> None:
@@ -108,20 +96,23 @@ class Pi0Pipeline():
         for key in images:
             images[key] = images[key].to(self.device)
 
-        state = self.aloha_inputs_transform.call_batch({'observation.state': state})['observation.state']
         state = self.state_normalize_transform(state)
         images, img_masks = self.image_transform.call_batch(images)
+
+        bsize = state.shape[0]
+        img_masks = [
+            torch.ones((bsize,), device=self.device, dtype=torch.bool),
+            torch.ones((bsize,), device=self.device, dtype=torch.bool),
+            torch.zeros((bsize,), device=self.device, dtype=torch.bool),
+        ]
+
         lang_tokens, lang_masks = self.prompt_tokenizer_transform.call_batch({'task': task, 'observation.state': state})
-        state = self.pad_states_and_actions_transform({'observation.state': state})['observation.state']
 
         # Inference
         pred_action = self.policy.sample_actions(images, img_masks, lang_tokens, lang_masks, state=state)
 
         # Output transforms
-        output_dict = {'action': pred_action, 'observation.state': state}
-        output_dict['observation.state'] = self.state_unnormalize_transform(output_dict['observation.state'])
-        output_dict['action'] = self.action_unnormalize_transform(output_dict['action'])
-        output_dict = self.absolute_actions_transform(output_dict)
-        pred_action = self.aloha_outputs_transform.call_batch(output_dict)['action'].to(ori_device)
+        state = self.state_unnormalize_transform(state)
+        pred_action = self.action_unnormalize_transform(pred_action)
 
         return pred_action, images, img_masks, lang_tokens, lang_masks, state

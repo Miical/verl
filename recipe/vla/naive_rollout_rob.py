@@ -240,14 +240,93 @@ class PI0RolloutRob(NaiveRolloutRob):
         self.pipeline = Pi0Pipeline(
             self.module.policy,
             tokenizer_model_path='google/paligemma-3b-pt-224',
-            state_norm_stats={'mean': [0.0] * 32, 'std': [1.0] * 32},
-            action_norm_stats={'mean': [0.0] * 32, 'std': [1.0] * 32},
+            # TODO(liujincheng): pass in using the configuration file
+            state_norm_stats={
+                'mean': [
+                    -0.04363870248198509,
+                    0.03525487706065178,
+                    0.7637033462524414,
+                    2.9673683643341064,
+                    -0.2108035385608673,
+                    -0.1297520250082016,
+                    0.027788693085312843,
+                    -0.028010232374072075,
+                ] + [0.0] * (32 - 8),
+                'std': [
+                    0.10337679088115692,
+                    0.15188011527061462,
+                    0.38154250383377075,
+                    0.3545231223106384,
+                    0.929176390171051,
+                    0.330748051404953,
+                    0.014128931798040867,
+                    0.013960899785161018,
+                ] + [1.0] * (32 - 8),
+                'q01': [
+                    -0.3524468903720379,
+                    -0.26824864755272865,
+                    0.04083745917417109,
+                    1.5317653684616088,
+                    -2.7152330031871794,
+                    -1.076538143157959,
+                    0.001715825623134151,
+                    -0.04003722561979666,
+                ] + [-1.0] * (32 - 8),
+                'q99': [
+                    0.13891278689503672,
+                    0.3251991607129573,
+                    1.2568962905768304,
+                    3.26276856803894,
+                    2.4437233173847197,
+                    0.5638469840288161,
+                    0.04030780866963323,
+                    -0.0017131616945378486,
+                ] + [1.0] * (32 - 8),
+            },
+            action_norm_stats={
+                'mean': [
+                    0.026827840134501457,
+                    0.08886060863733292,
+                    -0.09983397275209427,
+                    0.00024006747116800398,
+                    0.0012838079128414392,
+                    -0.0029443209059536457,
+                    -0.1305243819952011,
+                ] + [0.0] * (32 - 7),
+                'std': [
+                    0.3311910927295685,
+                    0.37191954255104065,
+                    0.45225635170936584,
+                    0.03948824852705002,
+                    0.06278067082166672,
+                    0.07317619770765305,
+                    0.9914451241493225,
+                ] + [1.0] * (32 - 7),
+                'q01': [
+                    -0.747375,
+                    -0.796125,
+                    -0.9375,
+                    -0.11580300460159779,
+                    -0.16942972007393836,
+                    -0.194502209174633,
+                    -1.0,
+                ] + [-1.0] * (32 - 7),
+                'q99': [
+                    0.937125,
+                    0.8594999999999999,
+                    0.937125,
+                    0.1402260055720806,
+                    0.18103543001413347,
+                    0.3115457148551941,
+                    0.9996,
+                ] + [1.0] * (32 - 7),
+            },
             original_action_dim=32,
         )
         self.pipeline.to(module.device)
         # self.pipeline.compile(fullgraph=True)
 
-        # dummy forward
+        # Perform a dummy forward in order to initialize fsdp
         with torch.no_grad(), torch.autocast(device_type=get_device_name(), dtype=torch.bfloat16):
             _ = self.module(
                 images=[torch.zeros((1, 3, 224, 224), device=self.pipeline.device, dtype=torch.float32)],
@@ -313,18 +392,20 @@ class PI0RolloutRob(NaiveRolloutRob):
         """
 
         images = prompts.batch["full_image"]
+        wrist_images = prompts.batch["wrist_image"]
         state = prompts.batch["state"]
         task_descriptions = prompts.non_tensor_batch["task_descriptions"]
 
         timing_generate = {}
-        with simple_timer("pi0_generate_loop", timing_generate):
-            with torch.autocast(device_type=get_device_name(), dtype=torch.bfloat16), torch.no_grad():
+        with simple_timer("rollout generate_sequences", timing_generate):
+            with torch.autocast(device_type=get_device_name(), dtype=torch.bfloat16):
                 batch_size = images.shape[0]
-                cam_high = images.permute(0, 3, 1, 2).to(prompts.batch.device, dtype=torch.float32)
+                cam_high = images.permute(0, 3, 1, 2).to(prompts.batch.device)
+                left_wrist = wrist_images.permute(0, 3, 1, 2).to(prompts.batch.device)
                 zeros = torch.zeros(
                     (batch_size, 3, cam_high.shape[2], cam_high.shape[3]),
                     device=prompts.batch.device,
-                    dtype=torch.float32,
+                    dtype=torch.uint8,
                 )
                 (
                     action,
@@ -336,7 +417,7 @@ class PI0RolloutRob(NaiveRolloutRob):
                 ) = self.pipeline(
                     images={
                         "observation.images.cam_high": cam_high,
-                        "observation.images.cam_left_wrist": zeros,
+                        "observation.images.cam_left_wrist": left_wrist,
                         "observation.images.cam_right_wrist": zeros,
                     },
                     task=task_descriptions.tolist() if hasattr(task_descriptions, "tolist") else list(task_descriptions),
@@ -345,11 +426,11 @@ class PI0RolloutRob(NaiveRolloutRob):
                     ).to(prompts.batch.device, dtype=torch.float32),
                 )
 
-        print("pi0_generate_loop time (s): %s" % timing_generate.get("pi0_generate_loop", 0.0))
+        print("rollout generate_sequences time (s): %s" % timing_generate.get("rollout generate_sequences", 0.0))
 
         ret = DataProto.from_dict(
             {
-                "action": action[..., :7],
+                "action": action[:, :10, :7],
                 "full_action": action,
                 "images": torch.stack(images_out, dim=1),
                 "image_masks": torch.stack(img_masks, dim=1),

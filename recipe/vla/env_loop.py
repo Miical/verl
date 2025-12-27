@@ -129,7 +129,7 @@ class EnvLoop:
 
                 # Prepare next observation
                 next_obs = DataProto(
-                    batch=env_result.batch.select("full_image", "state"),
+                    batch=env_result.batch.select("full_image", "wrist_image", "state"),
                     non_tensor_batch={"task_descriptions": env_result.non_tensor_batch["task_descriptions"]},
                 )
                 staged_next_obs[stage_id] = next_obs

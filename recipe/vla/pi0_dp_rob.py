@@ -29,6 +29,7 @@ from verl.utils.device import get_device_id, get_device_name
 from verl.utils.py_functional import append_to_dict
 from verl.utils.seqlen_balancing import prepare_dynamic_batch, restore_dynamic_batch
 from verl.utils.torch_functional import logprobs_from_logits
+from verl.utils.profiler import simple_timer
 from verl.workers.actor import BasePPOActor
 
 logger = logging.getLogger(__name__)
@@ -159,7 +160,6 @@ class PI0RobDataParallelPPOActor(BasePPOActor):
         Returns:
             Loss tensor (e.g., per-sample or aggregated depending on the Trainer reduction).
         """
-
         images = batch_dict['images']
         img_masks = batch_dict['image_masks']
         lang_tokens = batch_dict['lang_tokens']
@@ -169,13 +169,13 @@ class PI0RobDataParallelPPOActor(BasePPOActor):
         action_loss_mask = batch_dict['action_loss_mask']
 
         noisy_model_input, timesteps = self.loss_func.add_noise(actions)
-        with torch.autocast(device_type=get_device_name(), dtype=torch.bfloat16):
-            # images shape: [torch.Size([1, 3, 224, 224]), torch.Size([1, 3, 224, 224]), torch.Size([1, 3, 224, 224])],
-            # img_masks shape: [torch.Size([1]), torch.Size([1]), torch.Size([1])],
-            # lang_tokens shape: torch.Size([1, 48]), lang_masks shape: torch.Size([1, 48]),
-            # state shape: torch.Size([1, 32]),
-            # noisy_model_input shape: torch.Size([1, 50, 14]),
-            model_pred = self.actor_module(images, img_masks, lang_tokens, lang_masks, state, noisy_model_input, timesteps)
+
+        timing_generate = {}
+        with simple_timer("training forward_step", timing_generate):
+            with torch.autocast(device_type=get_device_name(), dtype=torch.bfloat16):
+                model_pred = self.actor_module(images, img_masks, lang_tokens, lang_masks, state, noisy_model_input, timesteps)
+
+        print("training foward_step(s): %s" % timing_generate.get("training forward_step", 0.0))
 
         loss = self.loss_func(model_pred, loss_mask=action_loss_mask)
         return loss
@@ -212,6 +212,8 @@ class PI0RobDataParallelPPOActor(BasePPOActor):
 
             for micro_batch in micro_batches:
                 micro_batch = micro_batch.to(get_device_id())  # actor device is cpu when using offload
+                bsz = micro_batch['full_action'].shape[0]
+                print("micro_batch bsz", bsz)
                 loss = self.forward_step({
                     'images': list(micro_batch['images'].unbind(1)),
                     'image_masks': list(micro_batch['image_masks'].unbind(1)),
@@ -219,12 +221,15 @@ class PI0RobDataParallelPPOActor(BasePPOActor):
                     'lang_masks': micro_batch['lang_masks'],
                     'observation.state': micro_batch['states'],
                     'action': micro_batch['full_action'],
-                    'action_loss_mask': None,
+                    'action_loss_mask': torch.cat([
+                        torch.ones((bsz, 10), dtype=torch.bool, device=micro_batch['full_action'].device),
+                        torch.zeros((bsz, 40), dtype=torch.bool, device=micro_batch['full_action'].device),
+                    ], dim=1)
                 })
 
                 advantages = micro_batch["advantages"].to(loss.device)
-                bsz, t_steps = loss.shape
-                advantages = advantages.view(bsz, t_steps, 7).mean(dim=-1)
+                loss = loss[:, 10]
+                advantages = advantages.view(bsz, 10, 7).mean(dim=-1)
                 loss = (loss * advantages).mean()
 
                 loss.backward()

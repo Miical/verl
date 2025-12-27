@@ -34,7 +34,7 @@ from recipe.vla.envs.action_utils import (
     to_tensor,
 )
 from recipe.vla.envs.libero_env.utils import (
-    get_libero_image,
+    get_libero_image, get_libero_wrist_image, quat2axisangle
 )
 from recipe.vla.envs.libero_env.venv import ReconfigureSubprocEnv
 
@@ -234,12 +234,13 @@ class LiberoEnv(gym.Env):
 
     def _extract_image_and_state(self, obs):
         return {
-            "full_image": get_libero_image(obs),
+            "full_image": get_libero_image(obs, 224),
+            "wrist_image": get_libero_wrist_image(obs, 224),
             "state": np.concatenate(
                 [
                     obs["robot0_eef_pos"],
-                    # quat2axisangle(obs["robot0_eef_quat"]),
-                    # obs["robot0_gripper_qpos"],
+                    quat2axisangle(obs["robot0_eef_quat"]),
+                    obs["robot0_gripper_qpos"],
                 ]
             ),
         }
