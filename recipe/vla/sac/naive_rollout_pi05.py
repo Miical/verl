@@ -239,7 +239,7 @@ class PI0RolloutRob(NaiveRolloutRob):
 
         self.pipeline = Pi0Pipeline(
             self.module.policy,
-            tokenizer_model_path='google/paligemma-3b-pt-224',
+            tokenizer_model_path=model_config.get("tokenizer_path", None),
             # TODO(liujincheng): pass in using the configuration file
             state_norm_stats={
                 'mean': [

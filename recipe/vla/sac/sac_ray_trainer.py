@@ -430,8 +430,6 @@ class RobRayPPOTrainer(RayPPOTrainer):
                     with marked_timer("save_checkpoint", timing_raw, color="green"):
                         self._save_checkpoint()
 
-                self._save_checkpoint()
-
                 with marked_timer("stop_profile", timing_raw):
                     next_step_profile = (
                         self.global_steps + 1 in self.config.global_profiler.steps
