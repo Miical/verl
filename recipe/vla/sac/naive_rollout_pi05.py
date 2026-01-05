@@ -28,11 +28,11 @@ import torch
 from PIL import Image
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.nn.utils.rnn import pad_sequence
+from typing import Any
 
 from recipe.vla.envs.action_utils import center_crop_image, resize_image
 from recipe.vla.models.openvla_oft.modeling_prismatic import OpenVLAForActionPrediction
 from recipe.vla.models.openvla_oft.processing_prismatic import PrismaticProcessor
-from recipe.vla.models.pi0_torch import Pi0Pipeline
 from verl import DataProto
 from verl.utils.device import get_device_id, get_device_name, get_torch_device
 from verl.utils.profiler import simple_timer
@@ -232,164 +232,17 @@ class PI0RolloutRob(NaiveRolloutRob):
         self,
         model_config: dict,
         module: torch.nn.Module,
+        tokenizer: Any,
     ):
         self.model_config = model_config
         self.module = module
-        self.module.eval()
+        self.tokenizer = tokenizer
 
-        self.pipeline = Pi0Pipeline(
-            self.module.policy,
-            tokenizer_model_path=model_config.get("tokenizer_path", None),
-            # TODO(liujincheng): pass in using the configuration file
-            state_norm_stats={
-                'mean': [
-                    -0.04363870248198509,
-                    0.03525487706065178,
-                    0.7637033462524414,
-                    2.9673683643341064,
-                    -0.2108035385608673,
-                    -0.1297520250082016,
-                    0.027788693085312843,
-                    -0.028010232374072075,
-                ] + [0.0] * (32 - 8),
-                'std': [
-                    0.10337679088115692,
-                    0.15188011527061462,
-                    0.38154250383377075,
-                    0.3545231223106384,
-                    0.929176390171051,
-                    0.330748051404953,
-                    0.014128931798040867,
-                    0.013960899785161018,
-                ] + [1.0] * (32 - 8),
-                'q01': [
-                    -0.3524468903720379,
-                    -0.26824864755272865,
-                    0.04083745917417109,
-                    1.5317653684616088,
-                    -2.7152330031871794,
-                    -1.076538143157959,
-                    0.001715825623134151,
-                    -0.04003722561979666,
-                ] + [-1.0] * (32 - 8),
-                'q99': [
-                    0.13891278689503672,
-                    0.3251991607129573,
-                    1.2568962905768304,
-                    3.26276856803894,
-                    2.4437233173847197,
-                    0.5638469840288161,
-                    0.04030780866963323,
-                    -0.0017131616945378486,
-                ] + [1.0] * (32 - 8),
-            },
-            action_norm_stats={
-                'mean': [
-                    0.026827840134501457,
-                    0.08886060863733292,
-                    -0.09983397275209427,
-                    0.00024006747116800398,
-                    0.0012838079128414392,
-                    -0.0029443209059536457,
-                    -0.1305243819952011,
-                ] + [0.0] * (32 - 7),
-                'std': [
-                    0.3311910927295685,
-                    0.37191954255104065,
-                    0.45225635170936584,
-                    0.03948824852705002,
-                    0.06278067082166672,
-                    0.07317619770765305,
-                    0.9914451241493225,
-                ] + [1.0] * (32 - 7),
-                'q01': [
-                    -0.747375,
-                    -0.796125,
-                    -0.9375,
-                    -0.11580300460159779,
-                    -0.16942972007393836,
-                    -0.194502209174633,
-                    -1.0,
-                ] + [-1.0] * (32 - 7),
-                'q99': [
-                    0.937125,
-                    0.8594999999999999,
-                    0.937125,
-                    0.1402260055720806,
-                    0.18103543001413347,
-                    0.3115457148551941,
-                    0.9996,
-                ] + [1.0] * (32 - 7),
-            },
-            original_action_dim=32,
-        )
-        self.pipeline.to(module.device)
-        # self.pipeline.compile(fullgraph=True)
-
-        # Perform a dummy forward in order to initialize fsdp
-        with torch.no_grad(), torch.autocast(device_type=get_device_name(), dtype=torch.bfloat16):
-            _ = self.module(
-                images=[torch.zeros((1, 3, 224, 224), device=self.pipeline.device, dtype=torch.float32)],
-                img_masks=[torch.ones((1,), device=self.pipeline.device, dtype=torch.bool)],
-                lang_tokens=torch.zeros((1, 1), device=self.pipeline.device, dtype=torch.long),
-                lang_masks=torch.ones((1, 1), device=self.pipeline.device, dtype=torch.bool),
-                state=torch.zeros((1, self.module.policy.max_state_dim), device=self.pipeline.device, dtype=torch.float32),
-                x_t=self.module.policy.sample_noise(
-                    (1, self.module.policy.n_action_steps, self.module.policy.max_action_dim),
-                    device=self.pipeline.device,
-                ),
-                timestep=torch.full((1,), 0.5, device=self.pipeline.device, dtype=torch.float32),
-            )
+        self.module.dummy_forward()
 
     @torch.no_grad()
     def generate_sequences(self, prompts: DataProto) -> DataProto:
-        """Generate sequences
-
-        Example prompts:
-            DataProto(
-            batch = TensorDict(
-                fields = {
-                full_image: Tensor(
-                    shape = torch.Size([4, 512, 512, 3]),
-                    device = cuda:0,
-                    dtype = torch.uint8,
-                    is_shared = True
-                ),
-                state: Tensor(
-                    shape = torch.Size([4, 7]),
-                    device = cuda:0,
-                    dtype = torch.float32,
-                    is_shared = True
-                )
-                },
-                batch_size = torch.Size([4]),
-                device = cuda:0,
-                is_shared = True
-            ),
-
-            non_tensor_batch = {
-                'task_descriptions': array(
-                [
-                    'put both moka pots on the stove',
-                    'put both moka pots on the stove',
-                    'put both moka pots on the stove',
-                    'put both moka pots on the stove'
-                ],
-                dtype = object
-                )
-            },
-
-            meta_info = {
-                'global_steps': 1,
-                'do_sample': True,
-                'temperature': 1.6,
-                'prompt_length': 512,
-                'eos_token_id': None,
-                'n_samples': 8,
-                'pad_token_id': None
-            }
-            )
-        """
+        """Generate sequences """
 
         images = prompts.batch["full_image"]
         wrist_images = prompts.batch["wrist_image"]
@@ -414,16 +267,20 @@ class PI0RolloutRob(NaiveRolloutRob):
                     lang_tokens,
                     lang_masks,
                     state_out,
-                ) = self.pipeline(
+                ) = self.module.sample_actions(
                     images={
                         "observation.images.cam_high": cam_high,
                         "observation.images.cam_left_wrist": left_wrist,
                         "observation.images.cam_right_wrist": zeros,
                     },
+                    img_masks=[torch.ones((batch_size,), device=prompts.batch.device, dtype=torch.bool),
+                               torch.ones((batch_size,), device=prompts.batch.device, dtype=torch.bool),
+                               torch.zeros((batch_size,), device=prompts.batch.device, dtype=torch.bool)],
                     task=task_descriptions.tolist() if hasattr(task_descriptions, "tolist") else list(task_descriptions),
                     state=torch.nn.functional.pad(
                         state, (0, max(0, 32 - state.shape[-1])), "constant", 0,
                     ).to(prompts.batch.device, dtype=torch.float32),
+                    tokenizer=self.tokenizer,
                 )
 
         print("rollout generate_sequences time (s): %s" % timing_generate.get("rollout generate_sequences", 0.0))

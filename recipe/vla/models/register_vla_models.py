@@ -5,7 +5,7 @@ from transformers import AutoConfig, AutoImageProcessor, AutoModelForVision2Seq,
 from .openvla_oft.configuration_prismatic import OpenVLAConfig
 from .openvla_oft.modeling_prismatic import OpenVLAForActionPrediction
 from .openvla_oft.processing_prismatic import PrismaticImageProcessor, PrismaticProcessor
-from .pi0_torch import PI0TorchConfig, PI0TorchImageProcessor, PI0TorchModel, PI0TorchProcessor
+from .pi0_torch import PI0TorchConfig, PI0ForActionPrediction
 
 _REGISTERED_MODELS = {
     "openvla_oft": False,
@@ -31,9 +31,7 @@ def register_pi0_torch_model() -> None:
         return
 
     AutoConfig.register("pi0_torch", PI0TorchConfig)
-    AutoImageProcessor.register(PI0TorchConfig, PI0TorchImageProcessor)
-    AutoProcessor.register(PI0TorchConfig, PI0TorchProcessor)
-    AutoModelForVision2Seq.register(PI0TorchConfig, PI0TorchModel)
+    AutoModelForVision2Seq.register(PI0TorchConfig, PI0ForActionPrediction)
 
     _REGISTERED_MODELS["pi0_torch"] = True
 

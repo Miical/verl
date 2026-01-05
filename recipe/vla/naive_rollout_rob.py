@@ -32,7 +32,6 @@ from torch.nn.utils.rnn import pad_sequence
 from recipe.vla.envs.action_utils import center_crop_image, resize_image
 from recipe.vla.models.openvla_oft.modeling_prismatic import OpenVLAForActionPrediction
 from recipe.vla.models.openvla_oft.processing_prismatic import PrismaticProcessor
-from recipe.vla.models.pi0_torch import Pi0Pipeline
 from verl import DataProto
 from verl.utils.device import get_device_id, get_device_name, get_torch_device
 from verl.utils.profiler import simple_timer

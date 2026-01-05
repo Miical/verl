@@ -96,7 +96,7 @@ class RobActorRolloutRefWorker(ActorRolloutRefWorker):
 
         self._register_dispatch_collect_info("rollout", dp_rank=self.rank, is_collect=True)
         # TODO(liujincheng): configurable
-        self.rollout = PI0RolloutRob(module=self.actor_module_fsdp, model_config=self.config.model)
+        self.rollout = PI0RolloutRob(module=self.actor_module_fsdp, model_config=self.config.model, tokenizer=self.tokenizer)
 
         model_config: HFModelConfig = omega_conf_to_dataclass(self.config.model, dataclass_type=HFModelConfig)
         self.model_config = model_config

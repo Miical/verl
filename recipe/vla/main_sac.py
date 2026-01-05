@@ -55,9 +55,6 @@ def main(config):
         ray.init(**OmegaConf.to_container(ray_init_kwargs))
     ray.get(main_task.remote(config))
 
-    # ray.timeline(filename="/tmp/ray_timeline.json")
-
-
 @ray.remote
 def main_task(config):
     # print initial config

@@ -98,8 +98,6 @@ def flatten_trajectories(data: DataProto) -> DataProto:
     return new_data
 
 
-# def filter_by_acc(data: DataProto, accuracy_lower_bound, accuracy_upper_bound) -> torch.Tensor:
-
 
 class RobRayPPOTrainer(RayPPOTrainer):
     """Distributed PPO trainer using Ray for scalable reinforcement learning.

@@ -444,12 +444,12 @@ class ImageTransform:
 
 
 class PromptTokenizerTransform:
-    def __init__(self, tokenizer_model_path: str, max_length: int, discrete_state_input: bool = False) -> None:
-        self.tokenizer = AutoTokenizer.from_pretrained(tokenizer_model_path)
+    def __init__(self, max_length: int, discrete_state_input: bool = False) -> None:
+        # self.tokenizer = AutoTokenizer.from_pretrained(tokenizer_model_path)
         self.tokenizer_max_length = max_length
         self.discrete_state_input = discrete_state_input
 
-    def __call__(self, data: dict[str, Any]) -> tuple[torch.Tensor, torch.Tensor]:
+    def __call__(self, data: dict[str, Any], tokenizer) -> tuple[torch.Tensor, torch.Tensor]:
         """Tokenize the text input.
 
         Args:
@@ -472,7 +472,7 @@ class PromptTokenizerTransform:
             # PaliGemma prompt has to end with a new line in Pi0
             task = f'{task}\n'
 
-        tokenized_prompt = self.tokenizer(
+        tokenized_prompt = tokenizer(
             task,
             padding='max_length',
             padding_side='right',
@@ -486,7 +486,7 @@ class PromptTokenizerTransform:
 
     # VeRL: Batch Inference
 
-    def call_batch(self, data: dict[str, Any]) -> tuple[torch.Tensor, torch.Tensor]:
+    def call_batch(self, data: dict[str, Any], tokenizer) -> tuple[torch.Tensor, torch.Tensor]:
         task = data['task']
         if hasattr(task, "tolist") and not isinstance(task, str):
             tasks = task.tolist()
@@ -510,7 +510,7 @@ class PromptTokenizerTransform:
         else:
             tasks = [f'{task_item}\n' for task_item in tasks]
 
-        tokenized_prompt = self.tokenizer(
+        tokenized_prompt = tokenizer(
             tasks,
             padding='max_length',
             padding_side='right',
