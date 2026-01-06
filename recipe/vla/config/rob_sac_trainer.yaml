@@ -44,6 +44,7 @@ actor_rollout_ref:
       sac_enable: True
       double_q: True
   actor:
+    training_actions_per_chunk: 10
     num_images_in_input: 1
     traj_mini_batch_size: 16
     fsdp_config:

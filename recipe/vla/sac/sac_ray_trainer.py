@@ -45,6 +45,7 @@ from verl.trainer.ppo.utils import Role
 from verl.utils.checkpoint.checkpoint_manager import should_save_ckpt_esi
 from verl.utils.debug import marked_timer
 from verl.utils.metric import reduce_metrics
+from verl.utils.replay_pool import SACReplayPool
 
 
 def compute_response_mask(data: DataProto) -> torch.Tensor:
@@ -189,14 +190,7 @@ class RobRayPPOTrainer(RayPPOTrainer):
         return gen_batch
 
     def fit(self):
-        """
-        The training loop of PPO.
-        The driver process only need to call the compute functions of the worker group through RPC
-        to construct the PPO dataflow.
-        The light-weight advantage computation is done on the driver process.
-        """
         from omegaconf import OmegaConf
-
         from verl.utils.tracking import Tracking
 
         logger = Tracking(
@@ -237,6 +231,9 @@ class RobRayPPOTrainer(RayPPOTrainer):
         )
         next_step_profile = False
 
+
+        self.replay_pool = SACReplayPool()
+
         for epoch in range(self.config.trainer.total_epochs):
             for batch_dict in self.train_dataloader:
                 metrics = {}
@@ -255,28 +252,19 @@ class RobRayPPOTrainer(RayPPOTrainer):
                 batch.non_tensor_batch["uid"] = np.array([str(uuid.uuid4()) for _ in range(len(batch))], dtype=object)
 
                 gen_batch = self._get_gen_batch(batch)
-
-                # pass global_steps to trace
                 gen_batch.meta_info["global_steps"] = self.global_steps
-                # pass generation config to gen_batch
                 gen_batch.meta_info["do_sample"] = True
                 gen_batch.meta_info["temperature"] = self.config.actor_rollout_ref.rollout.temperature
                 gen_batch.meta_info["prompt_length"] = self.config.actor_rollout_ref.rollout.prompt_length
-                gen_batch.meta_info["eos_token_id"] = self.tokenizer.eos_token_id
-                gen_batch.meta_info["n_samples"] = self.config.actor_rollout_ref.rollout.n
-                gen_batch.meta_info["pad_token_id"] = self.tokenizer.pad_token_id
-
-                gen_batch = gen_batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
+                # gen_batch.meta_info["eos_token_id"] = self.tokenizer.eos_token_id
+                # gen_batch.meta_info["n_samples"] = self.config.actor_rollout_ref.rollout.n
+                # gen_batch.meta_info["pad_token_id"] = self.tokenizer.pad_token_id
 
                 is_last_step = self.global_steps >= self.total_training_steps
                 with marked_timer("step", timing_raw):
                     # generate a batch
                     with marked_timer("gen", timing_raw, color="red"):
-                        gen_batch_output = self.async_rollout_manager.generate_sequences(gen_batch)
-
-                    # repeat to align with repeated responses in rollout
-                    batch = batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
-                    batch = gen_batch_output
+                        batch = self.async_rollout_manager.generate_sequences(gen_batch)
 
                     if "response_mask" not in batch.batch.keys():
                         batch.batch["response_mask"] = compute_response_mask(batch)
@@ -285,84 +273,14 @@ class RobRayPPOTrainer(RayPPOTrainer):
                         # compute reward model score
                         reward_tensor, reward_extra_infos_dict = compute_reward(batch, self.reward_fn)
 
-                    batch.batch["reward_tensor"] = reward_tensor
+                    batch.batch["rewards"] = reward_tensor
                     batch = flatten_trajectories(batch)
 
                     # batch.meta_info["global_token_num"] = torch.sum(batch.batch["attention_mask"], dim=-1).tolist()
                     batch.meta_info["global_token_num"] = [0]
 
-
-                    if self.use_reference_policy:
-                        # compute reference log_prob
-                        with marked_timer("ref", timing_raw, color="olive"):
-                            if not self.ref_in_actor:
-                                ref_log_prob = self.ref_policy_wg.compute_ref_log_prob(batch)
-                            else:
-                                ref_log_prob = self.actor_rollout_wg.compute_ref_log_prob(batch)
-                            batch = batch.union(ref_log_prob)
-
-                    # compute values
-                    if self.use_critic:
-                        with marked_timer("values", timing_raw, color="cyan"):
-                            values = self.critic_wg.compute_values(batch)
-                            batch = batch.union(values)
-
-                    with marked_timer("adv", timing_raw, color="brown"):
-                        # we combine with rule-based rm
-                        reward_extra_infos_dict: dict[str, list] = None
-
-                        response_masks = batch.batch["response_mask"]
-                        token_level_scores = torch.zeros_like(response_masks, dtype=torch.float32)
-                        flipped_mask = response_masks.flip(dims=[1])
-                        indices_in_flipped = torch.argmax(flipped_mask.long(), dim=1)
-
-                        last_true_indices = response_masks.shape[-1] - 1 - indices_in_flipped
-                        rows_with_response = response_masks.any(dim=1)
-                        effective_rewards = batch.batch["reward_tensor"] * rows_with_response.to(
-                            batch.batch["reward_tensor"].dtype
-                        )
-                        row_indices = torch.arange(response_masks.shape[0], device=token_level_scores.device)
-
-                        token_level_scores[row_indices, last_true_indices] = effective_rewards
-                        batch.batch["token_level_scores"] = token_level_scores
-                        if reward_extra_infos_dict:
-                            batch.non_tensor_batch.update({k: np.array(v) for k, v in reward_extra_infos_dict.items()})
-
-                        # compute rewards. apply_kl_penalty if available
-                        if self.config.algorithm.use_kl_in_reward:
-                            batch, kl_metrics = apply_kl_penalty(
-                                batch, kl_ctrl=self.kl_ctrl_in_reward, kl_penalty=self.config.algorithm.kl_penalty
-                            )
-                            metrics.update(kl_metrics)
-                        else:
-                            batch.batch["token_level_rewards"] = batch.batch["token_level_scores"]
-
-                        # compute advantages, executed on the driver process
-
-                        norm_adv_by_std_in_grpo = self.config.algorithm.get(
-                            "norm_adv_by_std_in_grpo", True
-                        )  # GRPO adv normalization factor
-
-                        batch = compute_advantage(
-                            batch,
-                            adv_estimator=self.config.algorithm.adv_estimator,
-                            gamma=self.config.algorithm.gamma,
-                            lam=self.config.algorithm.lam,
-                            num_repeat=self.config.actor_rollout_ref.rollout.n,
-                            norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
-                            config=self.config.algorithm,
-                        )
-
-                    # update critic
-                    if self.use_critic:
-                        with marked_timer("update_critic", timing_raw, color="pink"):
-                            critic_output = self.critic_wg.update_critic(batch)
-                        critic_output_metrics = reduce_metrics(critic_output.meta_info["metrics"])
-                        metrics.update(critic_output_metrics)
-
-                    # implement critic warmup
+                    # update actor
                     if self.config.trainer.critic_warmup <= self.global_steps:
-                        # update actor
                         with marked_timer("update_actor", timing_raw, color="red"):
                             batch.meta_info["multi_turn"] = self.config.actor_rollout_ref.rollout.multi_turn.enable
                             actor_output = self.actor_rollout_wg.update_actor(batch)
@@ -397,16 +315,16 @@ class RobRayPPOTrainer(RayPPOTrainer):
                             )
 
                 # validate
-                if (
-                    self.val_reward_fn is not None
-                    and self.config.trainer.test_freq > 0
-                    and (is_last_step or self.global_steps % self.config.trainer.test_freq == 0)
-                ):
-                    with marked_timer("testing", timing_raw, color="green"):
-                        val_metrics: dict = self._validate()
-                        if is_last_step:
-                            last_val_metrics = val_metrics
-                    metrics.update(val_metrics)
+                # if (
+                #     self.val_reward_fn is not None
+                #     and self.config.trainer.test_freq > 0
+                #     and (is_last_step or self.global_steps % self.config.trainer.test_freq == 0)
+                # ):
+                #     with marked_timer("testing", timing_raw, color="green"):
+                #         val_metrics: dict = self._validate()
+                #         if is_last_step:
+                #             last_val_metrics = val_metrics
+                #     metrics.update(val_metrics)
 
                 # Check if the ESI (Elastic Server Instance)/training plan is close to expiration.
                 esi_close_to_expiration = should_save_ckpt_esi(

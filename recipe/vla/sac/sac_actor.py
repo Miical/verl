@@ -15,31 +15,20 @@
 Single Process Actor
 """
 
-import logging
-
 import torch
-from tensordict.base import TensorDictBase
+import logging
+from typing_extensions import override
 from torch import nn
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 import torch.nn.functional as F
 
-import verl.utils.torch_functional as verl_F
 from verl.protocol import DataProto
-from verl.trainer.ppo import core_algos
 from verl.utils.device import get_device_id, get_device_name
 from verl.utils.py_functional import append_to_dict
-from verl.utils.seqlen_balancing import prepare_dynamic_batch, restore_dynamic_batch
-from verl.utils.torch_functional import logprobs_from_logits
 from verl.utils.profiler import simple_timer
-from verl.workers.actor import BasePPOActor
-
-from .base import SupportSACTraining
+from .base import SupportSACTraining, BaseSACActor
 
 logger = logging.getLogger(__name__)
-
-__all__ = ["RobDataParallelPPOActor"]
-
-
 
 class PI0Loss(nn.Module):
     """Diffusion-style training loss for PI0 actions."""
@@ -117,8 +106,7 @@ class PI0Loss(nn.Module):
 
         return loss
 
-
-class PI0RobDataParallelPPOActor(BasePPOActor):
+class PI0RobDataParallelPPOActor(BaseSACActor):
     def __init__(
         self,
         config,
@@ -126,17 +114,145 @@ class PI0RobDataParallelPPOActor(BasePPOActor):
         actor_optimizer: torch.optim.Optimizer = None,
     ):
         """When optimizer is None, it is Reference Policy"""
-        super().__init__(config)
+        super().__init__()
+        self.config = config
+        self.device = get_device_name()
         self.actor_module = actor_module
         self.actor_optimizer = actor_optimizer
+
+        #TODO: remove it
+        self.loss_func = PI0Loss()
+
         self.use_remove_padding = self.config.get("use_remove_padding", False)
         logger.info(f"Actor use_remove_padding={self.use_remove_padding}")
-        logger.info(f"PRM use dynamic bsz={self.config.get('use_dynamic_bsz', False)}")
-        self.ulysses_sequence_parallel_size = self.config.ulysses_sequence_parallel_size
-        self.use_ulysses_sp = False  # self.ulysses_sequence_parallel_size > 1
-        self.compute_entropy_from_logits = torch.compile(verl_F.entropy_from_logits, dynamic=True)
 
-        self.loss_func = PI0Loss()
+    def _calculate_actor_loss(self, model_pred: torch.Tensor, action_loss_mask: torch.Tensor) -> torch.Tensor:
+        # TODO: sac actor loss input args: logprobs(B, T, D), q_value(B, 1)
+        """Calculate actor loss using the PI0 loss function.
+
+        Args:
+            model_pred: Predicted v_t with shape (B, T, D).
+            action_loss_mask: Mask of shape (B, T) indicating valid action steps.
+
+        Returns:
+            Tensor of shape (1,) representing the actor loss.
+        """
+
+        loss = self.loss_func(model_pred, action_loss_mask)
+        training_actions_per_chunk = self.config.get("training_actions_per_chunk", loss.shape[1])
+        actor_loss = loss[:, :training_actions_per_chunk].mean()
+        return actor_loss
+
+    def _calculate_critic_loss(self, q_values: torch.Tensor, rewards: torch.Tensor) -> torch.Tensor:
+        """Calculate critic loss as MSE between Q-values and rewards.
+
+        Args:
+            q_values: Tensor of shape (B,) representing predicted Q-values.
+            rewards: Tensor of shape (B,) representing observed rewards.
+
+        Returns:
+            Tensor of shape (1,) representing the critic loss.
+        """
+
+        # TODO: implement critic loss
+
+        return None
+
+    def _forward_step(self, micro_batch: DataProto) -> torch.Tensor:
+        micro_batch = micro_batch.to(get_device_id())
+
+        # make action loss mask
+        actions = micro_batch['full_action']
+        batch_size, action_chunk_size = actions.shape[0], actions.shape[1]
+        training_actions_per_chunk = self.config.get("training_actions_per_chunk", action_chunk_size)
+        action_loss_mask = torch.cat([
+            torch.ones((batch_size, training_actions_per_chunk),
+                       dtype=torch.bool,
+                       device=self.device),
+            torch.zeros((batch_size, action_chunk_size - training_actions_per_chunk),
+                        dtype=torch.bool,
+                        device=self.device)
+        ], dim=1)
+
+        # get model prediction
+        noisy_model_input, timesteps = self.loss_func.add_noise(actions)
+        timing_generate = {}
+        with simple_timer("training forward_step", timing_generate):
+            with torch.autocast(device_type=get_device_name(), dtype=torch.bfloat16):
+                # TODO: change to sac_forward
+                model_pred = self.actor_module(
+                    micro_batch['images'].unbind(1),
+                    micro_batch['image_masks'].unbind(1),
+                    micro_batch['lang_tokens'],
+                    micro_batch['lang_masks'],
+                    micro_batch['states'],
+                    noisy_model_input,
+                    timesteps
+                )
+
+        print("training foward_step(s): %s" % timing_generate.get("training forward_step", 0.0))
+
+        # compute losses
+        actor_loss = self._calculate_actor_loss(model_pred, action_loss_mask)
+        critic_loss = self._calculate_critic_loss(None, micro_batch['rewards'])
+
+        return actor_loss, critic_loss
+
+    @override
+    def update_policy(self, data: DataProto):
+        """
+        Update the policy using the provided data batch.
+
+        Args:
+            data: DataProto containing the following entries in `data.batch`:
+                - "full_action": Tensor of shape (B, action_steps, action_dim),
+                    representing the action chunk for each sample.
+                - "states": Tensor of shape (B, state_dim),
+                    representing the environment or agent state.
+                - "images": Tensor of shape (num_images, B, C, H, W),
+                    containing visual observations.
+                - "image_masks": Tensor of shape (num_images, B),
+                    indicating valid images per sample.
+                - "lang_tokens": Tensor of shape (B, max_seq_len),
+                    tokenized language instructions.
+                - "lang_masks": Tensor of shape (B, max_seq_len),
+                    attention masks for language tokens.
+                - "rewards": Tensor of shape (B,),
+                    chunk-level scalar rewards.
+                    Each action chunk corresponds to a single reward value. The reward must be computed at the
+                    trajectory level and assigned to chunks externally, as the actor operates purely on chunks
+                    and does not have access to full trajectories.
+                - "response_mask": Tensor of shape (B,),
+                    mask indicating whether each sample has a valid response.
+        """
+
+        batch = data.select([
+            "full_action",
+            "states",
+            "images",
+            "image_masks",
+            "lang_tokens",
+            "lang_masks",
+            "rewards",
+            "response_mask"
+        ]).batch
+
+        micro_batches = batch.split(self.config.ppo_micro_batch_size_per_gpu)
+
+        metrics = {}
+        for batch_idx, micro_batch in enumerate(micro_batches):
+            print(f"[{batch_idx+1}/{len(micro_batches)}] actor micro batch ")
+            self.actor_optimizer.zero_grad()
+
+            actor_loss, critic_loss = self._forward_step(micro_batch)
+            actor_loss.backward()
+            # critic_loss.backward()
+
+            grad_norm = self._optimizer_step()
+            mini_batch_metrics = {"actor/grad_norm": grad_norm.detach().item()}
+            append_to_dict(metrics, mini_batch_metrics)
+
+        return metrics
 
     def _optimizer_step(self):
         assert self.config.grad_clip is not None
@@ -147,94 +263,3 @@ class PI0RobDataParallelPPOActor(BasePPOActor):
             grad_norm = torch.nn.utils.clip_grad_norm_(self.actor_module.parameters(), max_norm=self.config.grad_clip)
         self.actor_optimizer.step()
         return grad_norm
-
-    def compute_log_prob(self, data: DataProto) -> torch.Tensor:
-        pass
-
-    def forward_step(self, batch_dict: dict[str, torch.Tensor | list[torch.Tensor]]) -> torch.Tensor:
-        """Perform one training step and return the loss tensor.
-
-        Args:
-            batch_dict: Preprocessed batch containing images, masks, tokens, state and actions.
-
-        Returns:
-            Loss tensor (e.g., per-sample or aggregated depending on the Trainer reduction).
-        """
-        images = batch_dict['images']
-        img_masks = batch_dict['image_masks']
-        lang_tokens = batch_dict['lang_tokens']
-        lang_masks = batch_dict['lang_masks']
-        state = batch_dict['observation.state']
-        actions = batch_dict['action']
-        action_loss_mask = batch_dict['action_loss_mask']
-
-        noisy_model_input, timesteps = self.loss_func.add_noise(actions)
-
-        timing_generate = {}
-        with simple_timer("training forward_step", timing_generate):
-            with torch.autocast(device_type=get_device_name(), dtype=torch.bfloat16):
-                model_pred = self.actor_module(images, img_masks, lang_tokens, lang_masks, state, noisy_model_input, timesteps)
-
-        print("training foward_step(s): %s" % timing_generate.get("training forward_step", 0.0))
-
-        loss = self.loss_func(model_pred, loss_mask=action_loss_mask)
-        return loss
-
-    def update_policy(self, data: DataProto):
-        assert self.config.ppo_mini_batch_size % self.config.ppo_micro_batch_size_per_gpu == 0
-        self.gradient_accumulation = self.config.ppo_mini_batch_size // self.config.ppo_micro_batch_size_per_gpu
-        temperature = data.meta_info["temperature"]  # temperature must be in the data.meta_info to avoid slient error
-
-        select_keys = [
-            "advantages",
-            "full_action",
-            "states",
-            "images",
-            "image_masks",
-            "lang_tokens",
-            "lang_masks",
-            "reward_tensor",
-        ]
-        batch = data.select(batch_keys=select_keys).batch
-        self.pad_token_id = data.meta_info["pad_token_id"]
-
-        mini_batches = batch.split(self.config.ppo_mini_batch_size)
-        metrics = {}
-        for batch_idx, mini_batch in enumerate(mini_batches):
-            if self.config.use_dynamic_bsz:
-                max_token_len = self.config.ppo_max_token_len_per_gpu * self.ulysses_sequence_parallel_size
-                micro_batches, _ = prepare_dynamic_batch(mini_batch, max_token_len=max_token_len)
-            else:
-                self.gradient_accumulation = self.config.ppo_mini_batch_size // self.config.ppo_micro_batch_size_per_gpu
-                micro_batches = mini_batch.split(self.config.ppo_micro_batch_size_per_gpu)
-
-            self.actor_optimizer.zero_grad()
-
-            for micro_batch in micro_batches:
-                micro_batch = micro_batch.to(get_device_id())  # actor device is cpu when using offload
-                bsz = micro_batch['full_action'].shape[0]
-                loss = self.forward_step({
-                    'images': list(micro_batch['images'].unbind(1)),
-                    'image_masks': list(micro_batch['image_masks'].unbind(1)),
-                    'lang_tokens': micro_batch['lang_tokens'],
-                    'lang_masks': micro_batch['lang_masks'],
-                    'observation.state': micro_batch['states'],
-                    'action': micro_batch['full_action'],
-                    'action_loss_mask': torch.cat([
-                        torch.ones((bsz, 10), dtype=torch.bool, device=micro_batch['full_action'].device),
-                        torch.zeros((bsz, 40), dtype=torch.bool, device=micro_batch['full_action'].device),
-                    ], dim=1)
-                })
-
-                advantages = micro_batch["advantages"].to(loss.device)
-                loss = loss[:, 10]
-                advantages = advantages.view(bsz, 10, 7).mean(dim=-1)
-                loss = (loss * advantages).mean()
-
-                loss.backward()
-
-            grad_norm = self._optimizer_step()
-            mini_batch_metrics = {"actor/grad_norm": grad_norm.detach().item()}
-            append_to_dict(metrics, mini_batch_metrics)
-        self.actor_optimizer.zero_grad()
-        return metrics

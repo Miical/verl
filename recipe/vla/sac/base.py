@@ -1,4 +1,6 @@
 import torch
+from verl import DataProto
+from abc import abstractmethod, ABC
 
 class SupportSACTraining:
     """
@@ -26,3 +28,31 @@ class SupportSACTraining:
 
         raise NotImplementedError("Subclasses must implement sac_forward method.")
 
+class BaseSACActor(ABC):
+    @abstractmethod
+    def update_policy(self, data: DataProto) -> dict:
+        """
+        Update the policy using the provided data batch.
+
+        Args:
+            data: DataProto containing the following entries in `data.batch`:
+                - "full_action": Tensor of shape (B, action_steps, action_dim),
+                    representing the action chunk for each sample.
+                - "states": Tensor of shape (B, state_dim),
+                    representing the environment or agent state.
+                - "images": Tensor of shape (num_images, B, C, H, W),
+                    containing visual observations.
+                - "image_masks": Tensor of shape (num_images, B),
+                    indicating valid images per sample.
+                - "lang_tokens": Tensor of shape (B, max_seq_len),
+                    tokenized language instructions.
+                - "lang_masks": Tensor of shape (B, max_seq_len),
+                    attention masks for language tokens.
+                - "reward_tensor": Tensor of shape (B,),
+                    chunk-level scalar rewards.
+                    Each action chunk corresponds to a single reward value. The reward must be computed at the
+                    trajectory level and assigned to chunks externally, as the actor operates purely on chunks
+                    and does not have access to full trajectories.
+                - "response_mask": Tensor of shape (B,),
+                    mask indicating whether each sample has a valid response.
+        """
