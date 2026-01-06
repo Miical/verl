@@ -33,15 +33,11 @@ logger = logging.getLogger(__name__)
 
 def calculate_reward(data: DataProto, return_dict: bool = False) -> torch.Tensor:
     complete_tensor = data.batch["complete"]
-    batch_size, num_steps = complete_tensor.shape[:2]
-    traj_has_complete = torch.any(complete_tensor, dim=(1, 2))  # shape: [batch_size]
-    reward_per_traj = traj_has_complete.float()
-    reward_per_step = reward_per_traj.unsqueeze(1).expand(batch_size, num_steps)
+    reward_per_step = complete_tensor.float()
     if return_dict:
         return {"reward_tensor": reward_per_step}
     else:
         return reward_per_step
-
 
 @hydra.main(config_path="config", config_name="rob_sac_trainer", version_base=None)
 def main(config):

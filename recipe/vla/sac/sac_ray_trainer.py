@@ -47,6 +47,7 @@ from verl.utils.debug import marked_timer
 from verl.utils.metric import reduce_metrics
 from verl.utils.replay_pool import SACReplayPool
 
+from recipe.vla.sac.core_algos import compute_discounted_returns
 
 def compute_response_mask(data: DataProto) -> torch.Tensor:
     """Compute the attention mask for the response part of the sequence.
@@ -98,6 +99,42 @@ def flatten_trajectories(data: DataProto) -> DataProto:
     new_data = DataProto.from_dict(tensors=new_batch_fields, meta_info=data.meta_info)
     return new_data
 
+
+def add_transition_prefixes(data: DataProto) -> DataProto:
+    batch = data.batch
+    step_key = "action" if "action" in batch else "full_action"
+    if step_key not in batch:
+        return data
+
+    num_steps = batch[step_key].shape[1]
+    if num_steps <= 1:
+        return data
+
+    def drop_last(tensor: torch.Tensor) -> torch.Tensor:
+        return tensor[:, :-1, ...]
+
+    def shift_next(tensor: torch.Tensor) -> torch.Tensor:
+        return tensor[:, 1:, ...]
+
+    state_keys = ["states", "images", "image_masks", "lang_tokens", "lang_masks"]
+    action_keys = ["full_action", "action"]
+
+    for key in state_keys:
+        if key in batch:
+            batch[f"s0.{key}"] = drop_last(batch[key])
+            batch[f"s1.{key}"] = shift_next(batch[key])
+
+    for key in action_keys:
+        if key in batch:
+            batch[f"a0.{key}"] = drop_last(batch[key])
+            batch[f"a1.{key}"] = shift_next(batch[key])
+
+    batch_size = batch[step_key].shape[0]
+    for key, tensor in list(batch.items()):
+        if tensor.ndim >= 2 and tensor.shape[0] == batch_size and tensor.shape[1] == num_steps:
+            batch[key] = drop_last(tensor)
+
+    return data
 
 
 class RobRayPPOTrainer(RayPPOTrainer):
@@ -274,6 +311,8 @@ class RobRayPPOTrainer(RayPPOTrainer):
                         reward_tensor, reward_extra_infos_dict = compute_reward(batch, self.reward_fn)
 
                     batch.batch["rewards"] = reward_tensor
+                    batch.batch["returns"] = compute_discounted_returns(reward_tensor, gamma=0.99)
+                    batch = add_transition_prefixes(batch)
                     batch = flatten_trajectories(batch)
 
                     # batch.meta_info["global_token_num"] = torch.sum(batch.batch["attention_mask"], dim=-1).tolist()

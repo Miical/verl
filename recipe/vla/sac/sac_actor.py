@@ -162,7 +162,7 @@ class PI0RobDataParallelPPOActor(BaseSACActor):
         micro_batch = micro_batch.to(get_device_id())
 
         # make action loss mask
-        actions = micro_batch['full_action']
+        actions = micro_batch["a0.full_action"]
         batch_size, action_chunk_size = actions.shape[0], actions.shape[1]
         training_actions_per_chunk = self.config.get("training_actions_per_chunk", action_chunk_size)
         action_loss_mask = torch.cat([
@@ -181,11 +181,11 @@ class PI0RobDataParallelPPOActor(BaseSACActor):
             with torch.autocast(device_type=get_device_name(), dtype=torch.bfloat16):
                 # TODO: change to sac_forward
                 model_pred = self.actor_module(
-                    micro_batch['images'].unbind(1),
-                    micro_batch['image_masks'].unbind(1),
-                    micro_batch['lang_tokens'],
-                    micro_batch['lang_masks'],
-                    micro_batch['states'],
+                    micro_batch["s0.images"].unbind(1),
+                    micro_batch["s0.image_masks"].unbind(1),
+                    micro_batch["s0.lang_tokens"],
+                    micro_batch["s0.lang_masks"],
+                    micro_batch["s0.states"],
                     noisy_model_input,
                     timesteps
                 )
@@ -194,7 +194,7 @@ class PI0RobDataParallelPPOActor(BaseSACActor):
 
         # compute losses
         actor_loss = self._calculate_actor_loss(model_pred, action_loss_mask)
-        critic_loss = self._calculate_critic_loss(None, micro_batch['rewards'])
+        critic_loss = self._calculate_critic_loss(None, micro_batch["rewards"])
 
         return actor_loss, critic_loss
 
@@ -205,35 +205,53 @@ class PI0RobDataParallelPPOActor(BaseSACActor):
 
         Args:
             data: DataProto containing the following entries in `data.batch`:
-                - "full_action": Tensor of shape (B, action_steps, action_dim),
-                    representing the action chunk for each sample.
-                - "states": Tensor of shape (B, state_dim),
-                    representing the environment or agent state.
-                - "images": Tensor of shape (num_images, B, C, H, W),
-                    containing visual observations.
-                - "image_masks": Tensor of shape (num_images, B),
+                - "a0.full_action": Tensor of shape (B, action_steps, action_dim),
+                    representing the current action chunk for each sample.
+                - "a1.full_action": Tensor of shape (B, action_steps, action_dim),
+                    representing the next action chunk for each sample.
+                - "s0.states": Tensor of shape (B, state_dim),
+                    representing the current environment or agent state.
+                - "s1.states": Tensor of shape (B, state_dim),
+                    representing the next environment or agent state.
+                - "s0.images": Tensor of shape (num_images, B, C, H, W),
+                    containing current visual observations.
+                - "s1.images": Tensor of shape (num_images, B, C, H, W),
+                    containing next-step visual observations.
+                - "s0.image_masks": Tensor of shape (num_images, B),
                     indicating valid images per sample.
-                - "lang_tokens": Tensor of shape (B, max_seq_len),
+                - "s1.image_masks": Tensor of shape (num_images, B),
+                    indicating valid images per sample.
+                - "s0.lang_tokens": Tensor of shape (B, max_seq_len),
                     tokenized language instructions.
-                - "lang_masks": Tensor of shape (B, max_seq_len),
+                - "s1.lang_tokens": Tensor of shape (B, max_seq_len),
+                    tokenized language instructions for the next step.
+                - "s0.lang_masks": Tensor of shape (B, max_seq_len),
                     attention masks for language tokens.
+                - "s1.lang_masks": Tensor of shape (B, max_seq_len),
+                    attention masks for language tokens for the next step.
                 - "rewards": Tensor of shape (B,),
-                    chunk-level scalar rewards.
-                    Each action chunk corresponds to a single reward value. The reward must be computed at the
-                    trajectory level and assigned to chunks externally, as the actor operates purely on chunks
-                    and does not have access to full trajectories.
+                    chunk-level scalar rewards aligned to the next step.
+                - "returns": Tensor of shape (B,),
+                    chunk-level discounted returns aligned to the next step.
                 - "response_mask": Tensor of shape (B,),
                     mask indicating whether each sample has a valid response.
         """
 
         batch = data.select([
-            "full_action",
-            "states",
-            "images",
-            "image_masks",
-            "lang_tokens",
-            "lang_masks",
+            "a0.full_action",
+            "a1.full_action",
+            "s0.states",
+            "s1.states",
+            "s0.images",
+            "s1.images",
+            "s0.image_masks",
+            "s1.image_masks",
+            "s0.lang_tokens",
+            "s1.lang_tokens",
+            "s0.lang_masks",
+            "s1.lang_masks",
             "rewards",
+            "returns",
             "response_mask"
         ]).batch
 
