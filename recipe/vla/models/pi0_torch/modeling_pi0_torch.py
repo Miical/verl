@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 from onnx_ir import Tensor
+from typing_extensions import override
 
 import torch
+from torch import nn
 from transformers import PreTrainedModel
 from verl.utils.device import get_device_name
 
@@ -14,8 +16,10 @@ from .pi0_utils import (
     PromptTokenizerTransform,
     Unnormalize,
 )
+from ..modules.mlp import MLP
+from ...sac.base import SupportSACTraining
 
-class PI0ForActionPrediction(PreTrainedModel):
+class PI0ForActionPrediction(PreTrainedModel, SupportSACTraining):
     config_class = PI0TorchConfig
     base_model_prefix = "pi0_torch"
 
@@ -24,7 +28,7 @@ class PI0ForActionPrediction(PreTrainedModel):
         self.model = None
         self.state_norm_stats = config.state_norm_stats
         self.action_norm_stats = config.action_norm_stats
-        self.pi05_enabled = self.config.pi05_enabled
+        self.pi05_enabled = config.pi05_enabled
 
         assert self.state_norm_stats, "state_norm_stats must be provided in PI0TorchConfig"
         assert self.action_norm_stats, "action_norm_stats must be provided in PI0TorchConfig"
@@ -41,6 +45,21 @@ class PI0ForActionPrediction(PreTrainedModel):
         self.action_unnormalize_transform = Unnormalize(self.action_norm_stats, use_quantiles=self.pi05_enabled)
 
         self._to(get_device_name())
+
+        ##### SAC Algorithm Support #####
+        if getattr(self.config, "sac_enable", False):
+            head_num = 2 if getattr(self.config, "double_q", True) else 1
+
+            self.critic_heads = nn.ModuleList([
+                MLP(
+                    input_dim=config.max_action_dim * config.n_action_steps,
+                    hidden_dims=[256, 256],
+                    output_dim=1,
+                    activation='relu',
+                    init_method='kaiming'
+                )
+                for _ in range(head_num)
+            ])
 
     def _to(self, device: torch.device | str):
         self.state_normalize_transform.to(device)
@@ -149,3 +168,20 @@ class PI0ForActionPrediction(PreTrainedModel):
         policy = cls(config)
         policy.model = PI0Model.from_pretrained(pretrained_model_name_or_path)
         return policy
+
+    # --- SAC Algorithm Support ---
+
+    @override
+    def sac_forward(self) -> dict:
+        """
+        Returns:
+            A dictionary with keys:
+                - "actions": Predicted v_t with shape (B, n_action_steps, action_dim).
+                - "q_value": Predicted Q-value with shape (B, 1).
+        """
+
+        return {
+            "actions": torch.empty((1, 50, 32)),
+            "logits": torch.empty((1, 50, 32)),
+            "q_value": torch.empty((1, 1))
+        }

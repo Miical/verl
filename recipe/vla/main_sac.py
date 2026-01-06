@@ -43,7 +43,7 @@ def calculate_reward(data: DataProto, return_dict: bool = False) -> torch.Tensor
         return reward_per_step
 
 
-@hydra.main(config_path="config", config_name="rob_ppo_trainer", version_base=None)
+@hydra.main(config_path="config", config_name="rob_sac_trainer", version_base=None)
 def main(config):
     if not ray.is_initialized():
         default_runtime_env = get_ppo_ray_runtime_env()
