@@ -21,6 +21,7 @@ import torch
 from tensordict.base import TensorDictBase
 from torch import nn
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+import torch.nn.functional as F
 
 import verl.utils.torch_functional as verl_F
 from verl.protocol import DataProto
@@ -32,14 +33,13 @@ from verl.utils.torch_functional import logprobs_from_logits
 from verl.utils.profiler import simple_timer
 from verl.workers.actor import BasePPOActor
 
+from .base import SupportSACTraining
+
 logger = logging.getLogger(__name__)
 
 __all__ = ["RobDataParallelPPOActor"]
 
 
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
 
 class PI0Loss(nn.Module):
     """Diffusion-style training loss for PI0 actions."""
@@ -122,7 +122,7 @@ class PI0RobDataParallelPPOActor(BasePPOActor):
     def __init__(
         self,
         config,
-        actor_module: nn.Module,
+        actor_module: SupportSACTraining,
         actor_optimizer: torch.optim.Optimizer = None,
     ):
         """When optimizer is None, it is Reference Policy"""

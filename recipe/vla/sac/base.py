@@ -1,3 +1,5 @@
+import torch
+
 class SupportSACTraining:
     """
     Base class for Soft Actor-Critic (SAC).
@@ -14,6 +16,13 @@ class SupportSACTraining:
         `ABCMeta` can break FSDP's class rewriting mechanism.
     """
 
-    def sac_forward(self):
+    def sac_forward(
+        self,
+        images: dict[str, torch.Tensor],
+        img_masks: list[torch.Tensor],
+        task: list[str],
+        state: torch.Tensor,
+        tokenizer) -> dict:
+
         raise NotImplementedError("Subclasses must implement sac_forward method.")
 

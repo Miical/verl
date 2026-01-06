@@ -172,16 +172,27 @@ class PI0ForActionPrediction(PreTrainedModel, SupportSACTraining):
     # --- SAC Algorithm Support ---
 
     @override
-    def sac_forward(self) -> dict:
+    def sac_forward(
+        self,
+        images: dict[str, torch.Tensor],
+        img_masks: list[torch.Tensor],
+        task: list[str],
+        state: torch.Tensor,
+        tokenizer) -> dict:
         """
         Returns:
             A dictionary with keys:
-                - "actions": Predicted v_t with shape (B, n_action_steps, action_dim).
+                - "logprobs": Log probabilities of actions with shape (B, n_action_steps, action_dim).
                 - "q_value": Predicted Q-value with shape (B, 1).
         """
 
+        # TODO: Implement sac_forward method
+
+        B = state.shape[0]
+        n_action_steps = self.config.n_action_steps
+        action_dim = self.config.max_action_dim
+
         return {
-            "actions": torch.empty((1, 50, 32)),
-            "logits": torch.empty((1, 50, 32)),
-            "q_value": torch.empty((1, 1))
+            "logprobs": torch.empty((B, n_action_steps, action_dim)),
+            "q_value": torch.empty((B, 1)),
         }
