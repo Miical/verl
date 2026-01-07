@@ -18,14 +18,10 @@ class SupportSACTraining:
         `ABCMeta` can break FSDP's class rewriting mechanism.
     """
 
-    def sac_forward(
-        self,
-        images: dict[str, torch.Tensor],
-        img_masks: list[torch.Tensor],
-        task: list[str],
-        state: torch.Tensor,
-        tokenizer) -> dict:
+    def sac_forward_critic(self):
+        raise NotImplementedError("Subclasses must implement sac_forward_critic method.")
 
+    def sac_forward_actor(self) -> dict:
         raise NotImplementedError("Subclasses must implement sac_forward method.")
 
 class BaseSACActor(ABC):

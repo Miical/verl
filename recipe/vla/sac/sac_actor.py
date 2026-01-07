@@ -143,12 +143,18 @@ class PI0RobDataParallelPPOActor(BaseSACActor):
         actor_loss = loss[:, :training_actions_per_chunk].mean()
         return actor_loss
 
-    def _calculate_critic_loss(self, q_values: torch.Tensor, rewards: torch.Tensor) -> torch.Tensor:
+    def _calculate_critic_loss(
+        self,
+        q_values: torch.Tensor,
+        rewards: torch.Tensor,
+        returns: torch.Tensor
+    ) -> torch.Tensor:
         """Calculate critic loss as MSE between Q-values and rewards.
 
         Args:
             q_values: Tensor of shape (B,) representing predicted Q-values.
             rewards: Tensor of shape (B,) representing observed rewards.
+            returns: Tensor of shape (B,) representing discounted returns.
 
         Returns:
             Tensor of shape (1,) representing the critic loss.
@@ -177,9 +183,10 @@ class PI0RobDataParallelPPOActor(BaseSACActor):
         # get model prediction
         noisy_model_input, timesteps = self.loss_func.add_noise(actions)
         timing_generate = {}
+
+        self.actor_optimizer.zero_grad()
         with simple_timer("training forward_step", timing_generate):
             with torch.autocast(device_type=get_device_name(), dtype=torch.bfloat16):
-                # TODO: change to sac_forward
                 model_pred = self.actor_module(
                     micro_batch["s0.images"].unbind(1),
                     micro_batch["s0.image_masks"].unbind(1),
@@ -190,13 +197,23 @@ class PI0RobDataParallelPPOActor(BaseSACActor):
                     timesteps
                 )
 
+                actor_loss = self._calculate_actor_loss(model_pred, action_loss_mask)
+                actor_loss.backward()
+                grad_norm = self._optimizer_step()
+
+                # q_values_0, q_values_1, shared_features = self.actor_module.sac_forward_critic(...)
+                # critic_loss = self._calculate_critic_loss(...)
+                # critic_loss.backward()
+                # optimizer.step()
+
+                # model_pred = self.actor_module.sac_forward_actor(..., shared_features, ...)
+                # actor_loss = self._calculate_actor_loss(...)
+                # actor_loss.backward()
+                # optimizer.step()
+
         print("training foward_step(s): %s" % timing_generate.get("training forward_step", 0.0))
 
-        # compute losses
-        actor_loss = self._calculate_actor_loss(model_pred, action_loss_mask)
-        critic_loss = self._calculate_critic_loss(None, micro_batch["rewards"])
-
-        return actor_loss, critic_loss
+        return grad_norm
 
     @override
     def update_policy(self, data: DataProto):
@@ -260,16 +277,11 @@ class PI0RobDataParallelPPOActor(BaseSACActor):
         metrics = {}
         for batch_idx, micro_batch in enumerate(micro_batches):
             print(f"[{batch_idx+1}/{len(micro_batches)}] actor micro batch ")
-            self.actor_optimizer.zero_grad()
 
-            actor_loss, critic_loss = self._forward_step(micro_batch)
-            actor_loss.backward()
-            # critic_loss.backward()
+            grad_norm = self._forward_step(micro_batch)
 
-            grad_norm = self._optimizer_step()
             mini_batch_metrics = {"actor/grad_norm": grad_norm.detach().item()}
             append_to_dict(metrics, mini_batch_metrics)
-
         return metrics
 
     def _optimizer_step(self):

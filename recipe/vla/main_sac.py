@@ -76,7 +76,6 @@ def main_task(config):
         assert config.actor_rollout_ref.actor.strategy == config.critic.strategy
         from recipe.vla.workers.env.env_worker import EnvWorker
         from verl.single_controller.ray import RayWorkerGroup
-
         from .fsdp_workers import RobActorRolloutRefWorker
 
         ray_worker_group_cls = RayWorkerGroup

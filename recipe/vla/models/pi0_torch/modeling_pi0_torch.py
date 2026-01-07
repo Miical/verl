@@ -172,27 +172,45 @@ class PI0ForActionPrediction(PreTrainedModel, SupportSACTraining):
     # --- SAC Algorithm Support ---
 
     @override
-    def sac_forward(
+    def sac_forward_critic(
         self,
-        images: dict[str, torch.Tensor],
-        img_masks: list[torch.Tensor],
-        task: list[str],
-        state: torch.Tensor,
-        tokenizer) -> dict:
-        """
+        s0: dict[str, torch.Tensor],
+        a0: dict[str, torch.Tensor],
+        s1: dict[str, torch.Tensor],
+        a1: dict[str, torch.Tensor],
+        tokenizer
+    ) -> dict[str, torch.Tensor]:
+        """Compute Q-values for given state-action pairs using the critic heads.
+
+        Args:
+            s0: Dictionary of tensors representing the initial states, with keys:
+                - "images": dict[str, torch.Tensor] of shape (B, C, H, W)
+                - "img_masks": list[torch.Tensor] of shape (B,)
+                - "lang_tokens": torch.Tensor of shape (B, L)
+                - "lang_masks": torch.Tensor of shape (B, L)
+                - "state": torch.Tensor of shape (B, state_dim)
+            a0: Dictionary of tensors representing the initial actions, with key:
+                - "actions": torch.Tensor of shape (B, n_action_steps, action_dim)
+            s1: Dictionary of tensors representing the next states, with same keys as s0.
+            a1: Dictionary of tensors representing the next actions, with same keys as a0.
+
         Returns:
-            A dictionary with keys:
-                - "logprobs": Log probabilities of actions with shape (B, n_action_steps, action_dim).
-                - "q_value": Predicted Q-value with shape (B, 1).
+            A dictionary containing:
+                - "q_values_0": torch.Tensor of shape (B, 1), Q values for (s0, a0)
+                - "q_values_1": torch.Tensor of shape (B, 1), Q values for (s1, a1)
+                - "shared_features": torch.Tensor of shape (B, shared_dim), shared features computed by the critic. it
+                                     should be passed to sac_forward_actor for computing the actor loss.
         """
 
-        # TODO: Implement sac_forward method
+        return "q_values_0", "q_values_1", "shared_features"
 
-        B = state.shape[0]
-        n_action_steps = self.config.n_action_steps
-        action_dim = self.config.max_action_dim
+    @override
+    def sac_forward_actor(
+        self,
+        s0: dict[str, torch.Tensor],
+        a0: dict[str, torch.Tensor],
+        shared_features: torch.Tensor,
+        tokenizer
+    ) -> dict[str, torch.Tensor]:
 
-        return {
-            "logprobs": torch.empty((B, n_action_steps, action_dim)),
-            "q_value": torch.empty((B, 1)),
-        }
+        return "log_probs", "q_values_0"
