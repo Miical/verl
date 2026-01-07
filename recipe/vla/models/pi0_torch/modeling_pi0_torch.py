@@ -9,7 +9,7 @@ from transformers import PreTrainedModel
 from verl.utils.device import get_device_name
 
 from .configuration_pi0_torch import PI0TorchConfig
-from .model.modeling_pi0 import PI0Model
+from .model.modeling_pi0 import PI0Model, make_att_2d_masks
 from .pi0_utils import (
     ImageTransform,
     Normalize,
@@ -25,7 +25,7 @@ class PI0ForActionPrediction(PreTrainedModel, SupportSACTraining):
 
     def __init__(self, config: PI0TorchConfig):
         super().__init__(config)
-        self.model = None
+        self.model: PI0Model = None
         self.state_norm_stats = config.state_norm_stats
         self.action_norm_stats = config.action_norm_stats
         self.pi05_enabled = config.pi05_enabled
@@ -52,7 +52,7 @@ class PI0ForActionPrediction(PreTrainedModel, SupportSACTraining):
 
             self.critic_heads = nn.ModuleList([
                 MLP(
-                    input_dim=config.max_action_dim * config.n_action_steps,
+                    input_dim=3680, # config
                     hidden_dims=[256, 256],
                     output_dim=1,
                     activation='relu',
@@ -169,7 +169,21 @@ class PI0ForActionPrediction(PreTrainedModel, SupportSACTraining):
         policy.model = PI0Model.from_pretrained(pretrained_model_name_or_path)
         return policy
 
+    def freeze_vision_tower(self) -> None:
+        """Freeze the vision tower parameters."""
+
+        if self.model is None:
+            raise RuntimeError("PI0ForActionPrediction.model is not initialized. Did from_pretrained() run?")
+        vision_tower = self.model.paligemma_with_expert.vision_tower
+        vision_tower.requires_grad_(False)
+        vision_tower.eval()
+
     # --- SAC Algorithm Support ---
+
+    def _critic_output(self, input_tensor: torch.Tensor) -> torch.Tensor:
+        q_values = [head(input_tensor) for head in self.critic_heads]
+        q_values_min = torch.min(torch.stack(q_values, dim=0), dim=0).values
+        return q_values_min
 
     @override
     def sac_forward_critic(
@@ -178,39 +192,111 @@ class PI0ForActionPrediction(PreTrainedModel, SupportSACTraining):
         a0: dict[str, torch.Tensor],
         s1: dict[str, torch.Tensor],
         a1: dict[str, torch.Tensor],
-        tokenizer
-    ) -> dict[str, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Compute Q-values for given state-action pairs using the critic heads.
 
         Args:
             s0: Dictionary of tensors representing the initial states, with keys:
-                - "images": dict[str, torch.Tensor] of shape (B, C, H, W)
-                - "img_masks": list[torch.Tensor] of shape (B,)
+                - "images": torch.Tensor of shape (B, n_images, C, H, W)
+                - "img_masks": torch.Tensor of shape (B, n_images)
                 - "lang_tokens": torch.Tensor of shape (B, L)
                 - "lang_masks": torch.Tensor of shape (B, L)
-                - "state": torch.Tensor of shape (B, state_dim)
+                - "states": torch.Tensor of shape (B, state_dim)
             a0: Dictionary of tensors representing the initial actions, with key:
                 - "actions": torch.Tensor of shape (B, n_action_steps, action_dim)
             s1: Dictionary of tensors representing the next states, with same keys as s0.
             a1: Dictionary of tensors representing the next actions, with same keys as a0.
 
         Returns:
-            A dictionary containing:
-                - "q_values_0": torch.Tensor of shape (B, 1), Q values for (s0, a0)
-                - "q_values_1": torch.Tensor of shape (B, 1), Q values for (s1, a1)
-                - "shared_features": torch.Tensor of shape (B, shared_dim), shared features computed by the critic. it
-                                     should be passed to sac_forward_actor for computing the actor loss.
+            q_values_0: torch.Tensor of shape (B, 1), Q values for (s0, a0)
+            q_values_1: torch.Tensor of shape (B, 1), Q values for (s1, a1)
+            shared_features: tuple containing shared features computed by the critic, it will be used in
+                             sac_forward_actor.
         """
 
-        return "q_values_0", "q_values_1", "shared_features"
+        prefix_features = self.model.embed_prefix(
+            images=torch.cat([s0["images"], s1["images"]], dim=0).unbind(dim=1),
+            img_masks=torch.cat([s0["img_masks"], s1["img_masks"]], dim=0).unbind(dim=1),
+            lang_tokens=torch.cat([s0["lang_tokens"], s1["lang_tokens"]], dim=0),
+            lang_masks=torch.cat([s0["lang_masks"], s1["lang_masks"]], dim=0),
+        )
+        prefix_embs, _, _ = prefix_features                        # (2B, 968, 2048)
+        states = torch.cat([s0["states"], s1["states"]], dim=0)    # (2B, 32)
+        actions = torch.cat([a0["actions"], a1["actions"]], dim=0) # (2B, 50, 32)
+
+        mean_prefix_embs = prefix_embs.mean(dim=1, keepdim=False)                        # (2B, 2048)
+        flattened_actions = actions.view(actions.size(0), -1)                            # (2B, 50*32)
+        critic_input = torch.cat([mean_prefix_embs, states, flattened_actions], dim=-1)  # (2B, 3680)
+        critic_input_0, _ = torch.chunk(critic_input, 2, dim=0)                          # (B,  3680)
+
+        q_values_min = self._critic_output(critic_input)
+        q_values_0, q_values_1 = torch.chunk(q_values_min, 2, dim=0)
+
+        return q_values_0, q_values_1, (critic_input_0, prefix_features)
 
     @override
     def sac_forward_actor(
         self,
         s0: dict[str, torch.Tensor],
         a0: dict[str, torch.Tensor],
-        shared_features: torch.Tensor,
-        tokenizer
-    ) -> dict[str, torch.Tensor]:
+        shared_features: tuple[torch.Tensor],
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Compute log probabilities and Q-values for actions sampled by the actor.
 
-        return "log_probs", "q_values_0"
+            Args:
+                s0: Dictionary of tensors representing the initial states, with keys:
+                    - "images": torch.Tensor of shape (B, n_images, C, H,
+                    - "img_masks": torch.Tensor of shape (B, n_images)
+                    - "lang_tokens": torch.Tensor of shape (B, L)
+                    - "lang_masks": torch.Tensor of shape (B, L)
+                    - "states": torch.Tensor of shape (B, state_dim)
+                a0: Dictionary of tensors representing the initial actions, with key:
+                    - "actions": torch.Tensor of shape (B, n_action_steps, action_dim)
+                shared_features: tuple containing shared features computed by the critic in sac_forward_critic.
+
+            Returns:
+                log_probs: torch.Tensor of shape (B, 1), log probabilities of the actions sampled by the actor.
+                q_values_0: torch.Tensor of shape (B, 1), Q values for (s0, a0) computed using the critic heads.
+        """
+
+        critic_input, prefix_features = shared_features
+        prefix_embs, prefix_pad_masks, prefix_att_masks = prefix_features
+        batch_size = prefix_embs.shape[0]
+        device = prefix_embs.device
+
+        actions_shape = (batch_size, self.model.n_action_steps, self.model.max_action_dim)
+        noise = self.model.sample_noise(actions_shape, device)
+
+        prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
+        prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
+
+        # Compute image and language key value cache
+        _, past_key_values = self.model.paligemma_with_expert.forward(
+            attention_mask=prefix_att_2d_masks,
+            position_ids=prefix_position_ids,
+            past_key_values=None,
+            inputs_embeds=[prefix_embs, None],
+            use_cache=self.model.use_cache,
+            fill_kv_cache=True,
+            adarms_cond=[None, None],
+        )
+
+        x_t = noise
+        dt = -1.0 / self.model.num_steps
+        timesteps = torch.arange(1.0, -dt / 2, dt, dtype=torch.float32, device=device)
+        for timestep in timesteps:
+            v_t = self.model.denoise_step(
+                s0["states"],
+                prefix_pad_masks,
+                past_key_values,
+                x_t,
+                timestep.expand(batch_size),
+            )
+            x_t += dt * v_t
+
+        actions = x_t
+        q_values_0 = self._critic_output(critic_input).detach()
+        log_probs = actions # TODO: compute log probs properly
+
+
+        return log_probs, q_values_0

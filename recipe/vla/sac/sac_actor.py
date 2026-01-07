@@ -120,6 +120,13 @@ class PI0RobDataParallelPPOActor(BaseSACActor):
         self.actor_module = actor_module
         self.actor_optimizer = actor_optimizer
 
+        self.actor_module.freeze_vision_tower()
+
+        from torch.distributed.fsdp import register_fsdp_forward_method
+        register_fsdp_forward_method(actor_module, "sac_forward_critic")
+        register_fsdp_forward_method(actor_module, "sac_forward_actor")
+
+
         #TODO: remove it
         self.loss_func = PI0Loss()
 
@@ -187,15 +194,43 @@ class PI0RobDataParallelPPOActor(BaseSACActor):
         self.actor_optimizer.zero_grad()
         with simple_timer("training forward_step", timing_generate):
             with torch.autocast(device_type=get_device_name(), dtype=torch.bfloat16):
-                model_pred = self.actor_module(
-                    micro_batch["s0.images"].unbind(1),
-                    micro_batch["s0.image_masks"].unbind(1),
-                    micro_batch["s0.lang_tokens"],
-                    micro_batch["s0.lang_masks"],
-                    micro_batch["s0.states"],
-                    noisy_model_input,
-                    timesteps
-                )
+                # q_values_0, q_values_1, shared_features = self.actor_module.sac_forward_critic(
+                #     s0 = {
+                #         "images": micro_batch["s0.images"],
+                #         "img_masks": micro_batch["s0.image_masks"],
+                #         "lang_tokens": micro_batch["s0.lang_tokens"],
+                #         "lang_masks": micro_batch["s0.lang_masks"],
+                #         "states": micro_batch["s0.states"]
+                #     },
+                #     a0 = {
+                #         "actions": micro_batch["a0.full_action"]
+                #     },
+                #     s1 = {
+                #         "images": micro_batch["s1.images"],
+                #         "img_masks": micro_batch["s1.image_masks"],
+                #         "lang_tokens": micro_batch["s1.lang_tokens"],
+                #         "lang_masks": micro_batch["s1.lang_masks"],
+                #         "states": micro_batch["s1.states"]
+                #     },
+                #     a1 = {
+                #         "actions": micro_batch["a1.full_action"]
+                #     }
+                # )
+
+
+                # log_probs, q_values_0 = self.actor_module.sac_forward_actor(
+                #     s0 = {
+                #         "images": micro_batch["s0.images"],
+                #         "img_masks": micro_batch["s0.image_masks"],
+                #         "lang_tokens": micro_batch["s0.lang_tokens"],
+                #         "lang_masks": micro_batch["s0.lang_masks"],
+                #         "states": micro_batch["s0.states"]
+                #     },
+                #     a0 = {
+                #         "actions": micro_batch["a0.full_action"]
+                #     },
+                #     shared_features = shared_features
+                # )
 
                 actor_loss = self._calculate_actor_loss(model_pred, action_loss_mask)
                 actor_loss.backward()
@@ -230,13 +265,13 @@ class PI0RobDataParallelPPOActor(BaseSACActor):
                     representing the current environment or agent state.
                 - "s1.states": Tensor of shape (B, state_dim),
                     representing the next environment or agent state.
-                - "s0.images": Tensor of shape (num_images, B, C, H, W),
+                - "s0.images": Tensor of shape (B, n_images, C, H, W),
                     containing current visual observations.
-                - "s1.images": Tensor of shape (num_images, B, C, H, W),
+                - "s1.images": Tensor of shape (B, n_images, C, H, W),
                     containing next-step visual observations.
-                - "s0.image_masks": Tensor of shape (num_images, B),
+                - "s0.image_masks": Tensor of shape (B, n_images),
                     indicating valid images per sample.
-                - "s1.image_masks": Tensor of shape (num_images, B),
+                - "s1.image_masks": Tensor of shape (B, n_images),
                     indicating valid images per sample.
                 - "s0.lang_tokens": Tensor of shape (B, max_seq_len),
                     tokenized language instructions.
