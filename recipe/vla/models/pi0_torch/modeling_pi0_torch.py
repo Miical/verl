@@ -5,6 +5,7 @@ from typing_extensions import override
 
 import torch
 from torch import nn
+from torch.distributed.fsdp import register_fsdp_forward_method
 from transformers import PreTrainedModel
 from verl.utils.device import get_device_name
 
@@ -239,6 +240,17 @@ class PI0ForActionPrediction(PreTrainedModel, SupportSACTraining):
         log_probs = actions.mean(dim=(1, 2)) # TODO: compute log probs properly (flow noise/flow sde)
 
         return log_probs
+
+    @override
+    def sac_init(self):
+        """Initialize SAC-related components."""
+        pass
+
+        self.freeze_vision_tower()
+
+        register_fsdp_forward_method(self, "sac_forward_critic")
+        register_fsdp_forward_method(self, "sac_forward_actor")
+        register_fsdp_forward_method(self, "sac_update_target_network")
 
     @override
     def sac_forward_critic(

@@ -18,6 +18,9 @@ class SupportSACTraining:
         `ABCMeta` can break FSDP's class rewriting mechanism.
     """
 
+    def sac_init(self):
+        raise NotImplementedError("Subclasses must implement sac_init method.")
+
     def sac_forward_critic(self):
         raise NotImplementedError("Subclasses must implement sac_forward_critic method.")
 

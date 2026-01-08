@@ -43,12 +43,7 @@ class PI0RobDataParallelPPOActor(BaseSACActor):
         self.actor_module = actor_module
         self.actor_optimizer = actor_optimizer
 
-        self.actor_module.freeze_vision_tower()
-
-        from torch.distributed.fsdp import register_fsdp_forward_method
-        register_fsdp_forward_method(actor_module, "sac_forward_critic")
-        register_fsdp_forward_method(actor_module, "sac_forward_actor")
-        register_fsdp_forward_method(actor_module, "sac_update_target_network")
+        self.actor_module.sac_init()
 
         self.use_remove_padding = self.config.get("use_remove_padding", False)
         logger.info(f"Actor use_remove_padding={self.use_remove_padding}")
@@ -89,14 +84,6 @@ class PI0RobDataParallelPPOActor(BaseSACActor):
 
             critic_loss = F.mse_loss(q_pred, y, reduction="none").mean(dim=0).sum()
             return critic_loss
-
-    @torch.no_grad()
-    def soft_update_targets(self, tau: float):
-        for p, tp in zip(
-            self.actor_module.critic_heads.parameters(),
-            self.actor_module.critic_target_heads.parameters()
-        ):
-            tp.data.mul_(1.0 - tau).add_(p.data, alpha=tau)
 
     def _forward_step(self, micro_batch: DataProto) -> torch.Tensor:
         micro_batch = micro_batch.to(get_device_id())
@@ -167,12 +154,15 @@ class PI0RobDataParallelPPOActor(BaseSACActor):
                     shared_features = shared_features
                 )
 
-                print("log_probs shape:", log_probs.shape, "q_values_0 shape:", q_values_0.shape)
-                exit(0)
-
                 # actor_loss = self._calculate_actor_loss(...)
                 # actor_loss.backward()
                 # optimizer.step()
+
+                self.actor_module.sac_update_target_network(tau=0.01)
+
+                print("log_probs shape:", log_probs.shape, "q_values_0 shape:", q_values_0.shape)
+
+                exit(0)
 
         print("training foward_step(s): %s" % timing_generate.get("training forward_step", 0.0))
 
