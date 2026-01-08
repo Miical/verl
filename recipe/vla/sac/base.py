@@ -24,6 +24,9 @@ class SupportSACTraining:
     def sac_forward_actor(self) -> dict:
         raise NotImplementedError("Subclasses must implement sac_forward method.")
 
+    def sac_update_target_network(self, tau: float):
+        raise NotImplementedError("Subclasses must implement sac_update_target_network method.")
+
 class BaseSACActor(ABC):
     @abstractmethod
     def update_policy(self, data: DataProto) -> dict:

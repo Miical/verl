@@ -61,6 +61,17 @@ class PI0ForActionPrediction(PreTrainedModel, SupportSACTraining):
                 for _ in range(head_num)
             ])
 
+            self.target_network_heads = nn.ModuleList([
+                MLP(
+                    input_dim=3680, # config
+                    hidden_dims=[256, 256],
+                    output_dim=1,
+                    activation='relu',
+                    init_method='kaiming'
+                )
+                for _ in range(head_num)
+            ])
+
     def _to(self, device: torch.device | str):
         self.state_normalize_transform.to(device)
         self.state_unnormalize_transform.to(device)
@@ -180,8 +191,8 @@ class PI0ForActionPrediction(PreTrainedModel, SupportSACTraining):
 
     # --- SAC Algorithm Support ---
 
-    def _critic_output(self, input_tensor: torch.Tensor) -> torch.Tensor:
-        q_values = [head(input_tensor) for head in self.critic_heads]
+    def _multi_heads_min(self, value_heads: nn.ModuleList, input_tensor: torch.Tensor) -> torch.Tensor:
+        q_values = [head(input_tensor) for head in value_heads]
         q_values_min = torch.min(torch.stack(q_values, dim=0), dim=0).values
         return q_values_min
 
@@ -208,8 +219,8 @@ class PI0ForActionPrediction(PreTrainedModel, SupportSACTraining):
             a1: Dictionary of tensors representing the next actions, with same keys as a0.
 
         Returns:
-            q_values_0: torch.Tensor of shape (B, 1), Q values for (s0, a0)
-            q_values_1: torch.Tensor of shape (B, 1), Q values for (s1, a1)
+            q_values_0: torch.Tensor of shape (B, 1), Q values for (s0, a0), computed by critic heads.
+            q_values_1: torch.Tensor of shape (B, 1), Q values for (s1, a1), computed by target network.
             shared_features: tuple containing shared features computed by the critic, it will be used in
                              sac_forward_actor.
         """
@@ -227,10 +238,10 @@ class PI0ForActionPrediction(PreTrainedModel, SupportSACTraining):
         mean_prefix_embs = prefix_embs.mean(dim=1, keepdim=False)                        # (2B, 2048)
         flattened_actions = actions.view(actions.size(0), -1)                            # (2B, 50*32)
         critic_input = torch.cat([mean_prefix_embs, states, flattened_actions], dim=-1)  # (2B, 3680)
-        critic_input_0, _ = torch.chunk(critic_input, 2, dim=0)                          # (B,  3680)
+        critic_input_0, critic_input_1 = torch.chunk(critic_input, 2, dim=0)             # (B,  3680)
 
-        q_values_min = self._critic_output(critic_input)
-        q_values_0, q_values_1 = torch.chunk(q_values_min, 2, dim=0)
+        q_values_0 = self._multi_heads_min(self.critic_heads, critic_input_0)
+        q_values_1 = self._multi_heads_min(self.target_network_heads, critic_input_1)
 
         return q_values_0, q_values_1, (critic_input_0, prefix_features)
 
@@ -295,8 +306,19 @@ class PI0ForActionPrediction(PreTrainedModel, SupportSACTraining):
             x_t += dt * v_t
 
         actions = x_t
-        q_values_0 = self._critic_output(critic_input).detach()
+        q_values_0 = self._multi_heads_min(self.critic_heads, critic_input)
         log_probs = actions # TODO: compute log probs properly
 
-
         return log_probs, q_values_0
+
+    @override
+    def sac_update_target_network(self, tau: float):
+        """Update the target network heads using Polyak averaging.
+
+        Args:
+            tau: The interpolation parameter for Polyak averaging.
+        """
+
+        for target_head, head in zip(self.target_network_heads, self.critic_heads):
+            for target_param, param in zip(target_head.parameters(), head.parameters()):
+                target_param.data.copy_(tau * param.data + (1.0 - tau) * target_param.data)
