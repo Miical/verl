@@ -243,7 +243,8 @@ class PI0ForActionPrediction(PreTrainedModel, SupportSACTraining):
         q_values_0 = self._multi_heads_min(self.critic_heads, critic_input_0)
         q_values_1 = self._multi_heads_min(self.target_network_heads, critic_input_1)
 
-        return q_values_0, q_values_1, (critic_input_0, prefix_features)
+        prefix_features_0 = tuple(feature_chunk.chunk(2, dim=0)[0] for feature_chunk in prefix_features)
+        return q_values_0, q_values_1, (critic_input_0, prefix_features_0)
 
     @override
     def sac_forward_actor(
@@ -256,7 +257,7 @@ class PI0ForActionPrediction(PreTrainedModel, SupportSACTraining):
 
             Args:
                 s0: Dictionary of tensors representing the initial states, with keys:
-                    - "images": torch.Tensor of shape (B, n_images, C, H,
+                    - "images": torch.Tensor of shape (B, n_images, C, H, W)
                     - "img_masks": torch.Tensor of shape (B, n_images)
                     - "lang_tokens": torch.Tensor of shape (B, L)
                     - "lang_masks": torch.Tensor of shape (B, L)
@@ -312,6 +313,7 @@ class PI0ForActionPrediction(PreTrainedModel, SupportSACTraining):
         return log_probs, q_values_0
 
     @override
+    @torch.no_grad()
     def sac_update_target_network(self, tau: float):
         """Update the target network heads using Polyak averaging.
 
