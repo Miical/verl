@@ -18,7 +18,6 @@ Single Process Actor
 import torch
 import logging
 from typing_extensions import override
-from torch import nn
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 import torch.nn.functional as F
 
@@ -29,82 +28,6 @@ from verl.utils.profiler import simple_timer
 from .base import SupportSACTraining, BaseSACActor
 
 logger = logging.getLogger(__name__)
-
-class PI0Loss(nn.Module):
-    """Diffusion-style training loss for PI0 actions."""
-
-    def __init__(self) -> None:
-        super().__init__()
-
-    def sample_noise(self, shape: tuple[int, ...], device: torch.device | str) -> torch.Tensor:
-        """Sample standard normal noise with the given shape on the device."""
-        noise = torch.normal(
-            mean=0.0,
-            std=1.0,
-            size=shape,
-            dtype=torch.float32,
-            device=device,
-        )
-        return noise
-
-    def _sample_beta(self, alpha: float, beta: float, bsize: int, device: torch.device | str) -> torch.Tensor:
-        """Sample from Beta(alpha, beta) using the ratio of powered uniforms
-        trick.
-
-        Returns:
-            A tensor of shape (bsize,) with samples in (0, 1).
-        """
-        gamma1 = torch.empty((bsize,), device=device).uniform_(0, 1).pow(1 / alpha)
-        gamma2 = torch.empty((bsize,), device=device).uniform_(0, 1).pow(1 / beta)
-        return gamma1 / (gamma1 + gamma2)
-
-    def sample_time(self, bsize: int, device: torch.device | str) -> torch.Tensor:
-        """Sample diffusion times in (0.001, 1.0) biased toward later times."""
-        time_beta = self._sample_beta(1.5, 1.0, bsize, device)
-        time = time_beta * 0.999 + 0.001
-        return time.to(dtype=torch.float32, device=device)
-
-    def add_noise(self, actions: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """Create noisy actions x_t and compute the target u_t for training.
-
-        Args:
-            actions: Ground-truth actions of shape (B, T, D).
-
-        Returns:
-            A tuple (x_t, time) where x_t has shape (B, T, D) and time has shape (B,).
-        """
-        noise = self.sample_noise(actions.shape, actions.device)
-        time = self.sample_time(actions.shape[0], actions.device)
-        time_expanded = time[:, None, None]
-        x_t = time_expanded * noise + (1 - time_expanded) * actions
-        u_t = noise - actions
-
-        self.x_t = x_t
-        self.u_t = u_t
-        self.time = time
-
-        return x_t, time
-
-    def forward(self, model_pred: torch.Tensor, loss_mask: torch.Tensor | None = None) -> torch.Tensor:
-        """Compute v-prediction MSE loss.
-
-        Args:
-            model_pred: Predicted v_t with shape (B, T, D).
-            loss_mask: Optional mask (B, T) to ignore padded steps.
-
-        Returns:
-            Per-sample loss with shape (B, T) if mask provided then masked accordingly.
-        Note:
-            `add_noise` must be called before forward to set `self.u_t`.
-        """
-        target = self.u_t
-        if target.dtype != model_pred.dtype:
-            target = target.to(model_pred.dtype)
-        loss = F.mse_loss(target, model_pred, reduction='none').mean(dim=-1)
-        if loss_mask is not None:
-            loss = loss * loss_mask.to(loss.dtype)
-
-        return loss
 
 class PI0RobDataParallelPPOActor(BaseSACActor):
     def __init__(
@@ -125,10 +48,7 @@ class PI0RobDataParallelPPOActor(BaseSACActor):
         from torch.distributed.fsdp import register_fsdp_forward_method
         register_fsdp_forward_method(actor_module, "sac_forward_critic")
         register_fsdp_forward_method(actor_module, "sac_forward_actor")
-
-
-        #TODO: remove it
-        self.loss_func = PI0Loss()
+        register_fsdp_forward_method(actor_module, "sac_update_target_network")
 
         self.use_remove_padding = self.config.get("use_remove_padding", False)
         logger.info(f"Actor use_remove_padding={self.use_remove_padding}")
@@ -151,25 +71,32 @@ class PI0RobDataParallelPPOActor(BaseSACActor):
         return actor_loss
 
     def _calculate_critic_loss(
-        self,
-        q_values: torch.Tensor,
-        rewards: torch.Tensor,
-        returns: torch.Tensor
-    ) -> torch.Tensor:
-        """Calculate critic loss as MSE between Q-values and rewards.
+            self,
+            q_pred: torch.Tensor,        # (B,)
+            q_targ: torch.Tensor,        # (B,)
+            rewards: torch.Tensor,       # (B,)
+            done: torch.Tensor,          # (B,)  1=terminal
+            next_log_prob: torch.Tensor, # (B,)
+        ) -> torch.Tensor:
+            # gamma = self.config.discount
+            # alpha = self.temperature  # 或 self.log_alpha.exp() / self.temperature
 
-        Args:
-            q_values: Tensor of shape (B,) representing predicted Q-values.
-            rewards: Tensor of shape (B,) representing observed rewards.
-            returns: Tensor of shape (B,) representing discounted returns.
+            gamma = 0.5 # config
+            alpha = 0.5 # config
 
-        Returns:
-            Tensor of shape (1,) representing the critic loss.
-        """
+            with torch.no_grad():
+                y = rewards + (1.0 - done.to(torch.float32)) * gamma * (q_targ - alpha * next_log_prob)  # (B,)
 
-        # TODO: implement critic loss
+            critic_loss = F.mse_loss(q_pred, y, reduction="none").mean(dim=0).sum()
+            return critic_loss
 
-        return None
+    @torch.no_grad()
+    def soft_update_targets(self, tau: float):
+        for p, tp in zip(
+            self.actor_module.critic_heads.parameters(),
+            self.actor_module.critic_target_heads.parameters()
+        ):
+            tp.data.mul_(1.0 - tau).add_(p.data, alpha=tau)
 
     def _forward_step(self, micro_batch: DataProto) -> torch.Tensor:
         micro_batch = micro_batch.to(get_device_id())
@@ -188,60 +115,61 @@ class PI0RobDataParallelPPOActor(BaseSACActor):
         ], dim=1)
 
         # get model prediction
-        noisy_model_input, timesteps = self.loss_func.add_noise(actions)
         timing_generate = {}
-
         self.actor_optimizer.zero_grad()
         with simple_timer("training forward_step", timing_generate):
             with torch.autocast(device_type=get_device_name(), dtype=torch.bfloat16):
-                # q_values_0, q_values_1, shared_features = self.actor_module.sac_forward_critic(
-                #     s0 = {
-                #         "images": micro_batch["s0.images"],
-                #         "img_masks": micro_batch["s0.image_masks"],
-                #         "lang_tokens": micro_batch["s0.lang_tokens"],
-                #         "lang_masks": micro_batch["s0.lang_masks"],
-                #         "states": micro_batch["s0.states"]
-                #     },
-                #     a0 = {
-                #         "actions": micro_batch["a0.full_action"]
-                #     },
-                #     s1 = {
-                #         "images": micro_batch["s1.images"],
-                #         "img_masks": micro_batch["s1.image_masks"],
-                #         "lang_tokens": micro_batch["s1.lang_tokens"],
-                #         "lang_masks": micro_batch["s1.lang_masks"],
-                #         "states": micro_batch["s1.states"]
-                #     },
-                #     a1 = {
-                #         "actions": micro_batch["a1.full_action"]
-                #     }
-                # )
 
-
-                # log_probs, q_values_0 = self.actor_module.sac_forward_actor(
-                #     s0 = {
-                #         "images": micro_batch["s0.images"],
-                #         "img_masks": micro_batch["s0.image_masks"],
-                #         "lang_tokens": micro_batch["s0.lang_tokens"],
-                #         "lang_masks": micro_batch["s0.lang_masks"],
-                #         "states": micro_batch["s0.states"]
-                #     },
-                #     a0 = {
-                #         "actions": micro_batch["a0.full_action"]
-                #     },
-                #     shared_features = shared_features
-                # )
-
-                actor_loss = self._calculate_actor_loss(model_pred, action_loss_mask)
-                actor_loss.backward()
+                q_values_0, q_values_1, log_probs_1, shared_features = self.actor_module.sac_forward_critic(
+                    s0 = {
+                        "images": micro_batch["s0.images"],
+                        "img_masks": micro_batch["s0.image_masks"],
+                        "lang_tokens": micro_batch["s0.lang_tokens"],
+                        "lang_masks": micro_batch["s0.lang_masks"],
+                        "states": micro_batch["s0.states"]
+                    },
+                    a0 = {
+                        "actions": micro_batch["a0.full_action"]
+                    },
+                    s1 = {
+                        "images": micro_batch["s1.images"],
+                        "img_masks": micro_batch["s1.image_masks"],
+                        "lang_tokens": micro_batch["s1.lang_tokens"],
+                        "lang_masks": micro_batch["s1.lang_masks"],
+                        "states": micro_batch["s1.states"]
+                    },
+                    a1 = {
+                        "actions": micro_batch["a1.full_action"]
+                    }
+                )
+                critic_loss = self._calculate_critic_loss(
+                    q_pred=q_values_0,
+                    q_targ=q_values_1,
+                    rewards=micro_batch["rewards"].max(dim=-1).values,
+                    done=micro_batch["response_mask"].max(dim=-1).values,
+                    next_log_prob=log_probs_1
+                )
+                critic_loss.backward()
                 grad_norm = self._optimizer_step()
 
-                # q_values_0, q_values_1, shared_features = self.actor_module.sac_forward_critic(...)
-                # critic_loss = self._calculate_critic_loss(...)
-                # critic_loss.backward()
-                # optimizer.step()
+                self.actor_optimizer.zero_grad()
+                log_probs, q_values_0 = self.actor_module.sac_forward_actor(
+                    s0 = {
+                        "images": micro_batch["s0.images"],
+                        "img_masks": micro_batch["s0.image_masks"],
+                        "lang_tokens": micro_batch["s0.lang_tokens"],
+                        "lang_masks": micro_batch["s0.lang_masks"],
+                        "states": micro_batch["s0.states"]
+                    },
+                    a0 = {
+                        "actions": micro_batch["a0.full_action"]
+                    },
+                    shared_features = shared_features
+                )
 
-                # model_pred = self.actor_module.sac_forward_actor(..., shared_features, ...)
+                print("log_probs shape:", log_probs.shape, "q_values_0 shape:", q_values_0.shape)
+                exit(0)
+
                 # actor_loss = self._calculate_actor_loss(...)
                 # actor_loss.backward()
                 # optimizer.step()

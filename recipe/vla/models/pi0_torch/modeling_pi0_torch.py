@@ -193,8 +193,52 @@ class PI0ForActionPrediction(PreTrainedModel, SupportSACTraining):
 
     def _multi_heads_min(self, value_heads: nn.ModuleList, input_tensor: torch.Tensor) -> torch.Tensor:
         q_values = [head(input_tensor) for head in value_heads]
-        q_values_min = torch.min(torch.stack(q_values, dim=0), dim=0).values
+        q_values_min = torch.min(torch.cat(q_values, dim=-1), dim=-1).values
         return q_values_min
+
+    def _get_logprobs(
+        self,
+        s: dict[str, torch.Tensor],
+        prefix_features: tuple[torch.Tensor]
+    ) -> torch.Tensor:
+        prefix_embs, prefix_pad_masks, prefix_att_masks = prefix_features
+        batch_size = prefix_embs.shape[0]
+        device = prefix_embs.device
+
+        actions_shape = (batch_size, self.model.n_action_steps, self.model.max_action_dim)
+        noise = self.model.sample_noise(actions_shape, device)
+
+        prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
+        prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
+
+        # Compute image and language key value cache
+        _, past_key_values = self.model.paligemma_with_expert.forward(
+            attention_mask=prefix_att_2d_masks,
+            position_ids=prefix_position_ids,
+            past_key_values=None,
+            inputs_embeds=[prefix_embs, None],
+            use_cache=self.model.use_cache,
+            fill_kv_cache=True,
+            adarms_cond=[None, None],
+        )
+
+        x_t = noise
+        dt = -1.0 / self.model.num_steps
+        timesteps = torch.arange(1.0, -dt / 2, dt, dtype=torch.float32, device=device)
+        for timestep in timesteps:
+            v_t = self.model.denoise_step(
+                s["states"],
+                prefix_pad_masks,
+                past_key_values,
+                x_t,
+                timestep.expand(batch_size),
+            )
+            x_t += dt * v_t
+
+        actions = x_t
+        log_probs = actions.mean(dim=(1, 2)) # TODO: compute log probs properly (flow noise/flow sde)
+
+        return log_probs
 
     @override
     def sac_forward_critic(
@@ -219,18 +263,22 @@ class PI0ForActionPrediction(PreTrainedModel, SupportSACTraining):
             a1: Dictionary of tensors representing the next actions, with same keys as a0.
 
         Returns:
-            q_values_0: torch.Tensor of shape (B, 1), Q values for (s0, a0), computed by critic heads.
-            q_values_1: torch.Tensor of shape (B, 1), Q values for (s1, a1), computed by target network.
+            q_values_0: torch.Tensor of shape (B,), Q values for (s0, a0), computed by critic heads.
+            q_values_1: torch.Tensor of shape (B,), Q values for (s1, a1), computed by target network.
+            log_probs_1: torch.Tensor of shape (B,), log probabilities of actions a1 under the current policy.
             shared_features: tuple containing shared features computed by the critic, it will be used in
                              sac_forward_actor.
         """
 
-        prefix_features = self.model.embed_prefix(
-            images=torch.cat([s0["images"], s1["images"]], dim=0).unbind(dim=1),
-            img_masks=torch.cat([s0["img_masks"], s1["img_masks"]], dim=0).unbind(dim=1),
-            lang_tokens=torch.cat([s0["lang_tokens"], s1["lang_tokens"]], dim=0),
-            lang_masks=torch.cat([s0["lang_masks"], s1["lang_masks"]], dim=0),
-        )
+        with torch.no_grad():
+            prefix_features = self.model.embed_prefix(
+                images=torch.cat([s0["images"], s1["images"]], dim=0).unbind(dim=1),
+                img_masks=torch.cat([s0["img_masks"], s1["img_masks"]], dim=0).unbind(dim=1),
+                lang_tokens=torch.cat([s0["lang_tokens"], s1["lang_tokens"]], dim=0),
+                lang_masks=torch.cat([s0["lang_masks"], s1["lang_masks"]], dim=0),
+            )
+        prefix_features_0 = tuple(feature_chunk.chunk(2, dim=0)[0] for feature_chunk in prefix_features)
+        prefix_features_1 = tuple(feature_chunk.chunk(2, dim=0)[1] for feature_chunk in prefix_features)
         prefix_embs, _, _ = prefix_features                        # (2B, 968, 2048)
         states = torch.cat([s0["states"], s1["states"]], dim=0)    # (2B, 32)
         actions = torch.cat([a0["actions"], a1["actions"]], dim=0) # (2B, 50, 32)
@@ -241,10 +289,11 @@ class PI0ForActionPrediction(PreTrainedModel, SupportSACTraining):
         critic_input_0, critic_input_1 = torch.chunk(critic_input, 2, dim=0)             # (B,  3680)
 
         q_values_0 = self._multi_heads_min(self.critic_heads, critic_input_0)
-        q_values_1 = self._multi_heads_min(self.target_network_heads, critic_input_1)
+        with torch.no_grad():
+            q_values_1 = self._multi_heads_min(self.target_network_heads, critic_input_1)
+            log_probs_1 = self._get_logprobs(s1, prefix_features_1)
 
-        prefix_features_0 = tuple(feature_chunk.chunk(2, dim=0)[0] for feature_chunk in prefix_features)
-        return q_values_0, q_values_1, (critic_input_0, prefix_features_0)
+        return (q_values_0, q_values_1, log_probs_1, (critic_input_0, prefix_features_0))
 
     @override
     def sac_forward_actor(
@@ -272,43 +321,9 @@ class PI0ForActionPrediction(PreTrainedModel, SupportSACTraining):
         """
 
         critic_input, prefix_features = shared_features
-        prefix_embs, prefix_pad_masks, prefix_att_masks = prefix_features
-        batch_size = prefix_embs.shape[0]
-        device = prefix_embs.device
 
-        actions_shape = (batch_size, self.model.n_action_steps, self.model.max_action_dim)
-        noise = self.model.sample_noise(actions_shape, device)
-
-        prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
-        prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
-
-        # Compute image and language key value cache
-        _, past_key_values = self.model.paligemma_with_expert.forward(
-            attention_mask=prefix_att_2d_masks,
-            position_ids=prefix_position_ids,
-            past_key_values=None,
-            inputs_embeds=[prefix_embs, None],
-            use_cache=self.model.use_cache,
-            fill_kv_cache=True,
-            adarms_cond=[None, None],
-        )
-
-        x_t = noise
-        dt = -1.0 / self.model.num_steps
-        timesteps = torch.arange(1.0, -dt / 2, dt, dtype=torch.float32, device=device)
-        for timestep in timesteps:
-            v_t = self.model.denoise_step(
-                s0["states"],
-                prefix_pad_masks,
-                past_key_values,
-                x_t,
-                timestep.expand(batch_size),
-            )
-            x_t += dt * v_t
-
-        actions = x_t
+        log_probs = self._get_logprobs(s0, prefix_features)
         q_values_0 = self._multi_heads_min(self.critic_heads, critic_input)
-        log_probs = actions # TODO: compute log probs properly
 
         return log_probs, q_values_0
 
@@ -323,4 +338,4 @@ class PI0ForActionPrediction(PreTrainedModel, SupportSACTraining):
 
         for target_head, head in zip(self.target_network_heads, self.critic_heads):
             for target_param, param in zip(target_head.parameters(), head.parameters()):
-                target_param.data.copy_(tau * param.data + (1.0 - tau) * target_param.data)
+                target_param.data.mul_(1.0 - tau).add_(param.data, alpha=tau)
