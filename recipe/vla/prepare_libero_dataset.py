@@ -56,7 +56,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--task_suite_name", default="libero_10")
     parser.add_argument(
-        "--local_save_dir", default="~/data/libero_rl", help="The save directory for the preprocessed dataset."
+        "--local_save_dir", default="/shared_disk/users/yifei.nie/verl_outputs/test/datasets", help="The save directory for the preprocessed dataset."
     )
     args = parser.parse_args()
     random.seed(42)

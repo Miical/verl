@@ -20,6 +20,9 @@ from .pi0_utils import (
 from ..modules.mlp import MLP
 from ...sac.base import SupportSACTraining
 
+from typing import Any, Literal
+from torch.distributions import Normal
+
 class PI0ForActionPrediction(PreTrainedModel, SupportSACTraining):
     config_class = PI0TorchConfig
     base_model_prefix = "pi0_torch"
@@ -200,7 +203,8 @@ class PI0ForActionPrediction(PreTrainedModel, SupportSACTraining):
     def _get_logprobs(
         self,
         s: dict[str, torch.Tensor],
-        prefix_features: tuple[torch.Tensor]
+        prefix_features: tuple[torch.Tensor],
+        mode: Literal['train', 'eval'] = 'train',
     ) -> torch.Tensor:
         prefix_embs, prefix_pad_masks, prefix_att_masks = prefix_features
         batch_size = prefix_embs.shape[0]
@@ -226,6 +230,7 @@ class PI0ForActionPrediction(PreTrainedModel, SupportSACTraining):
         x_t = noise
         dt = -1.0 / self.model.num_steps
         timesteps = torch.arange(1.0, -dt / 2, dt, dtype=torch.float32, device=device)
+        infer_chains = [x_t]
         for timestep in timesteps:
             v_t = self.model.denoise_step(
                 s["states"],
@@ -235,9 +240,55 @@ class PI0ForActionPrediction(PreTrainedModel, SupportSACTraining):
                 timestep.expand(batch_size),
             )
             x_t += dt * v_t
+            infer_chains.append(x_t)
 
-        actions = x_t
-        log_probs = actions.mean(dim=(1, 2)) # TODO: compute log probs properly (flow noise/flow sde)
+        if "chains" and "denoise_inds" in s:    # for PPO
+            chains = s["chains"]
+            noise_injection_idx = s["denoise_inds"]
+        else:
+            chains = infer_chains               # for SAC
+            # no need to condsider T-dim, since data shoule be flatten before 
+            noise_injection_idx = torch.randint(0, self.actor.num_steps-1, size=(batch_size,), device=device)
+
+        # TODO
+        if mode == "eval":
+            noise_injection_idx = torch.zeros_like(noise_injection_idx)
+
+        x_t = chains[torch.arange(batch_size), noise_injection_idx, :, :]
+        x_next = chains[torch.arange(batch_size), noise_injection_idx+1, :, :]
+        dt = 1.0 / self.actor.num_steps
+        timesteps = torch.arange(1.0, -dt / 2, -dt, dtype=torch.float32, device=device)
+        t = timesteps[noise_injection_idx]  # shape: (bsize,)
+        v_t = self.model.denoise_step(
+            prefix_pad_masks,
+            past_key_values,
+            x_t,
+            t,
+        )
+
+        # get mean and std 
+        dt = torch.tensor([dt], dtype=torch.float32, device=device)[:, None, None].expand_as(x_t)
+        t = t[:, None, None].expand_as(x_t)
+        x0_pred = x_t - v_t * t
+        x1_pred = x_t + v_t * (1 - t)
+        # TODO hyper param
+        noise_level = 0.5
+        sigmas = (
+            noise_level * torch.sqrt(timesteps / (1 - torch.where(timesteps == 1, timesteps[1], timesteps)))[:-1]
+        )
+        sigma_i = sigmas[noise_injection_idx][:, None, None].expand_as(x_t)
+        x0_weight = torch.ones_like(t) - (t - dt)
+        x1_weight = t - dt - sigma_i**2 * dt / (2 * t)
+        x_next_std = torch.sqrt(dt) * sigma_i
+        x_next_mean = x0_pred * x0_weight + x1_pred * x1_weight
+
+        # log_probs = self.actor.get_logprob_norm(x_next, x_next_mean, x_next_std)
+        # entropy = self.actor.gaussian_entropy(x_next_std)
+
+        # Use torch instead
+        self.distribution = Normal(x_next_mean, x_next_std)
+        log_probs = self.distribution.log_prob(x_next)
+        # entropy = self.distribution.entropy().sum(dim=-1)
 
         return log_probs
 
