@@ -244,7 +244,6 @@ class PI0ForActionPrediction(PreTrainedModel, SupportSACTraining):
     @override
     def sac_init(self):
         """Initialize SAC-related components."""
-        pass
 
         self.freeze_vision_tower()
 

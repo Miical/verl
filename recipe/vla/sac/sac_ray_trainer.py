@@ -45,7 +45,6 @@ from verl.trainer.ppo.utils import Role
 from verl.utils.checkpoint.checkpoint_manager import should_save_ckpt_esi
 from verl.utils.debug import marked_timer
 from verl.utils.metric import reduce_metrics
-from verl.utils.replay_pool import SACReplayPool
 
 from recipe.vla.sac.core_algos import compute_discounted_returns
 
@@ -267,9 +266,6 @@ class RobRayPPOTrainer(RayPPOTrainer):
             else False
         )
         next_step_profile = False
-
-
-        self.replay_pool = SACReplayPool()
 
         for epoch in range(self.config.trainer.total_epochs):
             for batch_dict in self.train_dataloader:

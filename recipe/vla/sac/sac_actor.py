@@ -25,6 +25,7 @@ from verl.protocol import DataProto
 from verl.utils.device import get_device_id, get_device_name
 from verl.utils.py_functional import append_to_dict
 from verl.utils.profiler import simple_timer
+from verl.utils.replay_pool import SACReplayPool
 from .base import SupportSACTraining, BaseSACActor
 
 logger = logging.getLogger(__name__)
@@ -40,13 +41,14 @@ class PI0RobDataParallelPPOActor(BaseSACActor):
         super().__init__()
         self.config = config
         self.device = get_device_name()
-        self.actor_module = actor_module
-        self.actor_optimizer = actor_optimizer
 
+        self.actor_optimizer = actor_optimizer
+        self.actor_module = actor_module
         self.actor_module.sac_init()
 
-        self.use_remove_padding = self.config.get("use_remove_padding", False)
-        logger.info(f"Actor use_remove_padding={self.use_remove_padding}")
+        self.replay_pool = SACReplayPool(capacity=self.config.replay_pool_capacity, sample_device=self.device)
+        self.replay_pool.load(self.config.replay_pool_save_dir)
+
 
     def _calculate_actor_loss(self, model_pred: torch.Tensor, action_loss_mask: torch.Tensor) -> torch.Tensor:
         # TODO: sac actor loss input args: logprobs(B, T, D), q_value(B, 1)
@@ -225,6 +227,7 @@ class PI0RobDataParallelPPOActor(BaseSACActor):
             "response_mask"
         ]).batch
 
+        batch = self.replay_pool.insert_and_resample(batch)
         micro_batches = batch.split(self.config.ppo_micro_batch_size_per_gpu)
 
         metrics = {}
@@ -235,6 +238,10 @@ class PI0RobDataParallelPPOActor(BaseSACActor):
 
             mini_batch_metrics = {"actor/grad_norm": grad_norm.detach().item()}
             append_to_dict(metrics, mini_batch_metrics)
+
+        # TODO: save replay pool periodically
+        self.replay_pool.save(self.config.replay_pool_save_dir)
+
         return metrics
 
     def _optimizer_step(self):

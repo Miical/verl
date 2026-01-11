@@ -47,6 +47,8 @@ actor_rollout_ref:
     training_actions_per_chunk: 10
     num_images_in_input: 1
     traj_mini_batch_size: 16
+    replay_pool_capacity: 10000
+    replay_pool_save_dir: /tmp/replay_pools
     fsdp_config:
       wrap_policy:
         transformer_layer_cls_to_wrap:
