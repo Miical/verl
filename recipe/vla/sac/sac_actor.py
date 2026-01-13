@@ -18,6 +18,7 @@ Single Process Actor
 import torch
 import logging
 from typing_extensions import override
+from tensordict import TensorDict
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 import torch.nn.functional as F
 
@@ -29,6 +30,28 @@ from verl.utils.replay_pool import SACReplayPool
 from .base import SupportSACTraining, BaseSACActor
 
 logger = logging.getLogger(__name__)
+
+
+def get_dict_from_prefix(tensordict: TensorDict, prefix: str) -> dict:
+    """Extract a sub-dictionary from a TensorDict based on a given prefix.
+
+    Args:
+        tensordict: The input TensorDict containing various keys.
+        prefix: The prefix string to filter keys.
+    Returns:
+        A dictionary containing key-value pairs from the TensorDict
+        where the keys start with the specified prefix. The prefix is removed
+        from the keys in the resulting dictionary.
+    """
+
+    result = {}
+    prefix_length = len(prefix)
+    for key in tensordict.keys():
+        if key.startswith(prefix):
+            new_key = key[prefix_length:]
+            result[new_key] = tensordict[key]
+    return result
+
 
 class PI0RobDataParallelPPOActor(BaseSACActor):
     def __init__(
@@ -50,21 +73,33 @@ class PI0RobDataParallelPPOActor(BaseSACActor):
         self.replay_pool.load(self.config.replay_pool_save_dir)
 
 
-    def _calculate_actor_loss(self, model_pred: torch.Tensor, action_loss_mask: torch.Tensor) -> torch.Tensor:
-        # TODO: sac actor loss input args: logprobs(B, T, D), q_value(B, 1)
+    def _calculate_actor_loss(
+        self,
+        log_probs: torch.Tensor,
+        q_values: torch.Tensor,
+        action_loss_mask: torch.Tensor,
+    ) -> torch.Tensor:
         """Calculate actor loss using the PI0 loss function.
 
         Args:
-            model_pred: Predicted v_t with shape (B, T, D).
-            action_loss_mask: Mask of shape (B, T) indicating valid action steps.
+            log_probs: Tensor of shape (B,) representing the log probabilities of actions.
+            q_values: Tensor of shape (B,) representing the Q-values for the actions.
+            action_loss_mask: Tensor of shape (B, T) indicating valid actions for loss computation.
 
         Returns:
             Tensor of shape (1,) representing the actor loss.
         """
 
-        loss = self.loss_func(model_pred, action_loss_mask)
-        training_actions_per_chunk = self.config.get("training_actions_per_chunk", loss.shape[1])
-        actor_loss = loss[:, :training_actions_per_chunk].mean()
+        alpha = 0.5  # config
+
+        # valid sample mask: (B,)
+        valid = action_loss_mask.any(dim=1).to(torch.float32)
+
+        # L_pi = E[ alpha * logpi - Q ]
+        loss = (alpha * log_probs - q_values)
+
+        actor_loss = (loss * valid).sum() / (valid.sum().clamp_min(1.0))
+
         return actor_loss
 
     def _calculate_critic_loss(
@@ -87,8 +122,11 @@ class PI0RobDataParallelPPOActor(BaseSACActor):
             critic_loss = F.mse_loss(q_pred, y, reduction="none").mean(dim=0).sum()
             return critic_loss
 
-    def _forward_step(self, micro_batch: DataProto) -> torch.Tensor:
+    def _forward_step(self, micro_batch: TensorDict) -> torch.Tensor:
         micro_batch = micro_batch.to(get_device_id())
+        s0 = get_dict_from_prefix(micro_batch, "s0.")
+        s1 = get_dict_from_prefix(micro_batch, "s1.")
+        a0 = get_dict_from_prefix(micro_batch, "a0.")
 
         # make action loss mask
         actions = micro_batch["a0.full_action"]
@@ -108,29 +146,7 @@ class PI0RobDataParallelPPOActor(BaseSACActor):
         self.actor_optimizer.zero_grad()
         with simple_timer("training forward_step", timing_generate):
             with torch.autocast(device_type=get_device_name(), dtype=torch.bfloat16):
-
-                q_values_0, q_values_1, log_probs_1, shared_features = self.actor_module.sac_forward_critic(
-                    s0 = {
-                        "images": micro_batch["s0.images"],
-                        "img_masks": micro_batch["s0.image_masks"],
-                        "lang_tokens": micro_batch["s0.lang_tokens"],
-                        "lang_masks": micro_batch["s0.lang_masks"],
-                        "states": micro_batch["s0.states"]
-                    },
-                    a0 = {
-                        "actions": micro_batch["a0.full_action"]
-                    },
-                    s1 = {
-                        "images": micro_batch["s1.images"],
-                        "img_masks": micro_batch["s1.image_masks"],
-                        "lang_tokens": micro_batch["s1.lang_tokens"],
-                        "lang_masks": micro_batch["s1.lang_masks"],
-                        "states": micro_batch["s1.states"]
-                    },
-                    a1 = {
-                        "actions": micro_batch["a1.full_action"]
-                    }
-                )
+                q_values_0, q_values_1, log_probs_1, shared_features = self.actor_module.sac_forward_critic(s0, a0, s1)
                 critic_loss = self._calculate_critic_loss(
                     q_pred=q_values_0,
                     q_targ=q_values_1,
@@ -142,29 +158,16 @@ class PI0RobDataParallelPPOActor(BaseSACActor):
                 grad_norm = self._optimizer_step()
 
                 self.actor_optimizer.zero_grad()
-                log_probs, q_values_0 = self.actor_module.sac_forward_actor(
-                    s0 = {
-                        "images": micro_batch["s0.images"],
-                        "img_masks": micro_batch["s0.image_masks"],
-                        "lang_tokens": micro_batch["s0.lang_tokens"],
-                        "lang_masks": micro_batch["s0.lang_masks"],
-                        "states": micro_batch["s0.states"]
-                    },
-                    a0 = {
-                        "actions": micro_batch["a0.full_action"]
-                    },
-                    shared_features = shared_features
+                log_probs, q_values_0 = self.actor_module.sac_forward_actor(s0, shared_features)
+                actor_loss = self._calculate_actor_loss(
+                    log_probs=log_probs,
+                    q_values=q_values_0,
+                    action_loss_mask=action_loss_mask
                 )
-
-                # actor_loss = self._calculate_actor_loss(...)
-                # actor_loss.backward()
-                # optimizer.step()
+                actor_loss.backward()
+                grad_norm = self._optimizer_step()
 
                 self.actor_module.sac_update_target_network(tau=0.01)
-
-                print("log_probs shape:", log_probs.shape, "q_values_0 shape:", q_values_0.shape)
-
-                exit(0)
 
         print("training foward_step(s): %s" % timing_generate.get("training forward_step", 0.0))
 
@@ -209,19 +212,13 @@ class PI0RobDataParallelPPOActor(BaseSACActor):
                     mask indicating whether each sample has a valid response.
         """
 
-        batch = data.select([
-            "a0.full_action",
-            "a1.full_action",
-            "s0.states",
-            "s1.states",
-            "s0.images",
-            "s1.images",
-            "s0.image_masks",
-            "s1.image_masks",
-            "s0.lang_tokens",
-            "s1.lang_tokens",
-            "s0.lang_masks",
-            "s1.lang_masks",
+        batch: TensorDict = data.select([
+            "a0.full_action", "a1.full_action",
+            "s0.states", "s1.states",
+            "s0.images", "s1.images",
+            "s0.image_masks", "s1.image_masks",
+            "s0.lang_tokens", "s1.lang_tokens",
+            "s0.lang_masks", "s1.lang_masks",
             "rewards",
             "returns",
             "response_mask"
