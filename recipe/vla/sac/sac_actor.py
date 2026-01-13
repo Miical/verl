@@ -15,8 +15,9 @@
 Single Process Actor
 """
 
-import torch
 import logging
+import math
+import torch
 from typing_extensions import override
 from tensordict import TensorDict
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
@@ -73,6 +74,22 @@ class PI0RobDataParallelPPOActor(BaseSACActor):
         self.replay_pool = SACReplayPool(capacity=self.config.replay_pool_capacity, sample_device=self.device)
         self.replay_pool.load(self.config.replay_pool_save_dir)
 
+        self.auto_entropy = getattr(self.sac_config, "auto_entropy", False)
+        self.alpha_optimizer = None
+        if self.auto_entropy:
+            initial_alpha = float(self.sac_config.alpha)
+            self.log_alpha = torch.tensor(
+                math.log(initial_alpha),
+                device=get_device_name(),
+                requires_grad=True,
+            )
+            alpha_lr = float(getattr(self.sac_config, "alpha_lr", 3e-4))
+            self.alpha_optimizer = torch.optim.Adam([self.log_alpha], lr=alpha_lr)
+            target_entropy = getattr(self.sac_config, "target_entropy", None)
+            if target_entropy is None:
+                raise ValueError("sac.target_entropy must be set when sac.auto_entropy is enabled.")
+            self.target_entropy = torch.tensor(float(target_entropy), device=get_device_name())
+
 
     def _calculate_actor_loss(
         self,
@@ -91,10 +108,16 @@ class PI0RobDataParallelPPOActor(BaseSACActor):
             Tensor of shape (1,) representing the actor loss.
         """
 
-        loss = (self.sac_config.alpha * log_probs - q_values)
+        alpha = self._get_alpha()
+        loss = (alpha * log_probs - q_values)
         actor_loss = (loss * done).sum() / (done.sum().clamp_min(1.0))
 
         return actor_loss
+
+    def _calculate_alpha_loss(self, log_probs: torch.Tensor, done: torch.Tensor) -> torch.Tensor:
+        loss = -self.log_alpha * (log_probs.detach() + self.target_entropy)
+        alpha_loss = (loss * done).sum() / (done.sum().clamp_min(1.0))
+        return alpha_loss
 
     def _calculate_critic_loss(
         self,
@@ -118,7 +141,7 @@ class PI0RobDataParallelPPOActor(BaseSACActor):
         """
 
         gamma = self.sac_config.gamma
-        alpha = self.sac_config.alpha
+        alpha = self._get_alpha()
 
         with torch.no_grad():
             y = rewards + (1.0 - done.to(torch.float32)) * gamma * (q_target - alpha * next_log_prob)
@@ -126,6 +149,11 @@ class PI0RobDataParallelPPOActor(BaseSACActor):
         y = y.unsqueeze(1).expand_as(q_predict) # (B, critic_num)
         critic_loss = F.mse_loss(q_predict, y, reduction="none").mean(dim=0).sum()
         return critic_loss
+
+    def _get_alpha(self) -> torch.Tensor:
+        if self.auto_entropy:
+            return self.log_alpha.exp().detach()
+        return torch.tensor(float(self.sac_config.alpha), device=get_device_name())
 
     def _forward_critic(self, micro_batch: TensorDict) -> torch.Tensor:
         s0 = get_dict_from_prefix(micro_batch, "s0.")
@@ -146,7 +174,7 @@ class PI0RobDataParallelPPOActor(BaseSACActor):
         print("training forward_critic(s): %s" % timing_generate.get("_forward_critic", 0.0))
         return critic_loss
 
-    def _forward_actor(self, micro_batch: TensorDict) -> torch.Tensor:
+    def _forward_actor(self, micro_batch: TensorDict) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         micro_batch = micro_batch.to(get_device_id())
         s0 = get_dict_from_prefix(micro_batch, "s0.")
 
@@ -160,7 +188,8 @@ class PI0RobDataParallelPPOActor(BaseSACActor):
                     done=micro_batch["response_mask"].max(dim=-1).values,
                 )
         print("training forward_actor(s): %s" % timing_generate.get("_forward_actor", 0.0))
-        return actor_loss
+        done = micro_batch["response_mask"].max(dim=-1).values
+        return actor_loss, log_probs, done
 
     @override
     def update_policy(self, data: DataProto):
@@ -228,14 +257,21 @@ class PI0RobDataParallelPPOActor(BaseSACActor):
 
         # Training actor
         self.actor_optimizer.zero_grad()
+        if self.auto_entropy:
+            self.alpha_optimizer.zero_grad()
         for batch_idx, micro_batch in enumerate(micro_batches):
             print(f"[{batch_idx+1}/{len(micro_batches)}] actor micro batch ")
 
             micro_batch = micro_batch.to(get_device_id())
-            actor_loss = self._forward_actor(micro_batch)
+            actor_loss, log_probs, done = self._forward_actor(micro_batch)
             actor_loss.backward()
             actor_loss_list.append(actor_loss.detach().item())
+            if self.auto_entropy:
+                alpha_loss = self._calculate_alpha_loss(log_probs, done)
+                alpha_loss.backward()
         actor_grad_norm = self._optimizer_step()
+        if self.auto_entropy:
+            self.alpha_optimizer.step()
 
         # Update target networks
         self.actor_module.sac_update_target_network(self.sac_config.tau)
@@ -250,6 +286,7 @@ class PI0RobDataParallelPPOActor(BaseSACActor):
         metrics["critic/loss"] = sum(critic_loss_list) / len(critic_loss_list) if critic_loss_list else 0.0
         metrics["actor/grad_norm"] = actor_grad_norm.detach().item()
         metrics["critic/grad_norm"] = critic_grad_norm.detach().item()
+        metrics["actor/alpha"] = self._get_alpha().detach().item()
 
         return metrics
 
