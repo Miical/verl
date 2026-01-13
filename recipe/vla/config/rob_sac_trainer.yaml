@@ -45,7 +45,7 @@ actor_rollout_ref:
       double_q: True
   actor:
     sac:
-      gamma: 0.99
+      gamma: 0.96
       tau: 0.005
       alpha: 0.2
     replay_pool_save_interval: 10

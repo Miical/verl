@@ -213,9 +213,9 @@ class PI0RobDataParallelPPOActor(BaseSACActor):
 
         batch = self.replay_pool.insert_and_resample(batch)
         micro_batches = batch.split(self.config.ppo_micro_batch_size_per_gpu)
+        actor_loss_list, critic_loss_list = [], []
 
         # Training critic
-        metrics = {}
         self.actor_optimizer.zero_grad()
         for batch_idx, micro_batch in enumerate(micro_batches):
             print(f"[{batch_idx+1}/{len(micro_batches)}] critic micro batch ")
@@ -223,7 +223,8 @@ class PI0RobDataParallelPPOActor(BaseSACActor):
             micro_batch = micro_batch.to(get_device_id())
             critic_loss = self._forward_critic(micro_batch)
             critic_loss.backward()
-        grad_norm = self._optimizer_step()
+            critic_loss_list.append(critic_loss.detach().item())
+        critic_grad_norm = self._optimizer_step()
 
         # Training actor
         self.actor_optimizer.zero_grad()
@@ -233,7 +234,8 @@ class PI0RobDataParallelPPOActor(BaseSACActor):
             micro_batch = micro_batch.to(get_device_id())
             actor_loss = self._forward_actor(micro_batch)
             actor_loss.backward()
-        grad_norm = self._optimizer_step()
+            actor_loss_list.append(actor_loss.detach().item())
+        actor_grad_norm = self._optimizer_step()
 
         # Update target networks
         self.actor_module.sac_update_target_network(self.sac_config.tau)
@@ -242,8 +244,12 @@ class PI0RobDataParallelPPOActor(BaseSACActor):
         if global_steps % self.config.replay_pool_save_interval == 0:
             self.replay_pool.save(self.config.replay_pool_save_dir)
 
-        # mini_batch_metrics = {"actor/grad_norm": grad_norm.detach().item()}
-        # append_to_dict(metrics, mini_batch_metrics)
+        # Log metrics
+        metrics = {}
+        metrics["actor/loss"] = sum(actor_loss_list) / len(actor_loss_list) if actor_loss_list else 0.0
+        metrics["critic/loss"] = sum(critic_loss_list) / len(critic_loss_list) if critic_loss_list else 0.0
+        metrics["actor/grad_norm"] = actor_grad_norm.detach().item()
+        metrics["critic/grad_norm"] = critic_grad_norm.detach().item()
 
         return metrics
 
