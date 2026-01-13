@@ -84,7 +84,7 @@ class PI0RobDataParallelPPOActor(BaseSACActor):
         Args:
             log_probs: Tensor of shape (B,) representing the log probabilities of actions.
             q_values: Tensor of shape (B,) representing the Q-values for the actions.
-            action_loss_mask: Tensor of shape (B, T) indicating valid actions for loss computation.
+            action_loss_mask: Tensor of shape (B, action_steps) indicating valid actions for loss computation.
 
         Returns:
             Tensor of shape (1,) representing the actor loss.
@@ -122,31 +122,15 @@ class PI0RobDataParallelPPOActor(BaseSACActor):
             critic_loss = F.mse_loss(q_pred, y, reduction="none").mean(dim=0).sum()
             return critic_loss
 
-    def _forward_step(self, micro_batch: TensorDict) -> torch.Tensor:
-        micro_batch = micro_batch.to(get_device_id())
+    def _forward_critic(self, micro_batch: TensorDict) -> torch.Tensor:
         s0 = get_dict_from_prefix(micro_batch, "s0.")
         s1 = get_dict_from_prefix(micro_batch, "s1.")
         a0 = get_dict_from_prefix(micro_batch, "a0.")
 
-        # make action loss mask
-        actions = micro_batch["a0.full_action"]
-        batch_size, action_chunk_size = actions.shape[0], actions.shape[1]
-        training_actions_per_chunk = self.config.get("training_actions_per_chunk", action_chunk_size)
-        action_loss_mask = torch.cat([
-            torch.ones((batch_size, training_actions_per_chunk),
-                       dtype=torch.bool,
-                       device=self.device),
-            torch.zeros((batch_size, action_chunk_size - training_actions_per_chunk),
-                        dtype=torch.bool,
-                        device=self.device)
-        ], dim=1)
-
-        # get model prediction
         timing_generate = {}
-        self.actor_optimizer.zero_grad()
-        with simple_timer("training forward_step", timing_generate):
+        with simple_timer("_forward_critic", timing_generate):
             with torch.autocast(device_type=get_device_name(), dtype=torch.bfloat16):
-                q_values_0, q_values_1, log_probs_1, shared_features = self.actor_module.sac_forward_critic(s0, a0, s1)
+                q_values_0, q_values_1, log_probs_1 = self.actor_module.sac_forward_critic(s0, a0, s1)
                 critic_loss = self._calculate_critic_loss(
                     q_pred=q_values_0,
                     q_targ=q_values_1,
@@ -154,24 +138,24 @@ class PI0RobDataParallelPPOActor(BaseSACActor):
                     done=micro_batch["response_mask"].max(dim=-1).values,
                     next_log_prob=log_probs_1
                 )
-                critic_loss.backward()
-                grad_norm = self._optimizer_step()
+        print("training forward_critic(s): %s" % timing_generate.get("_forward_critic", 0.0))
+        return critic_loss
 
-                self.actor_optimizer.zero_grad()
-                log_probs, q_values_0 = self.actor_module.sac_forward_actor(s0, shared_features)
+    def _forward_actor(self, micro_batch: TensorDict) -> torch.Tensor:
+        micro_batch = micro_batch.to(get_device_id())
+        s0 = get_dict_from_prefix(micro_batch, "s0.")
+
+        timing_generate = {}
+        with simple_timer("_forward_actor", timing_generate):
+            with torch.autocast(device_type=get_device_name(), dtype=torch.bfloat16):
+                log_probs, q_values_0 = self.actor_module.sac_forward_actor(s0)
                 actor_loss = self._calculate_actor_loss(
                     log_probs=log_probs,
                     q_values=q_values_0,
-                    action_loss_mask=action_loss_mask
+                    action_loss_mask=micro_batch["a0.full_action"].bool()
                 )
-                actor_loss.backward()
-                grad_norm = self._optimizer_step()
-
-                self.actor_module.sac_update_target_network(tau=0.01)
-
-        print("training foward_step(s): %s" % timing_generate.get("training forward_step", 0.0))
-
-        return grad_norm
+        print("training forward_actor(s): %s" % timing_generate.get("_forward_actor", 0.0))
+        return actor_loss
 
     @override
     def update_policy(self, data: DataProto):
@@ -227,14 +211,30 @@ class PI0RobDataParallelPPOActor(BaseSACActor):
         batch = self.replay_pool.insert_and_resample(batch)
         micro_batches = batch.split(self.config.ppo_micro_batch_size_per_gpu)
 
+        # Training critic
         metrics = {}
+        self.actor_optimizer.zero_grad()
+        for batch_idx, micro_batch in enumerate(micro_batches):
+            print(f"[{batch_idx+1}/{len(micro_batches)}] critic micro batch ")
+
+            micro_batch = micro_batch.to(get_device_id())
+            critic_loss = self._forward_critic(micro_batch)
+            critic_loss.backward()
+        grad_norm = self._optimizer_step()
+
+        # Training actor
+        self.actor_optimizer.zero_grad()
         for batch_idx, micro_batch in enumerate(micro_batches):
             print(f"[{batch_idx+1}/{len(micro_batches)}] actor micro batch ")
 
-            grad_norm = self._forward_step(micro_batch)
+            micro_batch = micro_batch.to(get_device_id())
+            actor_loss = self._forward_actor(micro_batch)
+            actor_loss.backward()
+        grad_norm = self._optimizer_step()
 
-            mini_batch_metrics = {"actor/grad_norm": grad_norm.detach().item()}
-            append_to_dict(metrics, mini_batch_metrics)
+
+        # mini_batch_metrics = {"actor/grad_norm": grad_norm.detach().item()}
+        # append_to_dict(metrics, mini_batch_metrics)
 
         # TODO: save replay pool periodically
         self.replay_pool.save(self.config.replay_pool_save_dir)

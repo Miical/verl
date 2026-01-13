@@ -414,8 +414,6 @@ class PI0ForActionPrediction(PreTrainedModel, SupportSACTraining):
             q_values_0: torch.Tensor of shape (B, head_num), Q values for (s0, a0), computed by critic heads.
             q_values_1: torch.Tensor of shape (B,), Q values for (s1, a1), computed by target network.
             log_probs_1: torch.Tensor of shape (B,), log probabilities of actions a1 under the current policy.
-            shared_features: tuple containing shared features computed by the critic, it will be used in
-                             sac_forward_actor.
         """
 
         # Prepare prefix features for s0 and s1
@@ -454,13 +452,12 @@ class PI0ForActionPrediction(PreTrainedModel, SupportSACTraining):
         with torch.no_grad():
             q_values_1 = self._multi_heads_value(self.target_network_heads, critic_input_1, method="min")
 
-        return (q_values_0, q_values_1, log_probs_1, (prefix_features_0,))
+        return q_values_0, q_values_1, log_probs_1
 
     @override
     def sac_forward_actor(
         self,
         s0: dict[str, torch.Tensor],
-        shared_features: tuple[torch.Tensor, tuple],
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Compute log probabilities and Q-values for actions sampled by the actor.
 
@@ -471,7 +468,6 @@ class PI0ForActionPrediction(PreTrainedModel, SupportSACTraining):
                 - "lang_tokens": torch.Tensor of shape (B, L)
                 - "lang_masks": torch.Tensor of shape (B, L)
                 - "states": torch.Tensor of shape (B, state_dim)
-            shared_features: tuple containing shared features computed by the critic in sac_forward_critic.
 
         Returns:
             log_probs: torch.Tensor of shape (B, 1), log probabilities of the actions sampled by the actor.
@@ -481,7 +477,13 @@ class PI0ForActionPrediction(PreTrainedModel, SupportSACTraining):
         for p in self.critic_heads.parameters():
             p.requires_grad_(False)
 
-        prefix_features = shared_features[0]
+        with torch.no_grad():
+            prefix_features = self.model.embed_prefix(
+                images=s0["images"].unbind(dim=1),
+                img_masks=s0["image_masks"].unbind(dim=1),
+                lang_tokens=s0["lang_tokens"],
+                lang_masks=s0["lang_masks"],
+            )
         prefix_embs, _, _ = prefix_features
         actions_pi, log_probs = self._sample_actions_and_logprobs_from_prefix(s0["states"], prefix_features)
 
