@@ -107,7 +107,14 @@ class SACReplayPool:
         if not os.path.exists(filepath):
             return False
 
-        pool, meta_info = torch.load(filepath, weights_only=False)
+        try:
+            pool, meta_info = torch.load(filepath, weights_only=False)
+        except (RuntimeError, EOFError, ValueError) as exc:
+            print(
+                f"[Rank {self.rank}] Failed to load replay pool from {filepath}: {exc}. "
+                "Starting with an empty replay pool."
+            )
+            return False
         self.pool = pool.to(self.pool_device)
 
         if meta_info["capacity"] != self.capacity:
@@ -214,4 +221,3 @@ class SACReplayPool:
 
     def __len__(self):
         return self.size
-
