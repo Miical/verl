@@ -63,6 +63,7 @@ class PI0RobDataParallelPPOActor(BaseSACActor):
         """When optimizer is None, it is Reference Policy"""
         super().__init__()
         self.config = config
+        self.sac_config = config.sac
         self.device = get_device_name()
 
         self.actor_optimizer = actor_optimizer
@@ -77,50 +78,54 @@ class PI0RobDataParallelPPOActor(BaseSACActor):
         self,
         log_probs: torch.Tensor,
         q_values: torch.Tensor,
-        action_loss_mask: torch.Tensor,
+        done: torch.Tensor,
     ) -> torch.Tensor:
-        """Calculate actor loss using the PI0 loss function.
+        """Calculate actor loss using the SAC loss function.
 
         Args:
             log_probs: Tensor of shape (B,) representing the log probabilities of actions.
             q_values: Tensor of shape (B,) representing the Q-values for the actions.
-            action_loss_mask: Tensor of shape (B, action_steps) indicating valid actions for loss computation.
+            done: Tensor of shape (B,) indicating terminal states (1 for terminal, 0 for non-terminal).
 
         Returns:
             Tensor of shape (1,) representing the actor loss.
         """
 
-        alpha = 0.5  # config
-
-        # valid sample mask: (B,)
-        valid = action_loss_mask.any(dim=1).to(torch.float32)
-
-        # L_pi = E[ alpha * logpi - Q ]
-        loss = (alpha * log_probs - q_values)
-
-        actor_loss = (loss * valid).sum() / (valid.sum().clamp_min(1.0))
+        loss = (self.sac_config.alpha * log_probs - q_values)
+        actor_loss = (loss * done).sum() / (done.sum().clamp_min(1.0))
 
         return actor_loss
 
     def _calculate_critic_loss(
-            self,
-            q_pred: torch.Tensor,        # (B,)
-            q_targ: torch.Tensor,        # (B,)
-            rewards: torch.Tensor,       # (B,)
-            done: torch.Tensor,          # (B,)  1=terminal
-            next_log_prob: torch.Tensor, # (B,)
-        ) -> torch.Tensor:
-            # gamma = self.config.discount
-            # alpha = self.temperature  # 或 self.log_alpha.exp() / self.temperature
+        self,
+        q_predict: torch.Tensor,
+        q_target: torch.Tensor,
+        rewards: torch.Tensor,
+        done: torch.Tensor,
+        next_log_prob: torch.Tensor,
+    ) -> torch.Tensor:
+        """Calculate critic loss using the SAC loss function.
 
-            gamma = 0.5 # config
-            alpha = 0.5 # config
+        Args:
+            q_predict: Tensor of shape (B, critic_num) representing predicted Q-values.
+            q_target: Tensor of shape (B,) representing target Q-values.
+            rewards: Tensor of shape (B,) representing rewards.
+            done: Tensor of shape (B,) indicating terminal states (1 for terminal, 0 for non-terminal).
+            next_log_prob: Tensor of shape (B,) representing log probabilities of next actions.
 
-            with torch.no_grad():
-                y = rewards + (1.0 - done.to(torch.float32)) * gamma * (q_targ - alpha * next_log_prob)  # (B,)
+        Returns:
+            Tensor of shape (1,) representing the critic loss.
+        """
 
-            critic_loss = F.mse_loss(q_pred, y, reduction="none").mean(dim=0).sum()
-            return critic_loss
+        gamma = self.sac_config.gamma
+        alpha = self.sac_config.alpha
+
+        with torch.no_grad():
+            y = rewards + (1.0 - done.to(torch.float32)) * gamma * (q_target - alpha * next_log_prob)
+
+        y = y.unsqueeze(1).expand_as(q_predict) # (B, critic_num)
+        critic_loss = F.mse_loss(q_predict, y, reduction="none").mean(dim=0).sum()
+        return critic_loss
 
     def _forward_critic(self, micro_batch: TensorDict) -> torch.Tensor:
         s0 = get_dict_from_prefix(micro_batch, "s0.")
@@ -132,8 +137,8 @@ class PI0RobDataParallelPPOActor(BaseSACActor):
             with torch.autocast(device_type=get_device_name(), dtype=torch.bfloat16):
                 q_values_0, q_values_1, log_probs_1 = self.actor_module.sac_forward_critic(s0, a0, s1)
                 critic_loss = self._calculate_critic_loss(
-                    q_pred=q_values_0,
-                    q_targ=q_values_1,
+                    q_predict=q_values_0,
+                    q_target=q_values_1,
                     rewards=micro_batch["rewards"].max(dim=-1).values,
                     done=micro_batch["response_mask"].max(dim=-1).values,
                     next_log_prob=log_probs_1
@@ -152,7 +157,7 @@ class PI0RobDataParallelPPOActor(BaseSACActor):
                 actor_loss = self._calculate_actor_loss(
                     log_probs=log_probs,
                     q_values=q_values_0,
-                    action_loss_mask=micro_batch["a0.full_action"].bool()
+                    done=micro_batch["response_mask"].max(dim=-1).values,
                 )
         print("training forward_actor(s): %s" % timing_generate.get("_forward_actor", 0.0))
         return actor_loss
@@ -190,9 +195,7 @@ class PI0RobDataParallelPPOActor(BaseSACActor):
                     attention masks for language tokens for the next step.
                 - "rewards": Tensor of shape (B,),
                     chunk-level scalar rewards aligned to the next step.
-                - "returns": Tensor of shape (B,),
-                    chunk-level discounted returns aligned to the next step.
-                - "response_mask": Tensor of shape (B,),
+                - "response_mask": Tensor of shape (B, action_steps),
                     mask indicating whether each sample has a valid response.
         """
 
@@ -204,9 +207,9 @@ class PI0RobDataParallelPPOActor(BaseSACActor):
             "s0.lang_tokens", "s1.lang_tokens",
             "s0.lang_masks", "s1.lang_masks",
             "rewards",
-            "returns",
             "response_mask"
         ]).batch
+        global_steps = data.meta_info["global_steps"]
 
         batch = self.replay_pool.insert_and_resample(batch)
         micro_batches = batch.split(self.config.ppo_micro_batch_size_per_gpu)
@@ -232,12 +235,15 @@ class PI0RobDataParallelPPOActor(BaseSACActor):
             actor_loss.backward()
         grad_norm = self._optimizer_step()
 
+        # Update target networks
+        self.actor_module.sac_update_target_network(self.sac_config.tau)
+
+        # Save replay pool
+        if global_steps % self.config.replay_pool_save_interval == 0:
+            self.replay_pool.save(self.config.replay_pool_save_dir)
 
         # mini_batch_metrics = {"actor/grad_norm": grad_norm.detach().item()}
         # append_to_dict(metrics, mini_batch_metrics)
-
-        # TODO: save replay pool periodically
-        self.replay_pool.save(self.config.replay_pool_save_dir)
 
         return metrics
 

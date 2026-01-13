@@ -424,7 +424,6 @@ class PI0ForActionPrediction(PreTrainedModel, SupportSACTraining):
                 lang_tokens=torch.cat([s0["lang_tokens"], s1["lang_tokens"]], dim=0),
                 lang_masks=torch.cat([s0["lang_masks"], s1["lang_masks"]], dim=0),
             )
-        prefix_features_0 = tuple(feature_chunk.chunk(2, dim=0)[0] for feature_chunk in prefix_features)
         prefix_features_1 = tuple(feature_chunk.chunk(2, dim=0)[1] for feature_chunk in prefix_features)
         prefix_embs, _, _ = prefix_features                        # (2B, 968, 2048)
         states = torch.cat([s0["states"], s1["states"]], dim=0)    # (2B, 32)

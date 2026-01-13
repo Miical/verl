@@ -44,10 +44,14 @@ actor_rollout_ref:
       sac_enable: True
       double_q: True
   actor:
-    training_actions_per_chunk: 10
+    sac:
+      gamma: 0.99
+      tau: 0.005
+      alpha: 0.2
+    replay_pool_save_interval: 10
     num_images_in_input: 1
     traj_mini_batch_size: 16
-    replay_pool_capacity: 10000
+    replay_pool_capacity: 1000
     replay_pool_save_dir: /tmp/replay_pools
     fsdp_config:
       wrap_policy:
