@@ -48,6 +48,9 @@ actor_rollout_ref:
       gamma: 0.96
       tau: 0.005
       alpha: 0.2
+      auto_entropy: false
+      alpha_lr: 0.0003
+      target_entropy: -1.0
     replay_pool_save_interval: 10
     num_images_in_input: 1
     traj_mini_batch_size: 16
