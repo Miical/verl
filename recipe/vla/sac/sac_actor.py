@@ -112,14 +112,14 @@ class PI0RobDataParallelPPOActor(BaseSACActor):
         self,
         log_probs: torch.Tensor,
         q_values: torch.Tensor,
-        done: torch.Tensor,
+        valid: torch.Tensor,
     ) -> torch.Tensor:
         """Calculate actor loss using the SAC loss function.
 
         Args:
             log_probs: Tensor of shape (B,) representing the log probabilities of actions.
             q_values: Tensor of shape (B,) representing the Q-values for the actions.
-            done: Tensor of shape (B,) indicating terminal states (1 for terminal, 0 for non-terminal).
+            valid: Tensor of shape (B,) indicating valid samples (1 for valid, 0 for invalid).
 
         Returns:
             Tensor of shape (1,) representing the actor loss.
@@ -127,23 +127,23 @@ class PI0RobDataParallelPPOActor(BaseSACActor):
 
         alpha = self._get_alpha()
         loss = (alpha * log_probs - q_values)
-        actor_loss = (loss * done).sum() / (done.sum().clamp_min(1.0))
+        actor_loss = (loss * valid).sum() / (valid.sum().clamp_min(1.0))
 
         return actor_loss
 
-    def _calculate_alpha_loss(self, log_probs: torch.Tensor, done: torch.Tensor) -> torch.Tensor:
+    def _calculate_alpha_loss(self, log_probs: torch.Tensor, valid: torch.Tensor) -> torch.Tensor:
         """Calculate alpha loss for automatic entropy tuning.
 
         Args:
             log_probs: Tensor of shape (B,) representing the log probabilities of actions.
-            done: Tensor of shape (B,) indicating terminal states (1 for terminal, 0 for non-terminal).
+            valid: Tensor of shape (B,) indicating valid samples (1 for valid, 0 for invalid).
 
         Returns:
             Tensor of shape (1,) representing the alpha loss.
         """
 
         loss = -self.log_alpha * (log_probs.detach() + self.target_entropy)
-        alpha_loss = (loss * done).sum() / (done.sum().clamp_min(1.0))
+        alpha_loss = (loss * valid).sum() / (valid.sum().clamp_min(1.0))
         return alpha_loss
 
     def _calculate_critic_loss(
@@ -151,7 +151,7 @@ class PI0RobDataParallelPPOActor(BaseSACActor):
         q_predict: torch.Tensor,
         q_target: torch.Tensor,
         rewards: torch.Tensor,
-        done: torch.Tensor,
+        valid: torch.Tensor,
         next_log_prob: torch.Tensor,
     ) -> torch.Tensor:
         """Calculate critic loss using the SAC loss function.
@@ -160,7 +160,7 @@ class PI0RobDataParallelPPOActor(BaseSACActor):
             q_predict: Tensor of shape (B, critic_num) representing predicted Q-values.
             q_target: Tensor of shape (B,) representing target Q-values.
             rewards: Tensor of shape (B,) representing rewards.
-            done: Tensor of shape (B,) indicating terminal states (1 for terminal, 0 for non-terminal).
+            valid: Tensor of shape (B,) indicating valid samples (1 for valid, 0 for invalid).
             next_log_prob: Tensor of shape (B,) representing log probabilities of next actions.
 
         Returns:
@@ -171,7 +171,7 @@ class PI0RobDataParallelPPOActor(BaseSACActor):
         alpha = self._get_alpha()
 
         with torch.no_grad():
-            y = rewards + (1.0 - done.to(torch.float32)) * gamma * (q_target - alpha * next_log_prob)
+            y = rewards + valid * gamma * (q_target - alpha * next_log_prob)
 
         y = y.unsqueeze(1).expand_as(q_predict) # (B, critic_num)
         critic_loss = F.mse_loss(q_predict, y, reduction="none").mean(dim=0).sum()
@@ -190,7 +190,7 @@ class PI0RobDataParallelPPOActor(BaseSACActor):
                     q_predict=q_values_0,
                     q_target=q_values_1,
                     rewards=micro_batch["rewards"].max(dim=-1).values,
-                    done=micro_batch["response_mask"].max(dim=-1).values,
+                    valid=micro_batch["response_mask"].max(dim=-1).values,
                     next_log_prob=log_probs_1
                 )
         print("training forward_critic(s): %s" % timing_generate.get("_forward_critic", 0.0))
@@ -207,11 +207,11 @@ class PI0RobDataParallelPPOActor(BaseSACActor):
                 actor_loss = self._calculate_actor_loss(
                     log_probs=log_probs,
                     q_values=q_values_0,
-                    done=micro_batch["response_mask"].max(dim=-1).values,
+                    valid=micro_batch["response_mask"].max(dim=-1).values,
                 )
         print("training forward_actor(s): %s" % timing_generate.get("_forward_actor", 0.0))
-        done = micro_batch["response_mask"].max(dim=-1).values
-        return actor_loss, log_probs, done
+        valid = micro_batch["response_mask"].max(dim=-1).values
+        return actor_loss, log_probs, valid
 
     @override
     def update_policy(self, data: DataProto):
@@ -285,11 +285,11 @@ class PI0RobDataParallelPPOActor(BaseSACActor):
             print(f"[{batch_idx+1}/{len(micro_batches)}] actor micro batch ")
 
             micro_batch = micro_batch.to(get_device_id())
-            actor_loss, log_probs, done = self._forward_actor(micro_batch)
+            actor_loss, log_probs, valid = self._forward_actor(micro_batch)
             actor_loss.backward()
             actor_loss_list.append(actor_loss.detach().item())
             if self.auto_entropy:
-                alpha_loss = self._calculate_alpha_loss(log_probs, done)
+                alpha_loss = self._calculate_alpha_loss(log_probs, valid)
                 alpha_loss.backward()
         actor_grad_norm = self._optimizer_step()
         if self.auto_entropy:
@@ -304,11 +304,15 @@ class PI0RobDataParallelPPOActor(BaseSACActor):
 
         # Log metrics
         metrics = {}
-        metrics["actor/loss"] = sum(actor_loss_list) / len(actor_loss_list) if actor_loss_list else 0.0
-        metrics["critic/loss"] = sum(critic_loss_list) / len(critic_loss_list) if critic_loss_list else 0.0
-        metrics["actor/grad_norm"] = actor_grad_norm.detach().item()
-        metrics["critic/grad_norm"] = critic_grad_norm.detach().item()
+        metrics["reward/mean"] = batch["rewards"].mean().item()
+        metrics["reward/std"] = batch["rewards"].std().item()
+        metrics["valid_ratio"] = batch["response_mask"].max(dim=-1).values.float().mean().item()
+        metrics["actor/replay_pool_size"] = len(self.replay_pool)
         metrics["actor/alpha"] = self._get_alpha().detach().item()
+        metrics["actor/loss"] = sum(actor_loss_list) / len(actor_loss_list) if actor_loss_list else 0.0
+        metrics["actor/grad_norm"] = actor_grad_norm.detach().item()
+        metrics["critic/loss"] = sum(critic_loss_list) / len(critic_loss_list) if critic_loss_list else 0.0
+        metrics["critic/grad_norm"] = critic_grad_norm.detach().item()
 
         return metrics
 

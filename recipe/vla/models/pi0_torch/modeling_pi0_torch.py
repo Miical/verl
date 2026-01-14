@@ -56,7 +56,7 @@ class PI0ForActionPrediction(PreTrainedModel, SupportSACTraining):
             self.critic_heads = nn.ModuleList([
                 MLP(
                     input_dim=3680,  # 2048(prefix mean) + 32(state) + 50*32(action flat)
-                    hidden_dims=[256, 256],
+                    hidden_dims=[256, 256, 256],
                     output_dim=1,
                     activation='relu',
                     init_method='kaiming'
@@ -66,8 +66,8 @@ class PI0ForActionPrediction(PreTrainedModel, SupportSACTraining):
 
             self.target_network_heads = nn.ModuleList([
                 MLP(
-                    input_dim=3680, # config
-                    hidden_dims=[256, 256],
+                    input_dim=3680,
+                    hidden_dims=[256, 256, 256],
                     output_dim=1,
                     activation='relu',
                     init_method='kaiming'
