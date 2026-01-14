@@ -55,7 +55,7 @@ class PI0ForActionPrediction(PreTrainedModel, SupportSACTraining):
 
             self.critic_heads = nn.ModuleList([
                 MLP(
-                    input_dim=3680,  # config: 2048(prefix mean) + 32(state) + 50*32(action flat)
+                    input_dim=3680,  # 2048(prefix mean) + 32(state) + 50*32(action flat)
                     hidden_dims=[256, 256],
                     output_dim=1,
                     activation='relu',
@@ -168,7 +168,7 @@ class PI0ForActionPrediction(PreTrainedModel, SupportSACTraining):
         pred_action = self.model.sample_actions(images, img_masks, lang_tokens, lang_masks, state=state)
 
         # Output transforms
-        state = self.state_unnormalize_transform(state)
+        # state = self.state_unnormalize_transform(state)
         pred_action = self.action_unnormalize_transform(pred_action)
 
         return pred_action, images, img_masks, lang_tokens, lang_masks, state
@@ -415,6 +415,8 @@ class PI0ForActionPrediction(PreTrainedModel, SupportSACTraining):
             q_values_1: torch.Tensor of shape (B,), Q values for (s1, a1), computed by target network.
             log_probs_1: torch.Tensor of shape (B,), log probabilities of actions a1 under the current policy.
         """
+
+        a0 = { "full_action": self.state_normalize_transform(a0["full_action"]) }
 
         # Prepare prefix features for s0 and s1
         with torch.no_grad():
