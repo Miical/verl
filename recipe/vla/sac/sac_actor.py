@@ -59,9 +59,8 @@ class PI0RobDataParallelPPOActor(BaseSACActor):
         self,
         config,
         actor_module: SupportSACTraining,
-        actor_optimizer: torch.optim.Optimizer = None,
+        actor_optimizer: torch.optim.Optimizer,
     ):
-        """When optimizer is None, it is Reference Policy"""
         super().__init__()
         self.config = config
         self.sac_config = config.sac
@@ -75,21 +74,39 @@ class PI0RobDataParallelPPOActor(BaseSACActor):
         self.replay_pool.load(self.config.replay_pool_save_dir)
 
         self.auto_entropy = getattr(self.sac_config, "auto_entropy", False)
-        self.alpha_optimizer = None
-        if self.auto_entropy:
-            initial_alpha = float(self.sac_config.alpha)
-            self.log_alpha = torch.tensor(
-                math.log(initial_alpha),
-                device=get_device_name(),
-                requires_grad=True,
-            )
-            alpha_lr = float(getattr(self.sac_config, "alpha_lr", 3e-4))
-            self.alpha_optimizer = torch.optim.Adam([self.log_alpha], lr=alpha_lr)
-            target_entropy = getattr(self.sac_config, "target_entropy", None)
-            if target_entropy is None:
-                raise ValueError("sac.target_entropy must be set when sac.auto_entropy is enabled.")
-            self.target_entropy = torch.tensor(float(target_entropy), device=get_device_name())
+        self.alpha_optimizer, self.log_alpha, self.target_entropy = self._init_alpha_optimizer()
 
+    def _init_alpha_optimizer(self):
+        """Initialize the alpha optimizer for automatic entropy tuning.
+
+        Returns:
+            alpha_optimizer: The optimizer for the log alpha parameter.
+            log_alpha: The log alpha parameter tensor.
+            target_entropy: The target entropy tensor.
+        """
+
+        if not self.auto_entropy:
+            return None, None, None
+
+        initial_alpha = float(self.sac_config.alpha)
+        log_alpha = torch.tensor(
+            math.log(initial_alpha),
+            device=get_device_name(),
+            requires_grad=True,
+        )
+        alpha_lr = float(getattr(self.sac_config, "alpha_lr", 3e-4))
+        alpha_optimizer = torch.optim.Adam([log_alpha], lr=alpha_lr)
+        target_entropy = getattr(self.sac_config, "target_entropy", None)
+        if target_entropy is None:
+            raise ValueError("sac.target_entropy must be set when sac.auto_entropy is enabled.")
+        target_entropy = torch.tensor(float(target_entropy), device=get_device_name())
+
+        return alpha_optimizer, log_alpha, target_entropy
+
+    def _get_alpha(self) -> torch.Tensor:
+        if self.auto_entropy:
+            return self.log_alpha.exp().detach()
+        return torch.tensor(float(self.sac_config.alpha), device=get_device_name())
 
     def _calculate_actor_loss(
         self,
@@ -115,6 +132,16 @@ class PI0RobDataParallelPPOActor(BaseSACActor):
         return actor_loss
 
     def _calculate_alpha_loss(self, log_probs: torch.Tensor, done: torch.Tensor) -> torch.Tensor:
+        """Calculate alpha loss for automatic entropy tuning.
+
+        Args:
+            log_probs: Tensor of shape (B,) representing the log probabilities of actions.
+            done: Tensor of shape (B,) indicating terminal states (1 for terminal, 0 for non-terminal).
+
+        Returns:
+            Tensor of shape (1,) representing the alpha loss.
+        """
+
         loss = -self.log_alpha * (log_probs.detach() + self.target_entropy)
         alpha_loss = (loss * done).sum() / (done.sum().clamp_min(1.0))
         return alpha_loss
@@ -149,11 +176,6 @@ class PI0RobDataParallelPPOActor(BaseSACActor):
         y = y.unsqueeze(1).expand_as(q_predict) # (B, critic_num)
         critic_loss = F.mse_loss(q_predict, y, reduction="none").mean(dim=0).sum()
         return critic_loss
-
-    def _get_alpha(self) -> torch.Tensor:
-        if self.auto_entropy:
-            return self.log_alpha.exp().detach()
-        return torch.tensor(float(self.sac_config.alpha), device=get_device_name())
 
     def _forward_critic(self, micro_batch: TensorDict) -> torch.Tensor:
         s0 = get_dict_from_prefix(micro_batch, "s0.")
