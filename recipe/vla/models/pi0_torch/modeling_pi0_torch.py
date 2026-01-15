@@ -321,7 +321,7 @@ class PI0ForActionPrediction(PreTrainedModel, SupportSACTraining):
         x_next_std = (dt_b.sqrt() * sigma_i).clamp_min(1e-6)
 
         dist = Normal(x_next_mean.float(), x_next_std.float())
-        log_probs = dist.log_prob(x_next.float()).sum(dim=(1, 2))  # (B,)
+        log_probs = dist.log_prob(x_next.float()).mean(dim=(1, 2))  # (B,)
         return log_probs
 
     def _sample_actions_and_logprobs_from_prefix(
