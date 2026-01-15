@@ -19,6 +19,7 @@ import logging
 import math
 import torch
 import numpy as np
+from typing import Union
 from typing_extensions import override
 from tensordict import TensorDict
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
@@ -54,6 +55,52 @@ def get_dict_from_prefix(tensordict: TensorDict, prefix: str) -> dict:
             result[new_key] = tensordict[key]
     return result
 
+def merge_nested_dicts_or_tuples(
+    a: Union[dict, tuple],
+    b: Union[dict, tuple]
+) -> Union[dict, tuple]:
+    """Merge two nested structures (dictionaries or tuples) by concatenating tensors
+    along the first dimension.
+    """
+
+    if isinstance(a, dict) and isinstance(b, dict):
+        merged = {}
+        for key in a.keys():
+            merged[key] = merge_nested_dicts_or_tuples(a[key], b[key])
+        return merged
+    elif isinstance(a, tuple) and isinstance(b, tuple):
+        merged = []
+        for item_a, item_b in zip(a, b):
+            merged.append(merge_nested_dicts_or_tuples(item_a, item_b))
+        return tuple(merged)
+    else:
+        return torch.cat([a, b], dim=0)
+
+def split_nested_dicts_or_tuples(
+    data: Union[dict, tuple],
+    split_num: int
+) -> list[Union[dict, tuple]]:
+    """Split a nested structure (dictionary or tuple) into smaller chunks along the first dimension."""
+
+    if isinstance(data, torch.Tensor):
+        split_tensors = torch.chunk(data, split_num, dim=0)
+        return list(split_tensors)
+    elif isinstance(data, dict):
+        split_dicts = [dict() for _ in range(split_num)]
+        for key, value in data.items():
+            split_values = split_nested_dicts_or_tuples(value, split_num)
+            for i in range(split_num):
+                split_dicts[i][key] = split_values[i]
+        return split_dicts
+    elif isinstance(data, tuple):
+        split_tuples = [list() for _ in range(split_num)]
+        for item in data:
+            split_items = split_nested_dicts_or_tuples(item, split_num)
+            for i in range(split_num):
+                split_tuples[i].append(split_items[i])
+        return [tuple(split_tuple) for split_tuple in split_tuples]
+    else:
+        raise TypeError("Input data must be a torch.Tensor, dict, or tuple.")
 
 class PI0RobDataParallelPPOActor(BaseSACActor):
     def __init__(
@@ -196,7 +243,27 @@ class PI0RobDataParallelPPOActor(BaseSACActor):
         timing_generate = {}
         with simple_timer("_forward_critic", timing_generate):
             with torch.autocast(device_type=get_device_name(), dtype=torch.bfloat16):
-                q_values_0, q_values_1, log_probs_1 = self.actor_module.sac_forward_critic(s0, a0, s1)
+                with torch.no_grad():
+                    s = merge_nested_dicts_or_tuples(s0, s1)
+                    state_features = self.actor_module.sac_forward_state_features(s)
+                    s0_state_features, s1_state_features = split_nested_dicts_or_tuples(state_features, 2)
+                    a1_actions, log_probs_1 = self.actor_module.sac_forward_actor(s1_state_features)
+
+                q_values_0 = self.actor_module.sac_forward_critic(
+                    a0,
+                    s0_state_features,
+                    use_target_network=False,
+                    method="cat",
+                    requires_grad=True,
+                )
+                q_values_1 = self.actor_module.sac_forward_critic(
+                    {"full_action": a1_actions},
+                    s1_state_features,
+                    use_target_network=True,
+                    method="min",
+                    requires_grad=False,
+                )
+
                 critic_loss = self._calculate_critic_loss(
                     q_predict=q_values_0,
                     q_target=q_values_1,
@@ -214,51 +281,27 @@ class PI0RobDataParallelPPOActor(BaseSACActor):
         timing_generate = {}
         with simple_timer("_forward_actor", timing_generate):
             with torch.autocast(device_type=get_device_name(), dtype=torch.bfloat16):
-                log_probs, q_values_0 = self.actor_module.sac_forward_actor(s0)
+                with torch.no_grad():
+                    s0_state_features = self.actor_module.sac_forward_state_features(s0)
+                a0_actions, log_probs_0 = self.actor_module.sac_forward_actor(s0_state_features)
+                q_values_0 = self.actor_module.sac_forward_critic(
+                    {"full_action": a0_actions},
+                    s0_state_features,
+                    use_target_network=False,
+                    method="min",
+                    requires_grad=False,
+                )
+
                 actor_loss = self._calculate_actor_loss(
-                    log_probs=log_probs,
+                    log_probs=log_probs_0,
                     q_values=q_values_0,
                     valid=micro_batch["valid"],
                 )
         print("training forward_actor(s): %s" % timing_generate.get("_forward_actor", 0.0))
-        return actor_loss, log_probs
+        return actor_loss, log_probs_0
 
     @override
     def update_policy(self, data: DataProto):
-        """
-        Update the policy using the provided data batch.
-
-        Args:
-            data: DataProto containing the following entries in `data.batch`:
-                - "a0.full_action": Tensor of shape (B, action_steps, action_dim),
-                    representing the current action chunk for each sample.
-                - "a1.full_action": Tensor of shape (B, action_steps, action_dim),
-                    representing the next action chunk for each sample.
-                - "s0.states": Tensor of shape (B, state_dim),
-                    representing the current environment or agent state.
-                - "s1.states": Tensor of shape (B, state_dim),
-                    representing the next environment or agent state.
-                - "s0.images": Tensor of shape (B, n_images, C, H, W),
-                    containing current visual observations.
-                - "s1.images": Tensor of shape (B, n_images, C, H, W),
-                    containing next-step visual observations.
-                - "s0.image_masks": Tensor of shape (B, n_images),
-                    indicating valid images per sample.
-                - "s1.image_masks": Tensor of shape (B, n_images),
-                    indicating valid images per sample.
-                - "s0.lang_tokens": Tensor of shape (B, max_seq_len),
-                    tokenized language instructions.
-                - "s1.lang_tokens": Tensor of shape (B, max_seq_len),
-                    tokenized language instructions for the next step.
-                - "s0.lang_masks": Tensor of shape (B, max_seq_len),
-                    attention masks for language tokens.
-                - "s1.lang_masks": Tensor of shape (B, max_seq_len),
-                    attention masks for language tokens for the next step.
-                - "rewards": Tensor of shape (B,),
-                    chunk-level scalar rewards aligned to the next step.
-                - "response_mask": Tensor of shape (B, action_steps),
-                    mask indicating whether each sample has a valid response.
-        """
 
         batch: TensorDict = data.select([
             "a0.full_action", "a1.full_action",

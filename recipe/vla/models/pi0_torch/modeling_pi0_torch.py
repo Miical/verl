@@ -389,121 +389,60 @@ class PI0ForActionPrediction(PreTrainedModel, SupportSACTraining):
         register_fsdp_forward_method(self, "sac_forward_critic")
         register_fsdp_forward_method(self, "sac_forward_actor")
         register_fsdp_forward_method(self, "sac_update_target_network")
-
-    @override
-    def sac_forward_critic(
-        self,
-        s0: dict[str, torch.Tensor],
-        a0: dict[str, torch.Tensor],
-        s1: dict[str, torch.Tensor],
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Compute Q-values for given state-action pairs using the critic heads.
-
-        Args:
-            s0: Dictionary of tensors representing the initial states, with keys:
-                - "images": torch.Tensor of shape (B, n_images, C, H, W)
-                - "image_masks": torch.Tensor of shape (B, n_images)
-                - "lang_tokens": torch.Tensor of shape (B, L)
-                - "lang_masks": torch.Tensor of shape (B, L)
-                - "states": torch.Tensor of shape (B, state_dim)
-            a0: Dictionary of tensors representing the initial actions, with key:
-                - "full_action": torch.Tensor of shape (B, n_action_steps, action_dim)
-            s1: Dictionary of tensors representing the next states, with same keys as s0.
-
-        Returns:
-            q_values_0: torch.Tensor of shape (B, head_num), Q values for (s0, a0), computed by critic heads.
-            q_values_1: torch.Tensor of shape (B,), Q values for (s1, a1), computed by target network.
-            log_probs_1: torch.Tensor of shape (B,), log probabilities of actions a1 under the current policy.
-        """
-
-        a0 = { "full_action": self.state_normalize_transform(a0["full_action"]) }
-
-        # Prepare prefix features for s0 and s1
-        with torch.no_grad():
-            prefix_features = self.model.embed_prefix(
-                images=torch.cat([s0["images"], s1["images"]], dim=0).unbind(dim=1),
-                img_masks=torch.cat([s0["image_masks"], s1["image_masks"]], dim=0).unbind(dim=1),
-                lang_tokens=torch.cat([s0["lang_tokens"], s1["lang_tokens"]], dim=0),
-                lang_masks=torch.cat([s0["lang_masks"], s1["lang_masks"]], dim=0),
-            )
-        prefix_features_1 = tuple(feature_chunk.chunk(2, dim=0)[1] for feature_chunk in prefix_features)
-        prefix_embs, _, _ = prefix_features                        # (2B, 968, 2048)
-        states = torch.cat([s0["states"], s1["states"]], dim=0)    # (2B, 32)
-
-        # Resample actions for s1
-        with torch.no_grad():
-            actions_0 = a0["full_action"]
-            actions_1, log_probs_1 = self._sample_actions_and_logprobs_from_prefix(
-                states= s1["states"],
-                prefix_features=prefix_features_1
-            )
-        actions = torch.cat([actions_0, actions_1], dim=0)         # (2B, 50, 32)
-
-        # Enable grad for critic heads
-        for p in self.critic_heads.parameters():
-            p.requires_grad_(True)
-
-        # Compute Q-values
-        mean_prefix_embs = prefix_embs.mean(dim=1, keepdim=False)                        # (2B, 2048)
-        flattened_actions = actions.view(actions.size(0), -1)                            # (2B, 50*32)
-        critic_input = torch.cat([mean_prefix_embs, states, flattened_actions], dim=-1)  # (2B, 3680)
-        critic_input_0, critic_input_1 = torch.chunk(critic_input, 2, dim=0)             # (B,  3680)
-
-        q_values_0 = self._multi_heads_value(self.critic_heads, critic_input_0, method="cat")
-        with torch.no_grad():
-            q_values_1 = self._multi_heads_value(self.target_network_heads, critic_input_1, method="min")
-
-        return q_values_0, q_values_1, log_probs_1
+        register_fsdp_forward_method(self, "sac_forward_state_features")
 
     @override
     def sac_forward_actor(
         self,
-        s0: dict[str, torch.Tensor],
+        state_features: tuple[tuple[torch.Tensor, torch.Tensor, torch.Tensor], torch.Tensor],
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Compute log probabilities and Q-values for actions sampled by the actor.
 
-        Args:
-            s0: Dictionary of tensors representing the initial states, with keys:
-                - "images": torch.Tensor of shape (B, n_images, C, H, W)
-                - "image_masks": torch.Tensor of shape (B, n_images)
-                - "lang_tokens": torch.Tensor of shape (B, L)
-                - "lang_masks": torch.Tensor of shape (B, L)
-                - "states": torch.Tensor of shape (B, state_dim)
+        prefix_features, states = state_features
+        actions, log_probs = self._sample_actions_and_logprobs_from_prefix(states, prefix_features)
+        return actions, log_probs
 
-        Returns:
-            log_probs: torch.Tensor of shape (B, 1), log probabilities of the actions sampled by the actor.
-            q_values_0: torch.Tensor of shape (B, 1), Q values for (s0, a0) computed using the critic heads.
-        """
+    @override
+    def sac_forward_critic(
+        self,
+        a: dict[str, torch.Tensor],
+        state_features: tuple[tuple[torch.Tensor, torch.Tensor, torch.Tensor], torch.Tensor],
+        *,
+        use_target_network: bool = False,
+        method: Literal["cat", "min"] = "cat",
+        requires_grad: bool = False,
+    ):
+        critic_head = self.target_network_heads if use_target_network else self.critic_heads
+        for p in critic_head.parameters():
+            p.requires_grad_(requires_grad)
 
-        for p in self.critic_heads.parameters():
-            p.requires_grad_(False)
+        prefix_features, states = state_features
+        prefix_embs, _, _ = prefix_features
+        mean_prefix_embs = prefix_embs.mean(dim=1, keepdim=False)                        # (B, 2048)
+        actions = self.state_normalize_transform(a["full_action"])
+        flattened_actions = actions.view(actions.size(0), -1)                            # (B, 50*32)
+        critic_input = torch.cat([mean_prefix_embs, states, flattened_actions], dim=-1)  # (B, 3680)
 
+        q_values = self._multi_heads_value(critic_head, critic_input, method=method)
+
+        return q_values
+
+    @override
+    def sac_forward_state_features(
+        self,
+        s: dict[str, torch.Tensor]
+    ) -> tuple[tuple[torch.Tensor, torch.Tensor, torch.Tensor], torch.Tensor]:
         with torch.no_grad():
             prefix_features = self.model.embed_prefix(
-                images=s0["images"].unbind(dim=1),
-                img_masks=s0["image_masks"].unbind(dim=1),
-                lang_tokens=s0["lang_tokens"],
-                lang_masks=s0["lang_masks"],
+                images=s["images"].unbind(dim=1),
+                img_masks=s["image_masks"].unbind(dim=1),
+                lang_tokens=s["lang_tokens"],
+                lang_masks=s["lang_masks"],
             )
-        prefix_embs, _, _ = prefix_features
-        actions_pi, log_probs = self._sample_actions_and_logprobs_from_prefix(s0["states"], prefix_features)
-
-        mean_prefix_embs = prefix_embs.mean(dim=1)
-        flat_actions = actions_pi.reshape(actions_pi.size(0), -1)
-        critic_input = torch.cat([mean_prefix_embs, s0["states"], flat_actions], dim=-1)
-        q_values_0 = self._multi_heads_value(self.critic_heads, critic_input, method="min")
-
-        return log_probs, q_values_0
+        return (prefix_features, s["states"])
 
     @override
     @torch.no_grad()
     def sac_update_target_network(self, tau: float):
-        """Update the target network heads using Polyak averaging.
-
-        Args:
-            tau: The interpolation parameter for Polyak averaging.
-        """
-
         for target_head, head in zip(self.target_network_heads, self.critic_heads):
             for target_param, param in zip(target_head.parameters(), head.parameters()):
                 target_param.data.mul_(1.0 - tau).add_(param.data, alpha=tau)
