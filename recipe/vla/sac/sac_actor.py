@@ -18,6 +18,7 @@ Single Process Actor
 import logging
 import math
 import torch
+import numpy as np
 from typing_extensions import override
 from tensordict import TensorDict
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
@@ -73,40 +74,50 @@ class PI0RobDataParallelPPOActor(BaseSACActor):
         self.replay_pool = SACReplayPool(capacity=self.config.replay_pool_capacity, sample_device=self.device)
         self.replay_pool.load(self.config.replay_pool_save_dir)
 
-        self.auto_entropy = getattr(self.sac_config, "auto_entropy", False)
-        self.alpha_optimizer, self.log_alpha, self.target_entropy = self._init_alpha_optimizer()
+        self._init_alpha()
 
-    def _init_alpha_optimizer(self):
-        """Initialize the alpha optimizer for automatic entropy tuning.
+    def _init_alpha(self):
+        """Initialize the alpha optimizer for automatic entropy tuning."""
 
-        Returns:
-            alpha_optimizer: The optimizer for the log alpha parameter.
-            log_alpha: The log alpha parameter tensor.
-            target_entropy: The target entropy tensor.
-        """
+        self.auto_entropy = self.sac_config.get("auto_entropy", False)
 
-        if not self.auto_entropy:
-            return None, None, None
+        if self.auto_entropy:
+            self.target_entropy = torch.tensor(
+                float(self.sac_config.get("target_entropy", -32.0)),
+                device=self.device
+            )
 
-        initial_alpha = float(self.sac_config.alpha)
-        log_alpha = torch.tensor(
-            math.log(initial_alpha),
-            device=get_device_name(),
-            requires_grad=True,
-        )
-        alpha_lr = float(getattr(self.sac_config, "alpha_lr", 3e-4))
-        alpha_optimizer = torch.optim.Adam([log_alpha], lr=alpha_lr)
-        target_entropy = getattr(self.sac_config, "target_entropy", None)
-        if target_entropy is None:
-            raise ValueError("sac.target_entropy must be set when sac.auto_entropy is enabled.")
-        target_entropy = torch.tensor(float(target_entropy), device=get_device_name())
+            # Initialize raw_alpha parameter
+            self.alpha_type = self.sac_config.get("alpha_type", "softplus")
+            if self.alpha_type == "exp":
+                self.raw_alpha = torch.nn.Parameter(
+                    np.log(np.exp(self.sac_config.get("initial_alpha", 1))) * torch.ones(1, device=self.device),
+                    requires_grad=True,
+                )
+            elif self.alpha_type == "softplus":
+                self.raw_alpha = torch.nn.Parameter(
+                    np.log(np.exp(self.sac_config.get("initial_alpha", 0.01)) - 1) * torch.ones(1, device=self.device),
+                    requires_grad=True,
+                )
+            else:
+                return NotImplementedError(f"Unsupported alpha_type: {self.alpha_type}")
 
-        return alpha_optimizer, log_alpha, target_entropy
+            # build alpha optimizer and scheduler
+            self.alpha_optimizer = torch.optim.Adam([self.raw_alpha], lr=self.sac_config.get("alpha_lr", 3e-4))
+            self.alpha_scheduler = torch.optim.lr_scheduler.ConstantLR(
+                self.alpha_optimizer, factor=1.0
+            )
 
     def _get_alpha(self) -> torch.Tensor:
         if self.auto_entropy:
-            return self.log_alpha.exp().detach()
-        return torch.tensor(float(self.sac_config.alpha), device=get_device_name())
+            if self.alpha_type == "exp":
+                return self.raw_alpha.exp()
+            elif self.alpha_type == "softplus":
+                return torch.nn.functional.softplus(self.raw_alpha)
+            else:
+                return NotImplementedError(f"Unsupported alpha_type: {self.alpha_type}")
+        else:
+            return torch.tensor(float(self.sac_config.get("initial_alpha", 0.2)), device=self.device)
 
     def _calculate_actor_loss(
         self,
@@ -142,8 +153,8 @@ class PI0RobDataParallelPPOActor(BaseSACActor):
             Tensor of shape (1,) representing the alpha loss.
         """
 
-        loss = -self.log_alpha * (log_probs.detach() + self.target_entropy)
-        alpha_loss = (loss * valid).sum() / (valid.sum().clamp_min(1.0))
+        alpha_loss = -self._get_alpha() * (log_probs.detach() + self.target_entropy)
+        alpha_loss = (alpha_loss * valid).sum() / (valid.sum().clamp_min(1.0))
         return alpha_loss
 
     def _calculate_critic_loss(
@@ -190,7 +201,7 @@ class PI0RobDataParallelPPOActor(BaseSACActor):
                     q_predict=q_values_0,
                     q_target=q_values_1,
                     rewards=micro_batch["rewards"].max(dim=-1).values,
-                    valid=micro_batch["response_mask"].max(dim=-1).values,
+                    valid=micro_batch["valid"],
                     next_log_prob=log_probs_1
                 )
         print("training forward_critic(s): %s" % timing_generate.get("_forward_critic", 0.0))
@@ -207,11 +218,10 @@ class PI0RobDataParallelPPOActor(BaseSACActor):
                 actor_loss = self._calculate_actor_loss(
                     log_probs=log_probs,
                     q_values=q_values_0,
-                    valid=micro_batch["response_mask"].max(dim=-1).values,
+                    valid=micro_batch["valid"],
                 )
         print("training forward_actor(s): %s" % timing_generate.get("_forward_actor", 0.0))
-        valid = micro_batch["response_mask"].max(dim=-1).values
-        return actor_loss, log_probs, valid
+        return actor_loss, log_probs
 
     @override
     def update_policy(self, data: DataProto):
@@ -263,8 +273,9 @@ class PI0RobDataParallelPPOActor(BaseSACActor):
         global_steps = data.meta_info["global_steps"]
 
         batch = self.replay_pool.insert_and_resample(batch)
+        batch["valid"] = batch["response_mask"].min(dim=-1).values # (B,)
         micro_batches = batch.split(self.config.ppo_micro_batch_size_per_gpu)
-        actor_loss_list, critic_loss_list = [], []
+        actor_loss_list, critic_loss_list, alpha_loss_list = [], [], []
 
         # Training critic
         self.actor_optimizer.zero_grad()
@@ -275,25 +286,37 @@ class PI0RobDataParallelPPOActor(BaseSACActor):
             critic_loss = self._forward_critic(micro_batch)
             critic_loss.backward()
             critic_loss_list.append(critic_loss.detach().item())
-        critic_grad_norm = self._optimizer_step()
+        critic_grad_norm = self._optimizer_step(self.actor_optimizer)
 
         # Training actor
         self.actor_optimizer.zero_grad()
-        if self.auto_entropy:
-            self.alpha_optimizer.zero_grad()
+        actor_logprobs_list = []
         for batch_idx, micro_batch in enumerate(micro_batches):
             print(f"[{batch_idx+1}/{len(micro_batches)}] actor micro batch ")
 
             micro_batch = micro_batch.to(get_device_id())
-            actor_loss, log_probs, valid = self._forward_actor(micro_batch)
+            actor_loss, log_probs = self._forward_actor(micro_batch)
             actor_loss.backward()
             actor_loss_list.append(actor_loss.detach().item())
-            if self.auto_entropy:
-                alpha_loss = self._calculate_alpha_loss(log_probs, valid)
-                alpha_loss.backward()
-        actor_grad_norm = self._optimizer_step()
+            actor_logprobs_list.append(log_probs.detach())
+        actor_grad_norm = self._optimizer_step(self.actor_optimizer)
+
+        # Training alpha
+        # NOTE: We reuse the log-probabilities computed during the actor forward pass
+        # to update the entropy temperature (alpha), instead of re-forwarding
+        # the actor after the policy update (saving compute).
         if self.auto_entropy:
-            self.alpha_optimizer.step()
+            self.alpha_optimizer.zero_grad()
+            for micro_batch, log_probs in zip(micro_batches, actor_logprobs_list):
+                micro_batch = micro_batch.to(get_device_id())
+                alpha_loss = self._calculate_alpha_loss(log_probs, micro_batch["valid"])
+                alpha_loss.backward()
+                alpha_loss_list.append(alpha_loss.detach().item())
+            torch.distributed.all_reduce(
+                self.raw_alpha.grad, op=torch.distributed.ReduceOp.AVG
+            )
+            alpha_grad_norm = self._optimizer_step(self.alpha_optimizer)
+            self.alpha_scheduler.step()
 
         # Update target networks
         self.actor_module.sac_update_target_network(self.sac_config.tau)
@@ -303,25 +326,34 @@ class PI0RobDataParallelPPOActor(BaseSACActor):
             self.replay_pool.save(self.config.replay_pool_save_dir)
 
         # Log metrics
-        metrics = {}
-        metrics["reward/mean"] = batch["rewards"].mean().item()
-        metrics["reward/std"] = batch["rewards"].std().item()
-        metrics["valid_ratio"] = batch["response_mask"].max(dim=-1).values.float().mean().item()
-        metrics["actor/replay_pool_size"] = len(self.replay_pool)
-        metrics["actor/alpha"] = self._get_alpha().detach().item()
-        metrics["actor/loss"] = sum(actor_loss_list) / len(actor_loss_list) if actor_loss_list else 0.0
-        metrics["actor/grad_norm"] = actor_grad_norm.detach().item()
-        metrics["critic/loss"] = sum(critic_loss_list) / len(critic_loss_list) if critic_loss_list else 0.0
-        metrics["critic/grad_norm"] = critic_grad_norm.detach().item()
+        metrics = {
+            "reward/mean": batch["rewards"].mean().item(),
+            "reward/std": batch["rewards"].std().item(),
+            "valid_ratio": batch["valid"].float().mean().item(),
+
+            "sac/alpha": self._get_alpha().detach().item(),
+            "sac/alpha_lr": self.alpha_optimizer.param_groups[0]['lr'] if self.auto_entropy else 0.0,
+            "sac/alpha_loss": sum(alpha_loss_list) / len(alpha_loss_list) if alpha_loss_list else 0.0,
+            "sac/alpha_grad_norm": alpha_grad_norm.detach().item() if self.auto_entropy else 0.0,
+            "sac/replay_pool_size": len(self.replay_pool),
+
+            "actor/loss": sum(actor_loss_list) / len(actor_loss_list) if actor_loss_list else 0.0,
+            "actor/lr": self.actor_optimizer.param_groups[0]['lr'],
+            "actor/grad_norm": actor_grad_norm.detach().item(),
+            "actor/logprob_mean": torch.cat(actor_logprobs_list).mean().detach().item() if actor_logprobs_list else 0.0,
+
+            "critic/loss": sum(critic_loss_list) / len(critic_loss_list) if critic_loss_list else 0.0,
+            "critic/grad_norm": critic_grad_norm.detach().item(),
+        }
 
         return metrics
 
-    def _optimizer_step(self):
+    def _optimizer_step(self, optimizer: torch.optim.Optimizer) -> torch.Tensor:
         assert self.config.grad_clip is not None
 
         if isinstance(self.actor_module, FSDP):
             grad_norm = self.actor_module.clip_grad_norm_(max_norm=self.config.grad_clip)
         else:
             grad_norm = torch.nn.utils.clip_grad_norm_(self.actor_module.parameters(), max_norm=self.config.grad_clip)
-        self.actor_optimizer.step()
+        optimizer.step()
         return grad_norm
