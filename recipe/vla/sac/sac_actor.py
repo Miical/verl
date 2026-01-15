@@ -281,8 +281,7 @@ class PI0RobDataParallelPPOActor(BaseSACActor):
         timing_generate = {}
         with simple_timer("_forward_actor", timing_generate):
             with torch.autocast(device_type=get_device_name(), dtype=torch.bfloat16):
-                with torch.no_grad():
-                    s0_state_features = self.actor_module.sac_forward_state_features(s0)
+                s0_state_features = self.actor_module.sac_forward_state_features(s0)
                 a0_actions, log_probs_0 = self.actor_module.sac_forward_actor(s0_state_features)
                 q_values_0 = self.actor_module.sac_forward_critic(
                     {"full_action": a0_actions},

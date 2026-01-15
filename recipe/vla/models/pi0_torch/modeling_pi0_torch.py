@@ -39,6 +39,7 @@ class PI0ForActionPrediction(PreTrainedModel, SupportSACTraining):
 
         # Input transforms
         self.state_normalize_transform = Normalize(self.state_norm_stats, use_quantiles=self.pi05_enabled)
+        self.action_normalize_transform = Normalize(self.action_norm_stats, use_quantiles=self.pi05_enabled)
         self.image_transform = ImageTransform(resize_imgs_with_padding=(224, 224), enable_image_aug=False)
         max_length = 200 if self.pi05_enabled else 48
         self.prompt_tokenizer_transform = PromptTokenizerTransform(max_length=max_length, discrete_state_input=False)
@@ -78,6 +79,7 @@ class PI0ForActionPrediction(PreTrainedModel, SupportSACTraining):
     def _to(self, device: torch.device | str):
         self.state_normalize_transform.to(device)
         self.state_unnormalize_transform.to(device)
+        self.action_normalize_transform.to(device)
         self.action_unnormalize_transform.to(device)
         return self
 
@@ -418,7 +420,7 @@ class PI0ForActionPrediction(PreTrainedModel, SupportSACTraining):
         prefix_features, states = state_features
         prefix_embs, _, _ = prefix_features
         mean_prefix_embs = prefix_embs.mean(dim=1, keepdim=False)                        # (B, 2048)
-        actions = self.state_normalize_transform(a["full_action"])
+        actions = self.action_normalize_transform(a["full_action"])                      # (B, 50, 32)
         flattened_actions = actions.view(actions.size(0), -1)                            # (B, 50*32)
         critic_input = torch.cat([mean_prefix_embs, states, flattened_actions], dim=-1)  # (B, 3680)
 
