@@ -52,6 +52,7 @@ actor_rollout_ref:
       alpha_type: softplus
       alpha_lr: 0.0003
       target_entropy: -32.0
+    critic_warmup_steps: 100
     replay_pool_save_interval: 10
     num_images_in_input: 1
     traj_mini_batch_size: 16

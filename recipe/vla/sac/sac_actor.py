@@ -231,8 +231,11 @@ class PI0RobDataParallelPPOActor(BaseSACActor):
         with torch.no_grad():
             y = rewards + valid * gamma * (q_target - alpha * next_log_prob)
 
-        y = y.unsqueeze(1).expand_as(q_predict) # (B, critic_num)
-        critic_loss = F.mse_loss(q_predict, y, reduction="none").mean(dim=0).sum()
+        y = y.unsqueeze(1).expand_as(q_predict)  # (B, critic_num)
+        valid_mask = valid.unsqueeze(1)
+        mse = F.mse_loss(q_predict, y, reduction="none")
+        per_critic = (mse * valid_mask).sum(dim=0) / valid_mask.sum().clamp_min(1.0)
+        critic_loss = per_critic.sum()
         return critic_loss
 
     def _forward_critic(self, micro_batch: TensorDict) -> torch.Tensor:
@@ -271,7 +274,7 @@ class PI0RobDataParallelPPOActor(BaseSACActor):
                     valid=micro_batch["valid"],
                     next_log_prob=log_probs_1
                 )
-        print("training forward_critic(s): %s" % timing_generate.get("_forward_critic", 0.0))
+        print("training forward_critic(s): %s" % timing_generate.get("_forward_critic", 0.0), flush=True)
         return critic_loss
 
     def _forward_actor(self, micro_batch: TensorDict) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -296,7 +299,7 @@ class PI0RobDataParallelPPOActor(BaseSACActor):
                     q_values=q_values_0,
                     valid=micro_batch["valid"],
                 )
-        print("training forward_actor(s): %s" % timing_generate.get("_forward_actor", 0.0))
+        print("training forward_actor(s): %s" % timing_generate.get("_forward_actor", 0.0), flush=True)
         return actor_loss, log_probs_0
 
     @override
@@ -312,11 +315,14 @@ class PI0RobDataParallelPPOActor(BaseSACActor):
             "rewards",
             "response_mask"
         ]).batch
-        global_steps = data.meta_info["global_steps"]
 
         batch = self.replay_pool.insert_and_resample(batch)
-        batch["valid"] = batch["response_mask"].min(dim=-1).values # (B,)
+        batch["valid"] = batch["response_mask"].any(dim=-1).float() # (B,)
         micro_batches = batch.split(self.config.ppo_micro_batch_size_per_gpu)
+        global_steps = data.meta_info["global_steps"]
+        grad_accum_steps = len(micro_batches)
+
+        actor_logprobs_list = []
         actor_loss_list, critic_loss_list, alpha_loss_list = [], [], []
 
         # Training critic
@@ -325,40 +331,40 @@ class PI0RobDataParallelPPOActor(BaseSACActor):
             print(f"[{batch_idx+1}/{len(micro_batches)}] critic micro batch ")
 
             micro_batch = micro_batch.to(get_device_id())
-            critic_loss = self._forward_critic(micro_batch)
-            critic_loss.backward()
-            critic_loss_list.append(critic_loss.detach().item())
+            raw_critic_loss = self._forward_critic(micro_batch)
+            (raw_critic_loss / grad_accum_steps).backward()
+            critic_loss_list.append(raw_critic_loss.detach().item())
         critic_grad_norm = self._optimizer_step(self.actor_optimizer)
 
-        # Training actor
-        self.actor_optimizer.zero_grad()
-        actor_logprobs_list = []
-        for batch_idx, micro_batch in enumerate(micro_batches):
-            print(f"[{batch_idx+1}/{len(micro_batches)}] actor micro batch ")
+        if global_steps >= self.config.critic_warmup_steps:
+            # Training actor
+            self.actor_optimizer.zero_grad()
+            for batch_idx, micro_batch in enumerate(micro_batches):
+                print(f"[{batch_idx+1}/{len(micro_batches)}] actor micro batch ")
 
-            micro_batch = micro_batch.to(get_device_id())
-            actor_loss, log_probs = self._forward_actor(micro_batch)
-            actor_loss.backward()
-            actor_loss_list.append(actor_loss.detach().item())
-            actor_logprobs_list.append(log_probs.detach())
-        actor_grad_norm = self._optimizer_step(self.actor_optimizer)
-
-        # Training alpha
-        # NOTE: We reuse the log-probabilities computed during the actor forward pass
-        # to update the entropy temperature (alpha), instead of re-forwarding
-        # the actor after the policy update (saving compute).
-        if self.auto_entropy:
-            self.alpha_optimizer.zero_grad()
-            for micro_batch, log_probs in zip(micro_batches, actor_logprobs_list):
                 micro_batch = micro_batch.to(get_device_id())
-                alpha_loss = self._calculate_alpha_loss(log_probs, micro_batch["valid"])
-                alpha_loss.backward()
-                alpha_loss_list.append(alpha_loss.detach().item())
-            torch.distributed.all_reduce(
-                self.raw_alpha.grad, op=torch.distributed.ReduceOp.AVG
-            )
-            alpha_grad_norm = self._optimizer_step(self.alpha_optimizer)
-            self.alpha_scheduler.step()
+                raw_actor_loss, log_probs = self._forward_actor(micro_batch)
+                (raw_actor_loss / grad_accum_steps).backward()
+                actor_loss_list.append(raw_actor_loss.detach().item())
+                actor_logprobs_list.append(log_probs.detach())
+            actor_grad_norm = self._optimizer_step(self.actor_optimizer)
+
+            # Training alpha
+            # NOTE: We reuse the log-probabilities computed during the actor forward pass
+            # to update the entropy temperature (alpha), instead of re-forwarding
+            # the actor after the policy update (saving compute).
+            if self.auto_entropy:
+                self.alpha_optimizer.zero_grad()
+                for micro_batch, log_probs in zip(micro_batches, actor_logprobs_list):
+                    micro_batch = micro_batch.to(get_device_id())
+                    raw_alpha_loss = self._calculate_alpha_loss(log_probs, micro_batch["valid"])
+                    (raw_alpha_loss / grad_accum_steps).backward()
+                    alpha_loss_list.append(raw_alpha_loss.detach().item())
+                torch.distributed.all_reduce(
+                    self.raw_alpha.grad, op=torch.distributed.ReduceOp.AVG
+                )
+                alpha_grad_norm = self._optimizer_step(self.alpha_optimizer)
+                self.alpha_scheduler.step()
 
         # Update target networks
         self.actor_module.sac_update_target_network(self.sac_config.tau)
@@ -376,13 +382,16 @@ class PI0RobDataParallelPPOActor(BaseSACActor):
             "sac/alpha": self._get_alpha().detach().item(),
             "sac/alpha_lr": self.alpha_optimizer.param_groups[0]['lr'] if self.auto_entropy else 0.0,
             "sac/alpha_loss": sum(alpha_loss_list) / len(alpha_loss_list) if alpha_loss_list else 0.0,
-            "sac/alpha_grad_norm": alpha_grad_norm.detach().item() if self.auto_entropy else 0.0,
+            "sac/alpha_grad_norm": alpha_grad_norm.detach().item() if self.auto_entropy \
+                                   and global_steps >= self.config.critic_warmup_steps else 0.0,
             "sac/replay_pool_size": len(self.replay_pool),
 
             "actor/loss": sum(actor_loss_list) / len(actor_loss_list) if actor_loss_list else 0.0,
             "actor/lr": self.actor_optimizer.param_groups[0]['lr'],
-            "actor/grad_norm": actor_grad_norm.detach().item(),
-            "actor/logprob_mean": torch.cat(actor_logprobs_list).mean().detach().item() if actor_logprobs_list else 0.0,
+            "actor/grad_norm": actor_grad_norm.detach().item() \
+                               if global_steps >= self.config.critic_warmup_steps else 0.0,
+            "actor/logprob_mean": torch.cat(actor_logprobs_list).mean().detach().item() \
+                                  if actor_logprobs_list else 0.0,
 
             "critic/loss": sum(critic_loss_list) / len(critic_loss_list) if critic_loss_list else 0.0,
             "critic/grad_norm": critic_grad_norm.detach().item(),
