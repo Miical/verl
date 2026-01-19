@@ -103,9 +103,19 @@ class RobActorRolloutRefWorker(ActorRolloutRefWorker):
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def switch_to_rollout(self):
-        loop = asyncio.get_event_loop()
-        loop.run_until_complete(self.rollout_mode())
-        log_gpu_memory_usage("After switch to rollout mode", logger=logger)
+        print(f"[switch_to_rollout] Starting...", flush=True)
+        try:
+            loop = asyncio.get_event_loop()
+            print(f"[switch_to_rollout] Got event loop, calling rollout_mode()...", flush=True)
+            loop.run_until_complete(self.rollout_mode())
+            print(f"[switch_to_rollout] rollout_mode() completed, calling log_gpu_memory_usage...", flush=True)
+            log_gpu_memory_usage("After switch to rollout mode", logger=logger)
+            print(f"[switch_to_rollout] Completed successfully!", flush=True)
+        except Exception as e:
+            print(f"[switch_to_rollout] ERROR: {type(e).__name__}: {e}", flush=True)
+            import traceback
+            print(f"[switch_to_rollout] Traceback:\n{traceback.format_exc()}", flush=True)
+            raise
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def switch_to_train(self):
@@ -115,80 +125,145 @@ class RobActorRolloutRefWorker(ActorRolloutRefWorker):
 
     async def rollout_mode(self):
         """Context switch hybridengine to rollout mode."""
+        import sys
+        print(f"[rollout_mode] Starting rollout_mode...", flush=True)
+        sys.stdout.flush()
 
-        self.actor_module_fsdp.eval()
+        try:
+            print(f"[rollout_mode] Setting model to eval mode...", flush=True)
+            self.actor_module_fsdp.eval()
 
-        aggressive_empty_cache(force_sync=True)
-        self.base_sync_done = True
+            print(f"[rollout_mode] Calling aggressive_empty_cache...", flush=True)
+            aggressive_empty_cache(force_sync=True)
+            self.base_sync_done = True
 
-        # important: need to manually set the random states of each tp to be identical.
-        self.torch_random_states = get_torch_device().get_rng_state()
-        get_torch_device().set_rng_state(self.gen_random_states)
+            # important: need to manually set the random states of each tp to be identical.
+            print(f"[rollout_mode] Setting random states...", flush=True)
+            self.torch_random_states = get_torch_device().get_rng_state()
+            get_torch_device().set_rng_state(self.gen_random_states)
 
-        if fsdp_version(self.actor_module_fsdp) == 1:
-            fsdp_unshard_exit_stack = contextlib.ExitStack()
-            optional_state = _get_module_fsdp_state(self.actor_module_fsdp)
-            if optional_state is None:
-                self.fsdp_unshard_exit_stack = fsdp_unshard_exit_stack
-            states_and_modules = ([optional_state], [self.actor_module_fsdp])
-
-            for state, fsdp_module in zip(*states_and_modules, strict=False):
-                fsdp_unshard_exit_stack.enter_context(
-                    _unshard_params_for_summon(
-                        module=fsdp_module,
-                        state=state,
-                        writeback=False,
-                        rank0_only=False,
-                        offload_to_cpu=False,
-                        with_grads=False,
-                    )
-                )
-
-            self.fsdp_unshard_exit_stack = fsdp_unshard_exit_stack
-        elif fsdp_version(self.actor_module_fsdp) == 2:
-            self.actor_module_fsdp.unshard()
-            for m in self.actor_module_fsdp.modules():
-                if isinstance(m, FSDPModule) or hasattr(m, "unshard"):
-                    m.unshard()
-            if version.parse(torch.__version__) < version.parse("2.8"):
-                set_reshard_after_forward(self.actor_module_fsdp, False)
+            fsdp_ver = fsdp_version(self.actor_module_fsdp)
+            print(f"[rollout_mode] FSDP version detected: {fsdp_ver}, model type: {type(self.actor_module_fsdp)}", flush=True)
+            
+            if fsdp_ver == 1:
+                # Check if FSDP is using NO_SHARD strategy (world_size=1)
+                # In this case, params are already unsharded, no need to call summon_full_params
+                from torch.distributed.fsdp import ShardingStrategy
+                fsdp_state = self.actor_module_fsdp
+                sharding_strategy = getattr(fsdp_state, 'sharding_strategy', None)
+                print(f"[rollout_mode] FSDP1: sharding_strategy={sharding_strategy}", flush=True)
+                
+                if sharding_strategy == ShardingStrategy.NO_SHARD:
+                    # NO_SHARD means params are already full, no unshard needed
+                    print(f"[rollout_mode] FSDP1: NO_SHARD detected, skipping summon_full_params", flush=True)
+                    self.fsdp_unshard_exit_stack = None
+                else:
+                    # For FSDP1 with actual sharding: Use FSDP.summon_full_params context manager
+                    print(f"[rollout_mode] FSDP1: Calling summon_full_params...", flush=True)
+                    try:
+                        fsdp_unshard_exit_stack = contextlib.ExitStack()
+                        # Use the public API summon_full_params instead of internal _unshard_params_for_summon
+                        fsdp_unshard_exit_stack.enter_context(
+                            FSDP.summon_full_params(
+                                self.actor_module_fsdp,
+                                writeback=False,
+                                rank0_only=False,
+                                offload_to_cpu=False,
+                            )
+                        )
+                        self.fsdp_unshard_exit_stack = fsdp_unshard_exit_stack
+                        print(f"[rollout_mode] FSDP1: summon_full_params succeeded", flush=True)
+                    except Exception as e:
+                        print(f"[rollout_mode] FSDP1: summon_full_params failed: {e}", flush=True)
+                        logger.warning(f"Failed to summon full params for FSDP1: {e}. Continuing without unshard.")
+                        self.fsdp_unshard_exit_stack = None
+            elif fsdp_ver == 2:
+                print(f"[rollout_mode] FSDP2: Calling unshard...", flush=True)
+                try:
+                    self.actor_module_fsdp.unshard()
+                    for m in self.actor_module_fsdp.modules():
+                        if isinstance(m, FSDPModule) or hasattr(m, "unshard"):
+                            m.unshard()
+                    if version.parse(torch.__version__) < version.parse("2.8"):
+                        set_reshard_after_forward(self.actor_module_fsdp, False)
+                    else:
+                        self.actor_module_fsdp.set_reshard_after_forward(False)
+                    print(f"[rollout_mode] FSDP2: unshard succeeded", flush=True)
+                except Exception as e:
+                    print(f"[rollout_mode] FSDP2: unshard failed: {e}", flush=True)
+                    logger.warning(f"Failed to unshard for FSDP2: {e}. Continuing without unshard.")
+            elif fsdp_ver == 0:
+                # Model is not wrapped with FSDP, no unshard needed
+                print(f"[rollout_mode] No FSDP wrapping detected, skipping unshard", flush=True)
+                self.fsdp_unshard_exit_stack = None
             else:
-                self.actor_module_fsdp.set_reshard_after_forward(False)
-        else:
-            raise NotImplementedError(f"Unsupported fsdp version {fsdp_version(self.actor_module_fsdp)}")
+                raise NotImplementedError(f"Unsupported fsdp version {fsdp_ver}")
 
-        logger.info("rollout mode")
+            print(f"[rollout_mode] Completed successfully!", flush=True)
+            logger.info("rollout mode")
+            
+        except Exception as e:
+            print(f"[rollout_mode] FATAL ERROR: {type(e).__name__}: {e}", flush=True)
+            import traceback
+            print(f"[rollout_mode] Traceback:\n{traceback.format_exc()}", flush=True)
+            raise
 
     async def trainer_mode(self):
         """Context switch hybridengine to trainer mode."""
+        import sys
+        print(f"[trainer_mode] Starting trainer_mode...", flush=True)
 
-        self.actor_module_fsdp.train()
+        try:
+            self.actor_module_fsdp.train()
 
-        # add empty cache after each compute
-        aggressive_empty_cache(force_sync=True)
-        set_expandable_segments(True)
+            # add empty cache after each compute
+            aggressive_empty_cache(force_sync=True)
+            set_expandable_segments(True)
 
-        # restore random states
-        self.gen_random_states = get_torch_device().get_rng_state()
-        get_torch_device().set_rng_state(self.torch_random_states)
+            # restore random states
+            self.gen_random_states = get_torch_device().get_rng_state()
+            get_torch_device().set_rng_state(self.torch_random_states)
 
-        if fsdp_version(self.actor_module_fsdp) == 1:
-            if self.fsdp_unshard_exit_stack is not None:
-                self.fsdp_unshard_exit_stack.close()
-                self.fsdp_unshard_exit_stack = None
-        elif fsdp_version(self.actor_module_fsdp) == 2:
-            self.actor_module_fsdp.reshard()
-            for m in self.actor_module_fsdp.modules():
-                if isinstance(m, FSDPModule) or hasattr(m, "reshard"):
-                    m.reshard()
-            if version.parse(torch.__version__) < version.parse("2.8"):
-                set_reshard_after_forward(self.actor_module_fsdp, True)
+            fsdp_ver = fsdp_version(self.actor_module_fsdp)
+            print(f"[trainer_mode] FSDP version: {fsdp_ver}", flush=True)
+            
+            if fsdp_ver == 1:
+                if self.fsdp_unshard_exit_stack is not None:
+                    try:
+                        self.fsdp_unshard_exit_stack.close()
+                        print(f"[trainer_mode] FSDP1: exit_stack closed", flush=True)
+                    except Exception as e:
+                        print(f"[trainer_mode] FSDP1: failed to close exit_stack: {e}", flush=True)
+                        logger.warning(f"Failed to close FSDP1 unshard exit stack: {e}")
+                    self.fsdp_unshard_exit_stack = None
+            elif fsdp_ver == 2:
+                try:
+                    self.actor_module_fsdp.reshard()
+                    for m in self.actor_module_fsdp.modules():
+                        if isinstance(m, FSDPModule) or hasattr(m, "reshard"):
+                            m.reshard()
+                    if version.parse(torch.__version__) < version.parse("2.8"):
+                        set_reshard_after_forward(self.actor_module_fsdp, True)
+                    else:
+                        self.actor_module_fsdp.set_reshard_after_forward(True)
+                    print(f"[trainer_mode] FSDP2: reshard succeeded", flush=True)
+                except Exception as e:
+                    print(f"[trainer_mode] FSDP2: reshard failed: {e}", flush=True)
+                    logger.warning(f"Failed to reshard for FSDP2: {e}")
+            elif fsdp_ver == 0:
+                # Model is not wrapped with FSDP, no reshard needed
+                print(f"[trainer_mode] No FSDP wrapping, skipping reshard", flush=True)
             else:
-                self.actor_module_fsdp.set_reshard_after_forward(True)
-        else:
-            raise NotImplementedError(f"Unsupported fsdp version {fsdp_version(self.actor_module_fsdp)}")
+                raise NotImplementedError(f"Unsupported fsdp version {fsdp_ver}")
 
-        logger.info("trainer mode")
+            print(f"[trainer_mode] Completed successfully!", flush=True)
+            logger.info("trainer mode")
+            
+        except Exception as e:
+            print(f"[trainer_mode] FATAL ERROR: {type(e).__name__}: {e}", flush=True)
+            import traceback
+            print(f"[trainer_mode] Traceback:\n{traceback.format_exc()}", flush=True)
+            raise
 
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="rollout"), blocking=False)
     @DistProfiler.annotate(color="red", role="rollout_generate")

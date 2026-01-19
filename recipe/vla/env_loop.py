@@ -15,7 +15,10 @@
 import asyncio
 import logging
 import os
-
+import time
+from collections import defaultdict
+from statistics import mean
+import sys 
 import numpy as np
 import torch
 from omegaconf import DictConfig
@@ -25,6 +28,38 @@ from verl.single_controller.ray import RayWorkerGroup
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
+
+def force_print(*args, **kwargs):
+    """强制输出并刷新的 print 函数"""
+    print(*args, **kwargs, flush=True)
+    sys.stdout.flush()
+    sys.stderr.flush()
+class PerformanceMonitor:
+    """性能监控器，记录各个步骤的耗时"""
+    def __init__(self):
+        self.timings = defaultdict(list)
+        self.step_count = 0
+    
+    def record(self, name: str, duration: float):
+        """记录一次耗时"""
+        self.timings[name].append(duration)
+    
+    def report(self):
+        """打印性能报告"""
+        force_print("\n" + "="*80)
+        force_print("性能监控报告 (Performance Report)")
+        force_print("="*80)
+        
+        for name, durations in sorted(self.timings.items()):
+            if durations:
+                force_print(f"\n【{name}】")
+                force_print(f"  调用次数: {len(durations)}")
+                force_print(f"  平均耗时: {mean(durations):.4f} s")
+                force_print(f"  最小耗时: {min(durations):.4f} s")
+                force_print(f"  最大耗时: {max(durations):.4f} s")
+                force_print(f"  总耗时: {sum(durations):.4f} s")
+        
+        force_print("\n" + "="*80)
 
 
 class EnvLoop:
@@ -40,10 +75,12 @@ class EnvLoop:
             rollout_wg (RayWorkerGroup): Rollout worker group for model inference.
             config (DictConfig): YAML config.
         """
+        logger.info("EnvLoop.__init__: Starting initialization...")
         self.env_wg = env_wg
         self.rollout_wg = rollout_wg
         self.config = config
         # Extract relevant configuration
+        logger.info("EnvLoop.__init__: Extracting configuration...")
         self.max_interactions = config.env.train.max_episode_steps // config.env.actor.model.num_action_chunks
         self.stage_num = config.env.rollout.pipeline_stage_num
         self.num_envs_per_worker = config.env.train.num_envs
@@ -51,12 +88,20 @@ class EnvLoop:
         self.num_action_chunks = config.env.actor.model.num_action_chunks
         # Derived properties
         self.total_envs = self.env_wg.world_size * self.num_envs_per_worker
+        logger.info(f"EnvLoop.__init__: total_envs={self.total_envs}, stage_num={self.stage_num}")
         if self.total_envs % self.stage_num != 0:
             raise ValueError(f"Total envs ({self.total_envs}) must be divisible by stage_num ({self.stage_num})")
         self.envs_per_stage = self.total_envs // self.stage_num
 
+        logger.info(f"EnvLoop.__init__: Calling env_wg.init_worker() with simulator_type={config.env.train.simulator_type}...")
         self.env_wg.init_worker()
+        logger.info("EnvLoop.__init__: init_worker() completed, calling init_simulator()...")
         self.env_wg.init_simulator()
+        logger.info("EnvLoop.__init__: Initialization completed successfully!")
+        
+        # 初始化性能监控器
+        self.perf_monitor = PerformanceMonitor()
+        self.enable_perf_monitoring = config.get("enable_perf_monitoring", True)
 
     def generate_sequences(self, prompts: DataProto) -> DataProto:
         """Split input batch and dispatch to env loop workers.
@@ -67,12 +112,27 @@ class EnvLoop:
         Returns:
             DataProto: Output batch.
         """
-
+        import time
+        force_print(f"[EnvLoop.generate_sequences] Starting...")
+        
         loop = asyncio.get_event_loop()
+        
+        force_print(f"[EnvLoop.generate_sequences] Calling switch_to_rollout()...")
+        t_start = time.perf_counter()
         self.rollout_wg.switch_to_rollout()
+        force_print(f"[EnvLoop.generate_sequences] switch_to_rollout() completed in {time.perf_counter() - t_start:.3f}s")
+        
+        force_print(f"[EnvLoop.generate_sequences] Calling run()...")
+        t_start = time.perf_counter()
         output = loop.run_until_complete(self.run(prompts))
+        force_print(f"[EnvLoop.generate_sequences] run() completed in {time.perf_counter() - t_start:.3f}s")
+        
+        force_print(f"[EnvLoop.generate_sequences] Calling switch_to_train()...")
+        t_start = time.perf_counter()
         self.rollout_wg.switch_to_train()
-        # TODO(caiyunke.astra): add timing metrics
+        force_print(f"[EnvLoop.generate_sequences] switch_to_train() completed in {time.perf_counter() - t_start:.3f}s")
+        
+        force_print(f"[EnvLoop.generate_sequences] Completed!")
         return output
 
     async def run(self, prompts: DataProto) -> DataProto:
@@ -89,11 +149,61 @@ class EnvLoop:
         Returns:
             DataProto: A batch containing the complete trajectories.
         """
+        import ray
+        import os
+        
         initial_state_ids = prompts.non_tensor_batch["state_ids"]
         task_ids = prompts.non_tensor_batch["task_ids"]
 
+        # 【调试信息】 打印当前进程和节点信息
+        force_print(f"[EnvLoop.run] Current process PID: {os.getpid()}")
+        force_print(f"[EnvLoop.run] Current node IP: {ray.util.get_node_ip_address()}")
+        force_print(f"[EnvLoop.run] env_wg world_size: {self.env_wg.world_size}")
+        
+        # 【性能监控】 环境重置 (NodeB -> NodeA)
+        t_start = time.perf_counter()
+        force_print(f"[EnvLoop.run] Creating reset_prompts with state_ids={initial_state_ids}, task_ids={task_ids}")
+        
+        # 使用 ray.put() 显式将数据放入对象存储，确保数据持久化
+        # 这可以避免因为本地引用被回收导致的 OwnerDiedError
         reset_prompts = DataProto.from_dict(non_tensors={"state_ids": initial_state_ids, "task_ids": task_ids})
-        reset_results = self.env_wg.reset_envs_to_state_ids(reset_prompts)
+        force_print(f"[EnvLoop.run] reset_prompts created, type={type(reset_prompts)}")
+        force_print(f"[EnvLoop.run] reset_prompts.non_tensor_batch keys: {list(reset_prompts.non_tensor_batch.keys())}")
+        
+        force_print(f"[EnvLoop.run] Calling reset_envs_to_state_ids...")
+        force_print(f"[EnvLoop.run] env_wg type: {type(self.env_wg)}")
+        force_print(f"[EnvLoop.run] env_wg workers: {len(self.env_wg.workers)}")
+        
+        import time as time_module
+        call_start = time_module.perf_counter()
+        try:
+            reset_results = self.env_wg.reset_envs_to_state_ids(reset_prompts)
+            call_duration = time_module.perf_counter() - call_start
+            force_print(f"[EnvLoop.run] reset_envs_to_state_ids returned successfully in {call_duration:.3f}s")
+            force_print(f"[EnvLoop.run] reset_results type: {type(reset_results)}")
+        except Exception as e:
+            force_print(f"[EnvLoop.run] reset_envs_to_state_ids FAILED with error: {type(e).__name__}: {e}")
+            import traceback
+            force_print(f"[EnvLoop.run] Traceback: {traceback.format_exc()}")
+            # 打印更多调试信息
+            force_print(f"[EnvLoop.run] Checking env_wg workers status...")
+            try:
+                for i, worker in enumerate(self.env_wg.workers):
+                    try:
+                        # 尝试 ping worker 检查是否存活
+                        ray.get(worker.__ray_ready__.remote(), timeout=5)
+                        force_print(f"[EnvLoop.run] Worker {i} is alive")
+                    except Exception as worker_e:
+                        force_print(f"[EnvLoop.run] Worker {i} check failed: {type(worker_e).__name__}: {worker_e}")
+            except Exception as check_e:
+                force_print(f"[EnvLoop.run] Failed to check workers: {check_e}")
+            raise
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        reset_duration = time.perf_counter() - t_start
+        if self.enable_perf_monitoring:
+            self.perf_monitor.record("1. Env Reset (NodeB->NodeA)", reset_duration)
+            print(f"[PerfMonitor] Env Reset耗时: {reset_duration:.4f}s", flush=True)
 
         staged_obs = self._restructure_obs_data(reset_results)
         # --- Pipeline state ---
@@ -102,34 +212,57 @@ class EnvLoop:
         env_step_futures = {}
         # is_complete = torch.zeros((self.total_envs,), dtype=torch.bool)
 
+        # 【性能监控】 初始模型推理
         for stage_id in range(self.stage_num):
-            # trajectories[stage_id].append({'obs': staged_obs[stage_id]})
             trajectories[stage_id].append({})
             vla_input = staged_obs[stage_id]
             vla_input.meta_info = prompts.meta_info  # Pass along rollout config
+            
+            t_infer_start = time.perf_counter()
             rollout_futures[stage_id] = self.rollout_wg.generate_sequences(vla_input)
+            # 注意：这里只是提交任务，实际执行在get()时
+            
         for step in range(self.max_interactions):
             for stage_id in range(self.stage_num):
+                # 【性能监控】 等待模型推理结果 (NodeA上的推理)
+                t_infer_wait_start = time.perf_counter()
                 action_result: DataProto = rollout_futures[stage_id].get()
-
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
+                infer_duration = time.perf_counter() - t_infer_wait_start
+                if self.enable_perf_monitoring:
+                    self.perf_monitor.record("2. Model Inference (NodeA)", infer_duration)
+                
                 trajectories[stage_id][-1]["action"] = action_result
                 action_data = DataProto.from_dict(
                     non_tensors={"actions": action_result.batch["action"].cpu().numpy()},
                     meta_info={"stage_id": stage_id},
                 )
+                
+                # 【性能监控】 发送action到环境 (NodeA -> NodeB)
+                t_action_send_start = time.perf_counter()
                 env_step_futures[stage_id] = self.env_wg.env_interact_step(action_data)
+                # 注意：这里只是提交任务
 
             staged_next_obs = {}
             for stage_id in range(self.stage_num):
+                # 【性能监控】 等待环境step结果 (NodeB执行+回传到NodeA)
+                t_env_wait_start = time.perf_counter()
                 env_result: DataProto = env_step_futures[stage_id].get()
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
+                env_step_duration = time.perf_counter() - t_env_wait_start
+                if self.enable_perf_monitoring:
+                    self.perf_monitor.record("3. Env Step+Transfer (NodeB->NodeA)", env_step_duration)
 
                 # Store rewards and terminations
                 trajectories[stage_id][-1]["rew"] = env_result.batch["rews"]
                 trajectories[stage_id][-1]["done"] = env_result.batch["terminations"]
 
                 # Prepare next observation
+                # 使用模型需要的三张图像: head_image, left_wrist_image, right_wrist_image
                 next_obs = DataProto(
-                    batch=env_result.batch.select("full_image", "wrist_image", "state"),
+                    batch=env_result.batch.select("head_image", "left_wrist_image", "right_wrist_image", "state"),
                     non_tensor_batch={"task_descriptions": env_result.non_tensor_batch["task_descriptions"]},
                 )
                 staged_next_obs[stage_id] = next_obs
@@ -143,6 +276,10 @@ class EnvLoop:
                     vla_input.meta_info = prompts.meta_info  # Pass along rollout config
                     rollout_futures[stage_id] = self.rollout_wg.generate_sequences(vla_input)
         self.env_wg.finish_rollout()
+        
+        # 【性能监控】 打印报告
+        if self.enable_perf_monitoring:
+            self.perf_monitor.report()
 
         return self._collate_trajectories(trajectories, initial_state_ids, meta_info=prompts.meta_info)
 

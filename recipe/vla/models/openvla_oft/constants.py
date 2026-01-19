@@ -61,13 +61,20 @@ BRIDGE_CONSTANTS = {
     "PROPRIO_DIM": 7,
     "ACTION_PROPRIO_NORMALIZATION_TYPE": NormalizationType.BOUNDS_Q99,
 }
-
+PIPER_CONSTANTS = {
+    "NUM_ACTIONS_CHUNK": 50,
+    "ACTION_DIM": 14,
+    "PROPRIO_DIM": 14,
+    "ACTION_PROPRIO_NORMALIZATION_TYPE": NormalizationType.BOUNDS,
+}
 
 # Function to detect robot platform from command line arguments
 def detect_robot_platform():
     cmd_args = " ".join(sys.argv).lower()
 
-    if "libero" in cmd_args:
+    if "piper" in cmd_args or "gym_testenv" in cmd_args:
+        return "PIPER"
+    elif "libero" in cmd_args:
         return "LIBERO"
     elif "aloha" in cmd_args:
         return "ALOHA"
@@ -75,14 +82,16 @@ def detect_robot_platform():
         return "BRIDGE"
     else:
         # Default to LIBERO if unclear
-        return "LIBERO"
+        return "PIPER"
 
 
 # Determine which robot platform to use
 ROBOT_PLATFORM = detect_robot_platform()
 
 # Set the appropriate constants based on the detected platform
-if ROBOT_PLATFORM == "LIBERO":
+if ROBOT_PLATFORM == "PIPER":
+    constants = PIPER_CONSTANTS
+elif ROBOT_PLATFORM == "LIBERO":
     constants = LIBERO_CONSTANTS
 elif ROBOT_PLATFORM == "ALOHA":
     constants = ALOHA_CONSTANTS

@@ -244,22 +244,20 @@ class PI0RolloutRob(NaiveRolloutRob):
     def generate_sequences(self, prompts: DataProto) -> DataProto:
         """Generate sequences """
 
-        images = prompts.batch["full_image"]
-        wrist_images = prompts.batch["wrist_image"]
+        # 使用新的图像键名: head_image, left_wrist_image, right_wrist_image
+        head_image = prompts.batch["head_image"]
+        left_wrist_image = prompts.batch["left_wrist_image"]
+        right_wrist_image = prompts.batch["right_wrist_image"]
         state = prompts.batch["state"]
         task_descriptions = prompts.non_tensor_batch["task_descriptions"]
 
         timing_generate = {}
         with simple_timer("rollout generate_sequences", timing_generate):
             with torch.autocast(device_type=get_device_name(), dtype=torch.bfloat16):
-                batch_size = images.shape[0]
-                cam_high = images.permute(0, 3, 1, 2).to(prompts.batch.device)
-                left_wrist = wrist_images.permute(0, 3, 1, 2).to(prompts.batch.device)
-                zeros = torch.zeros(
-                    (batch_size, 3, cam_high.shape[2], cam_high.shape[3]),
-                    device=prompts.batch.device,
-                    dtype=torch.uint8,
-                )
+                batch_size = head_image.shape[0]
+                cam_high = head_image.permute(0, 3, 1, 2).to(prompts.batch.device)
+                left_wrist = left_wrist_image.permute(0, 3, 1, 2).to(prompts.batch.device)
+                right_wrist = right_wrist_image.permute(0, 3, 1, 2).to(prompts.batch.device)
                 (
                     action,
                     images_out,
@@ -271,11 +269,11 @@ class PI0RolloutRob(NaiveRolloutRob):
                     images={
                         "observation.images.cam_high": cam_high,
                         "observation.images.cam_left_wrist": left_wrist,
-                        "observation.images.cam_right_wrist": zeros,
+                        "observation.images.cam_right_wrist": right_wrist,
                     },
                     img_masks=[torch.ones((batch_size,), device=prompts.batch.device, dtype=torch.bool),
                                torch.ones((batch_size,), device=prompts.batch.device, dtype=torch.bool),
-                               torch.zeros((batch_size,), device=prompts.batch.device, dtype=torch.bool)],
+                               torch.ones((batch_size,), device=prompts.batch.device, dtype=torch.bool)],
                     task=task_descriptions.tolist() if hasattr(task_descriptions, "tolist") else list(task_descriptions),
                     state=torch.nn.functional.pad(
                         state, (0, max(0, 32 - state.shape[-1])), "constant", 0,

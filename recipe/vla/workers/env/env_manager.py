@@ -162,11 +162,13 @@ class EnvManager:
             logger.info(f"Simulator process already running for rank {self.rank}")
             return
 
+        logger.info(f"[EnvManager rank={self.rank}] Starting simulator process...")
         self.context = mp.get_context("spawn")
         # Create shared memory queues
         self.command_queue = self.context.Queue()
         self.result_queue = self.context.Queue()
 
+        logger.info(f"[EnvManager rank={self.rank}] Creating subprocess with env_cls={self.env_cls.__name__}...")
         # Start simulator process
         self.process = self.context.Process(
             target=_simulator_worker,
@@ -182,9 +184,11 @@ class EnvManager:
             ),
         )
         self.process.start()
+        logger.info(f"[EnvManager rank={self.rank}] Subprocess started (PID={self.process.pid}), waiting for ready signal (timeout=180s)...")
 
         # Wait for initialization
         result = self.result_queue.get(timeout=180)
+        logger.info(f"[EnvManager rank={self.rank}] Received result: {result}")
         if result["status"] != "ready":
             raise RuntimeError(f"Simulator initialization failed: {result}")
 
@@ -327,20 +331,40 @@ def _simulator_worker(
     # Set NUMA affinity for the process to match the GPU rank
     import logging
     import os
+    import sys
 
     pid = os.getpid()
     logger = logging.getLogger(f"simulator_worker_{rank}_{pid}")
+    
+    # 强制刷新输出
+    def force_print(*args, **kwargs):
+        print(*args, **kwargs, flush=True)
+        sys.stdout.flush()
+        sys.stderr.flush()
+    
+    force_print(f"[_simulator_worker PID={pid} rank={rank}] Worker process started!")
+    force_print(f"[_simulator_worker PID={pid}] env_cls={env_cls.__name__}")
+    force_print(f"[_simulator_worker PID={pid}] cfg.train.simulator_type={cfg.train.simulator_type if hasattr(cfg, 'train') else 'N/A'}")
 
     if bind_numa:
+        force_print(f"[_simulator_worker PID={pid}] Setting NUMA affinity...")
         set_process_numa_affinity(rank)
+        force_print(f"[_simulator_worker PID={pid}] NUMA affinity set")
+    
     try:
+        force_print(f"[_simulator_worker PID={pid}] Creating environment instance...")
         env = env_cls(cfg, rank, world_size)
+        force_print(f"[_simulator_worker PID={pid}] Environment created successfully!")
 
         if state_buffer:
+            force_print(f"[_simulator_worker PID={pid}] Loading state buffer...")
             env.load_state(state_buffer)
+            force_print(f"[_simulator_worker PID={pid}] State buffer loaded")
 
         # Signal ready
+        force_print(f"[_simulator_worker PID={pid}] Sending ready signal...")
         result_queue.put({"status": "ready"})
+        force_print(f"[_simulator_worker PID={pid}] Ready signal sent, entering command loop...")
 
         # Main command processing loop
         while True:
@@ -363,8 +387,23 @@ def _simulator_worker(
                 elif hasattr(env, method_name):
                     method = getattr(env, method_name)
                     assert callable(method), f"Method {method_name} is not callable"
-                    result = method(*args, **kwargs)
-                    result_queue.put({"status": "success", "data": result})
+                    force_print(f"[_simulator_worker PID={pid}] Calling method: {method_name}")
+                    try:
+                        result = method(*args, **kwargs)
+                        force_print(f"[_simulator_worker PID={pid}] Method {method_name} returned successfully")
+                    except Exception as method_error:
+                        import traceback
+                        force_print(f"[_simulator_worker PID={pid}] Method {method_name} FAILED: {method_error}")
+                        force_print(f"[_simulator_worker PID={pid}] Traceback: {traceback.format_exc()}")
+                        raise
+                    
+                    force_print(f"[_simulator_worker PID={pid}] Putting result to queue...")
+                    try:
+                        result_queue.put({"status": "success", "data": result})
+                        force_print(f"[_simulator_worker PID={pid}] Result sent successfully")
+                    except Exception as queue_error:
+                        force_print(f"[_simulator_worker PID={pid}] Failed to put result to queue: {queue_error}")
+                        raise
                 else:
                     logger.error(f"Method '{method_name}' not found")
                     result_queue.put(

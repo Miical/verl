@@ -18,7 +18,9 @@ import itertools
 import torch
 from omegaconf import DictConfig
 from torch.distributed.device_mesh import init_device_mesh
-
+import cv2
+import numpy as np
+import time
 from recipe.vla.envs.action_utils import prepare_actions
 from recipe.vla.workers.env.env_manager import EnvManager
 from verl import DataProto
@@ -29,7 +31,18 @@ from verl.utils.device import (
 )
 from verl.utils.distributed import initialize_global_process_group_ray
 
-
+def images_decoding(encoded_data, valid_len=None):
+    """解码图像并记录耗时"""
+    decode_start = time.perf_counter()
+    imgs = []
+    for data in encoded_data:
+        if valid_len is not None:
+            data = data[:valid_len]
+        nparr = np.frombuffer(data, np.uint8)
+        img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+        imgs.append(img)
+    decode_time = time.perf_counter() - decode_start
+    return imgs, decode_time
 def put_tensor_cpu(data_dict):
     for key, value in data_dict.items():
         if isinstance(value, dict):
@@ -48,16 +61,58 @@ def create_env_batch(obs, rews, dones, infos, meta=None):
     return ret_dict
 
 
+def decode_images_if_needed(images_dict):
+    """解码图像数据（如果是编码格式）
+    
+    Args:
+        images_dict: 包含图像tensor的字典
+        
+    Returns:
+        解码后的图像字典
+    """
+    decoded_dict = {}
+    for key, img_tensor in images_dict.items():
+        if isinstance(img_tensor, torch.Tensor) and img_tensor.dtype == torch.uint8 and img_tensor.ndim == 2:
+            # 这是编码的图像数据 (batch, max_len)
+            # 需要解码
+            encoded_data = []
+            for i in range(img_tensor.shape[0]):
+                img_bytes = img_tensor[i].cpu().numpy().tobytes()
+                encoded_data.append(img_bytes)
+            
+            # 解码图像
+            decoded_imgs, decode_time = images_decoding(encoded_data)
+            # 转换为tensor (batch, H, W, C)
+            img_tensors = torch.stack([torch.from_numpy(img) for img in decoded_imgs])
+            decoded_dict[key] = img_tensors
+            print(f"[EnvWorker] 解码 {key}: {img_tensors.shape}, 耗时: {decode_time:.4f}s", flush=True)
+        else:
+            # 已经是解码后的图像或其他数据
+            decoded_dict[key] = img_tensor
+    return decoded_dict
+
+
 def create_env_batch_dataproto(obs, rews, terminations, truncations, infos, meta=None):
     ret_dict = {"obs": obs, "rews": rews, "terminations": terminations, "truncations": truncations, "infos": infos}
     if meta is not None:
         ret_dict.update(meta=meta)
 
     ret_dict = put_tensor_cpu(ret_dict)
+    
+    # 解码图像（如果需要）
+    # 模型需要三张图像: head_image, left_wrist_image, right_wrist_image
+    images_and_states = ret_dict["obs"]["images_and_states"]
+    decoded_images = decode_images_if_needed({
+        "head_image": images_and_states.get("head_image"),
+        "left_wrist_image": images_and_states.get("left_wrist_image"),
+        "right_wrist_image": images_and_states.get("right_wrist_image"),
+    })
+    
     tensor_batch = {
-        "full_image": ret_dict["obs"]["images_and_states"]["full_image"],
-        "wrist_image": ret_dict["obs"]["images_and_states"]["wrist_image"],
-        "state": ret_dict["obs"]["images_and_states"]["state"],
+        "head_image": decoded_images["head_image"],
+        "left_wrist_image": decoded_images["left_wrist_image"],
+        "right_wrist_image": decoded_images["right_wrist_image"],
+        "state": images_and_states["state"],
         "rews": ret_dict["rews"],
         "terminations": ret_dict["terminations"],
         "truncations": ret_dict["truncations"],
@@ -88,10 +143,15 @@ class EnvWorker(Worker):
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def init_worker(self):
+        import logging
+        logger = logging.getLogger(__name__)
+        logger.info(f"EnvWorker.init_worker: rank={self._rank}, simulator_type={self.cfg.train.simulator_type}, stage_num={self.stage_num}")
+        
         if self.cfg.train.simulator_type == "libero":
             from recipe.vla.envs.libero_env.libero_env import LiberoEnv
 
-            for _ in range(self.stage_num):
+            for i in range(self.stage_num):
+                logger.info(f"  Creating LiberoEnv EnvManager {i+1}/{self.stage_num}...")
                 self.simulator_list.append(
                     EnvManager(
                         self.cfg.train,
@@ -104,7 +164,8 @@ class EnvWorker(Worker):
         elif self.cfg.train.simulator_type == "isaac":
             from recipe.vla.envs.isaac_env.isaac_env import IsaacEnv
 
-            for _ in range(self.stage_num):
+            for i in range(self.stage_num):
+                logger.info(f"  Creating IsaacEnv EnvManager {i+1}/{self.stage_num}...")
                 self.simulator_list.append(
                     EnvManager(
                         self.cfg.train,
@@ -113,13 +174,36 @@ class EnvWorker(Worker):
                         env_cls=IsaacEnv,
                     )
                 )
+        
+        elif self.cfg.train.simulator_type == "test":
+            from recipe.vla.envs.test_env.test_env import TestEnv
+
+            for i in range(self.stage_num):
+                logger.info(f"  Creating TestEnv EnvManager {i+1}/{self.stage_num}...")
+                self.simulator_list.append(
+                    EnvManager(
+                        self.cfg.train,
+                        rank=self._rank,
+                        world_size=self._world_size,
+                        env_cls=TestEnv,
+                    )
+                )
+        
         else:
             raise NotImplementedError(f"Simulator type {self.cfg.train.simulator_type} not implemented")
+        
+        logger.info(f"EnvWorker.init_worker: Completed! Created {len(self.simulator_list)} EnvManagers")
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def init_simulator(self):
+        import logging
+        logger = logging.getLogger(__name__)
+        logger.info(f"EnvWorker.init_simulator: Starting {self.stage_num} simulators...")
         for i in range(self.stage_num):
+            logger.info(f"  Starting simulator {i+1}/{self.stage_num}...")
             self.simulator_list[i].start_simulator()
+            logger.info(f"  Simulator {i+1}/{self.stage_num} started successfully!")
+        logger.info("EnvWorker.init_simulator: All simulators started!")
         return
 
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="env"), blocking=False)
@@ -127,6 +211,9 @@ class EnvWorker(Worker):
         """
         This function is used to interact with the environment.
         """
+        import time
+        t_step_start = time.perf_counter()
+        
         chunk_actions: torch.Tensor = data.non_tensor_batch["actions"]
         stage_id: int = data.meta_info["stage_id"]
         # Pi0.5 Libero is not required
@@ -138,9 +225,14 @@ class EnvWorker(Worker):
         # )
         env_info_list = {}
 
+        # 【性能监控】 环境step执行
+        t_sim_start = time.perf_counter()
         extracted_obs, chunk_rewards, chunk_terminations, chunk_truncations, infos = self.simulator_list[
             stage_id
         ].chunk_step(chunk_actions)
+        sim_time = time.perf_counter() - t_sim_start
+        print(f"[EnvWorker] Stage {stage_id} 环境step耗时: {sim_time:.4f}s", flush=True)
+        
         chunk_dones = torch.logical_or(chunk_terminations, chunk_truncations)
 
         if chunk_dones.any():
@@ -149,6 +241,8 @@ class EnvWorker(Worker):
                 for key in final_info["episode"]:
                     env_info_list[key] = final_info["episode"][key][chunk_dones[:, -1]].cpu()
 
+        # 【性能监控】 数据打包
+        t_pack_start = time.perf_counter()
         env_batch = create_env_batch_dataproto(
             obs=extracted_obs,
             rews=chunk_rewards,
@@ -157,6 +251,11 @@ class EnvWorker(Worker):
             infos=infos,
             meta=env_info_list,
         )
+        pack_time = time.perf_counter() - t_pack_start
+        
+        total_time = time.perf_counter() - t_step_start
+        print(f"[EnvWorker] Stage {stage_id} 数据打包耗时: {pack_time:.4f}s, 总耗时: {total_time:.4f}s", flush=True)
+        
         return env_batch
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
@@ -180,7 +279,7 @@ class EnvWorker(Worker):
         )
         result_list = []
         for stage_id in range(self.stage_num):
-            if self.cfg.train.simulator_type == "isaac":
+            if self.cfg.train.simulator_type in ["isaac", "test"]:
                 assert (
                     len(
                         set(
@@ -190,7 +289,7 @@ class EnvWorker(Worker):
                         )
                     )
                     == 1
-                ), "rollout.n should equal to num_envs for isaac"
+                ), f"rollout.n should equal to num_envs for {self.cfg.train.simulator_type}"
 
             result = self.simulator_list[stage_id].reset_envs_to_state_ids(
                 state_ids_list[stage_id * self.cfg.train.num_envs : (stage_id + 1) * self.cfg.train.num_envs],
@@ -202,17 +301,70 @@ class EnvWorker(Worker):
 
         # Handle nested 'images_and_states'
         images_and_states_list = [d[0]["images_and_states"] for d in result_list]
+        
+        # 模型只需要三张图像: head_image, left_wrist_image, right_wrist_image
+        # 跳过 full_image 和 wrist_image 以减少数据传输量
+        REQUIRED_IMAGE_KEYS = {"head_image", "left_wrist_image", "right_wrist_image", "state"}
+        
         if images_and_states_list:
             # Assuming all dicts in the list have the same keys
             for k in images_and_states_list[0].keys():
+                # 跳过不需要的图像键
+                if k not in REQUIRED_IMAGE_KEYS and "image" in k.lower():
+                    print(f"[EnvWorker] 跳过不需要的图像: {k}", flush=True)
+                    continue
+                    
                 if isinstance(images_and_states_list[0][k], torch.Tensor):
-                    output_tensor_dict[k] = torch.cat([d[k] for d in images_and_states_list])
-
+                    # Check if this is encoded image data (tensor of bytes/uint8)
+                    # Image keys typically contain "image" in their names
+                    if "image" in k.lower() and images_and_states_list[0][k].dtype == torch.uint8 and images_and_states_list[0][k].ndim == 2:
+                        # Decode images from all stages
+                        all_decoded_images = []
+                        total_decode_time = 0.0
+                        
+                        for stage_dict in images_and_states_list:
+                            # Extract encoded data for this stage
+                            encoded_tensor = stage_dict[k]  # Shape: (num_envs, max_len)
+                            
+                            # Convert tensor to list of bytes for decoding
+                            # Each row in the tensor is one encoded JPEG image (padded with zeros)
+                            encoded_data = []
+                            for i in range(encoded_tensor.shape[0]):
+                                # Convert each image's tensor row to bytes
+                                img_bytes = encoded_tensor[i].cpu().numpy().tobytes()
+                                encoded_data.append(img_bytes)
+                            
+                            # Decode images using the images_decoding function
+                            # The function handles zero-padding automatically via cv2.imdecode
+                            decoded_imgs, decode_time = images_decoding(encoded_data)
+                            total_decode_time += decode_time
+                            
+                            # Convert decoded images to tensor
+                            # decoded_imgs is list of numpy arrays (H, W, C) in BGR format
+                            img_tensors = torch.stack([torch.from_numpy(img) for img in decoded_imgs])
+                            all_decoded_images.append(img_tensors)
+                        
+                        # Concatenate all decoded images from all stages
+                        output_tensor_dict[k] = torch.cat(all_decoded_images, dim=0)
+                        print(f"[EnvWorker] reset时解码 {k}: {output_tensor_dict[k].shape}, decode_time={total_decode_time:.4f}s", flush=True)
+                    else:
+                        # For non-image tensors, just concatenate
+                        output_tensor_dict[k] = torch.cat([d[k] for d in images_and_states_list])
         # Handle 'task_descriptions'
         task_descriptions_list = [d[0]["task_descriptions"] for d in result_list]
         output_non_tensor_dict["task_descriptions"] = list(itertools.chain.from_iterable(task_descriptions_list))
 
         output = DataProto.from_dict(tensors=output_tensor_dict, non_tensors=output_non_tensor_dict)
+        
+        # 调试信息：打印返回数据的大小
+        print(f"[EnvWorker] reset_envs_to_state_ids 准备返回数据:", flush=True)
+        print(f"[EnvWorker]   tensor keys: {list(output_tensor_dict.keys())}", flush=True)
+        for k, v in output_tensor_dict.items():
+            print(f"[EnvWorker]   {k}: shape={v.shape}, dtype={v.dtype}, device={v.device}", flush=True)
+        print(f"[EnvWorker]   non_tensor keys: {list(output_non_tensor_dict.keys())}", flush=True)
+        print(f"[EnvWorker]   task_descriptions: {output_non_tensor_dict['task_descriptions']}", flush=True)
+        print(f"[EnvWorker] 开始返回 DataProto...", flush=True)
+        
         return output
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)

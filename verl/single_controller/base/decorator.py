@@ -218,8 +218,16 @@ def dispatch_nd_compute(dp_rank_mapping: list[int], dp_size, worker_group, *args
 
     max_workers = max(1, min(len(args[0]), os.cpu_count()))
 
-    args = [parallel_put(arg, max_workers=max_workers) for arg in args]
-    kwargs = {k: parallel_put(v, max_workers=max_workers) for k, v in kwargs.items()}
+    # NOTE: 禁用 parallel_put 以避免跨节点 OwnerDiedError
+    # 当 Driver 在 NodeA，Worker 在 NodeB 时，ray.put() 创建的 ObjectRef
+    # 的 owner 是 Driver 进程。如果在传输过程中出现问题，会导致 OwnerDiedError。
+    # 直接传递数据让 Ray 自动处理序列化和传输更加稳定。
+    use_parallel_put = os.environ.get("VERL_USE_PARALLEL_PUT", "0") == "1"
+    
+    if use_parallel_put:
+        args = [parallel_put(arg, max_workers=max_workers) for arg in args]
+        kwargs = {k: parallel_put(v, max_workers=max_workers) for k, v in kwargs.items()}
+    # else: 直接使用原始数据，让 Ray 在 remote() 调用时自动序列化
 
     all_args = []
     for arg in args:

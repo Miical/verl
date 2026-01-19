@@ -41,18 +41,54 @@ def get_random_string(length: int) -> str:
 def func_generator(self, method_name, dispatch_fn, collect_fn, execute_fn, blocking):
     class Functor:
         def __call__(this, *args, **kwargs):
+            import time as time_module
+            import os
+            
+            debug_enabled = os.environ.get("VERL_DEBUG_RPC", "0") == "1"
+            
+            if debug_enabled:
+                print(f"[func_generator] {method_name}: Starting dispatch_fn...", flush=True)
+            
             args, kwargs = dispatch_fn(self, *args, **kwargs)
             padding_count = kwargs.pop(_padding_size_key, 0)
+            
+            if debug_enabled:
+                print(f"[func_generator] {method_name}: dispatch_fn done, calling execute_fn...", flush=True)
+            
             output = execute_fn(method_name, *args, **kwargs)
+            
             if blocking:
-                output = ray.get(output)
+                if debug_enabled:
+                    print(f"[func_generator] {method_name}: execute_fn done, calling ray.get() on {len(output) if isinstance(output, list) else 1} refs...", flush=True)
+                    t_start = time_module.perf_counter()
+                
+                # 添加超时以避免无限等待，默认 300 秒
+                timeout = int(os.environ.get("VERL_RAY_GET_TIMEOUT", "300"))
+                try:
+                    output = ray.get(output, timeout=timeout)
+                except ray.exceptions.GetTimeoutError:
+                    print(f"[func_generator] {method_name}: ray.get() TIMEOUT after {timeout}s!", flush=True)
+                    raise
+                
+                if debug_enabled:
+                    t_elapsed = time_module.perf_counter() - t_start
+                    print(f"[func_generator] {method_name}: ray.get() completed in {t_elapsed:.3f}s", flush=True)
+            
+            if debug_enabled:
+                print(f"[func_generator] {method_name}: Calling collect_fn...", flush=True)
+            
             output = collect_fn(self, output)
+            
             if padding_count > 0:
                 if isinstance(output, DataProto):
                     indices = [i for i in range(len(output))][:-padding_count]
                     output = output.select_idxs(indices)
                 elif isinstance(output, list):
                     output = output[:-padding_count]
+            
+            if debug_enabled:
+                print(f"[func_generator] {method_name}: Completed!", flush=True)
+            
             return output
 
     # use class type to pass the method_name to get a better observability

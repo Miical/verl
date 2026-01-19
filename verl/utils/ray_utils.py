@@ -16,7 +16,6 @@ Contains commonly used utilities for ray
 """
 
 import asyncio
-import concurrent.futures
 import os
 from typing import Any, Optional
 
@@ -48,12 +47,20 @@ def ray_noset_visible_devices(env_vars=os.environ):
 
 def parallel_put(data_list: list[Any], max_workers: Optional[int] = None):
     """
-    Puts a list of data into the Ray object store in parallel using a thread pool.
+    Puts a list of data into the Ray object store.
+
+    NOTE: Previously this used ThreadPoolExecutor to parallelize ray.put() calls,
+    but this caused OwnerDiedError in distributed settings. When ray.put() is called
+    from a thread inside a Ray Actor, Ray may create a temporary worker process to
+    own the ObjectRef. When that temporary worker exits, the ObjectRef becomes
+    orphaned and causes OwnerDiedError.
+
+    Now we simply call ray.put() sequentially in the main thread to ensure stable
+    ObjectRef ownership by the calling Actor/Task.
 
     Args:
         data_list (List[Any]): A list of Python objects to be put into the Ray object store.
-        max_workers (int, optional): The maximum number of worker threads to use.
-                                     Defaults to min(len(data_list), 16).
+        max_workers (int, optional): Deprecated, kept for API compatibility.
 
     Returns:
         List[ray.ObjectRef]: A list of Ray object references corresponding to the input data_list,
@@ -61,23 +68,9 @@ def parallel_put(data_list: list[Any], max_workers: Optional[int] = None):
     """
     assert len(data_list) > 0, "data_list must not be empty"
 
-    def put_data(index, data):
-        return index, ray.put(data)
-
-    if max_workers is None:
-        max_workers = min(len(data_list), 16)
-
-    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-        data_list_f = [executor.submit(put_data, i, data) for i, data in enumerate(data_list)]
-        res_lst = []
-        for future in concurrent.futures.as_completed(data_list_f):
-            res_lst.append(future.result())
-
-        # reorder based on index
-        output = [None for _ in range(len(data_list))]
-        for res in res_lst:
-            index, data_ref = res
-            output[index] = data_ref
+    # Sequential put to ensure ObjectRef ownership stays with the calling process
+    # This prevents OwnerDiedError in distributed multi-node settings
+    output = [ray.put(data) for data in data_list]
 
     return output
 

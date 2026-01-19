@@ -145,6 +145,10 @@ class RobRayPPOTrainer(RayPPOTrainer):
     """
 
     def init_workers(self):
+        import logging
+        logger = logging.getLogger(__name__)
+        
+        logger.info("Step 1: Creating resource pool...")
         self.resource_pool_manager.create_resource_pool()
 
         if self.config.env.disagg_sim.enable:
@@ -152,6 +156,7 @@ class RobRayPPOTrainer(RayPPOTrainer):
             self.resource_pool_manager.get_resource_pool(Role.Env).accelerator_type = "sim"
             self.resource_pool_manager.get_resource_pool(Role.ActorRollout).accelerator_type = "train_rollout"
 
+        logger.info("Step 2: Setting up resource pool to class mapping...")
         self.resource_pool_to_cls = {pool: {} for pool in self.resource_pool_manager.resource_pool_dict.values()}
         resource_pool = self.resource_pool_manager.get_resource_pool(Role.ActorRollout)
         actor_rollout_cls = RayClassWithInitArgs(
@@ -172,6 +177,7 @@ class RobRayPPOTrainer(RayPPOTrainer):
         # you should not use `create_colocated_worker_cls`.
         # Instead, directly pass different resource pool to different worker groups.
         # See https://github.com/volcengine/verl/blob/master/examples/ray/tutorial.ipynb for more information.
+        logger.info("Step 3: Creating worker groups...")
         all_wg = {}
         wg_kwargs = {}  # Setting up kwargs for RayWorkerGroup
         if OmegaConf.select(self.config.trainer, "ray_wait_register_center_timeout") is not None:
@@ -190,6 +196,7 @@ class RobRayPPOTrainer(RayPPOTrainer):
         wg_kwargs["device_name"] = self.device_name
 
         for resource_pool, class_dict in self.resource_pool_to_cls.items():
+            logger.info(f"  Creating worker group for: {list(class_dict.keys())}")
             worker_dict_cls = create_colocated_worker_cls(class_dict=class_dict)
             wg_dict = self.ray_worker_group_cls(
                 resource_pool=resource_pool,
@@ -200,19 +207,30 @@ class RobRayPPOTrainer(RayPPOTrainer):
             all_wg.update(spawn_wg)
 
         # we should create rollout at the end so that vllm can have a better estimation of kv cache memory
+        logger.info("Step 4: Initializing actor rollout worker group...")
         self.actor_rollout_wg = all_wg["actor_rollout"]
+        logger.info("Step 5: Initializing model (this may take a while)...")
+        logger.info("  This step loads the model weights and may take several minutes...")
         self.actor_rollout_wg.init_model()
+        logger.info("  Model initialization complete!")
+        logger.info("Step 6: Setting up env worker group...")
         self.env_wg = all_wg["env"]
+        logger.info("  Env worker group assigned")
 
         # create async rollout manager and request scheduler
         self.async_rollout_mode = False
         if self.config.actor_rollout_ref.rollout.mode == "async_envloop":
             from recipe.vla.env_loop import EnvLoop
 
+            logger.info("Step 7: Creating EnvLoop (async rollout manager)...")
+            logger.info("  This will initialize environment workers...")
             self.async_rollout_mode = True
             self.async_rollout_manager = EnvLoop(
                 config=self.config, rollout_wg=self.actor_rollout_wg, env_wg=self.env_wg
             )
+            logger.info("  EnvLoop created successfully!")
+        
+        logger.info("All workers initialized successfully!")
 
     def _get_gen_batch(self, batch: DataProto) -> DataProto:
         # pop those keys for generation
@@ -241,6 +259,15 @@ class RobRayPPOTrainer(RayPPOTrainer):
         # load checkpoint before doing anything
         self._load_checkpoint()
 
+        # Handle val_only mode: only run validation and return
+        if self.config.trainer.get("val_only", False):
+            if self.val_reward_fn is not None:
+                val_metrics = self._validate()
+                assert val_metrics, f"{val_metrics=}"
+                pprint(f"Validation-only metrics: {val_metrics}")
+                logger.log(data=val_metrics, step=self.global_steps)
+            return
+        
         # perform validation before training
         # currently, we only support validation using the reward_function.
         if self.val_reward_fn is not None and self.config.trainer.get("val_before_train", True):
@@ -248,8 +275,6 @@ class RobRayPPOTrainer(RayPPOTrainer):
             assert val_metrics, f"{val_metrics=}"
             pprint(f"Initial validation metrics: {val_metrics}")
             logger.log(data=val_metrics, step=self.global_steps)
-            if self.config.trainer.get("val_only", False):
-                return
 
         # add tqdm
         progress_bar = tqdm(total=self.total_training_steps, initial=self.global_steps, desc="Training Progress")
@@ -278,6 +303,19 @@ class RobRayPPOTrainer(RayPPOTrainer):
                         if self.config.global_profiler.profile_continuous_steps
                         else curr_step_profile
                     )
+
+                # Handle the case where collate_fn returns 'state_id' instead of 'state_ids'
+                if 'state_ids' not in batch_dict and 'state_id' in batch_dict:
+                    state_id_val = batch_dict.pop('state_id')
+                    if isinstance(state_id_val, np.ndarray):
+                        batch_dict['state_ids'] = state_id_val.astype(np.int32)
+                        batch_dict['task_ids'] = state_id_val.astype(np.int32).copy()
+                    elif isinstance(state_id_val, (list, tuple)):
+                        batch_dict['state_ids'] = np.array(state_id_val, dtype=np.int32)
+                        batch_dict['task_ids'] = np.array(state_id_val, dtype=np.int32)
+                    else:
+                        batch_dict['state_ids'] = np.array([state_id_val], dtype=np.int32)
+                        batch_dict['task_ids'] = np.array([state_id_val], dtype=np.int32)
 
                 batch: DataProto = DataProto.from_single_dict(batch_dict)
 
@@ -450,8 +488,42 @@ class RobRayPPOTrainer(RayPPOTrainer):
         sample_turns = []
         sample_uids = []
 
-        for test_data in self.val_dataloader:
+        # Check if val_dataloader is empty (val_only mode without dataset)
+        if self.val_dataloader is None or len(self.val_dataloader) == 0:
+            # Generate dummy batch for env-only validation
+            # state_ids will be generated to select episodes from the environment
+            num_envs = self.config.env.train.num_envs
+            total_episodes = getattr(self.config.env.train, 'num_episodes', 47)  # Default to 47 or get from config
+            
+            # Create a simple batch with state_ids for environment reset
+            dummy_batch = {
+                'state_ids': np.arange(num_envs, dtype=np.int32) % total_episodes,
+                'task_ids': np.arange(num_envs, dtype=np.int32) % total_episodes,
+                'uid': np.array([str(uuid.uuid4()) for _ in range(num_envs)], dtype=object),
+            }
+            test_data_iter = [dummy_batch]
+        else:
+            test_data_iter = self.val_dataloader
+
+        for test_data in test_data_iter:
+            # Handle the case where collate_fn returns 'state_id' instead of 'state_ids'
+            # This can happen when batch_size=1 or collate_fn is not properly applied
+            if 'state_ids' not in test_data and 'state_id' in test_data:
+                state_id_val = test_data.pop('state_id')
+                # Convert to numpy array if not already
+                if isinstance(state_id_val, np.ndarray):
+                    test_data['state_ids'] = state_id_val.astype(np.int32)
+                    test_data['task_ids'] = state_id_val.astype(np.int32).copy()
+                elif isinstance(state_id_val, (list, tuple)):
+                    test_data['state_ids'] = np.array(state_id_val, dtype=np.int32)
+                    test_data['task_ids'] = np.array(state_id_val, dtype=np.int32)
+                else:
+                    # Single value, wrap in array
+                    test_data['state_ids'] = np.array([state_id_val], dtype=np.int32)
+                    test_data['task_ids'] = np.array([state_id_val], dtype=np.int32)
+            
             test_batch = DataProto.from_single_dict(test_data)
+            
             if len(test_batch) < self.config.data.val_batch_size:
                 print(f"drop last batch in val_dataloader, len {len(test_batch)}")
                 break
@@ -483,6 +555,7 @@ class RobRayPPOTrainer(RayPPOTrainer):
             # pad to be divisible by dp_size
             size_divisor = self.config.env.train.num_envs * self.config.env.rollout.pipeline_stage_num
             test_gen_batch_padded, pad_size = pad_dataproto_to_divisor(test_gen_batch, size_divisor)
+            
             if not self.async_rollout_mode:
                 test_output_gen_batch_padded = self.actor_rollout_wg.generate_sequences(test_gen_batch_padded)
             else:
