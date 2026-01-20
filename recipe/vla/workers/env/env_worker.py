@@ -99,24 +99,25 @@ def create_env_batch_dataproto(obs, rews, terminations, truncations, infos, meta
 
     ret_dict = put_tensor_cpu(ret_dict)
     
-    # 解码图像（如果需要）
-    # 模型需要三张图像: head_image, left_wrist_image, right_wrist_image
+    # ⚠️ 保持 JPEG 编码格式传输，减少数据传输量
+    # 图像解码将在 Rollout Worker (NodeA) 进行
     images_and_states = ret_dict["obs"]["images_and_states"]
-    decoded_images = decode_images_if_needed({
+    
+    tensor_batch = {
         "head_image": images_and_states.get("head_image"),
         "left_wrist_image": images_and_states.get("left_wrist_image"),
         "right_wrist_image": images_and_states.get("right_wrist_image"),
-    })
-    
-    tensor_batch = {
-        "head_image": decoded_images["head_image"],
-        "left_wrist_image": decoded_images["left_wrist_image"],
-        "right_wrist_image": decoded_images["right_wrist_image"],
         "state": images_and_states["state"],
         "rews": ret_dict["rews"],
         "terminations": ret_dict["terminations"],
         "truncations": ret_dict["truncations"],
     }
+    
+    # 打印传输数据信息
+    for k, v in tensor_batch.items():
+        if v is not None and hasattr(v, 'shape'):
+            print(f"[create_env_batch_dataproto] {k}: shape={v.shape}, dtype={v.dtype}", flush=True)
+    
     non_tensor_batch = {"task_descriptions": obs["task_descriptions"]}
     output = DataProto.from_dict(tensors=tensor_batch, non_tensors=non_tensor_batch)
 
@@ -256,6 +257,14 @@ class EnvWorker(Worker):
         total_time = time.perf_counter() - t_step_start
         print(f"[EnvWorker] Stage {stage_id} 数据打包耗时: {pack_time:.4f}s, 总耗时: {total_time:.4f}s", flush=True)
         
+        # 【调试信息】 打印返回数据的详细信息
+        print(f"[EnvWorker] Stage {stage_id} 准备返回 DataProto:", flush=True)
+        if env_batch.batch is not None:
+            for k in env_batch.batch.keys():
+                v = env_batch.batch[k]
+                print(f"[EnvWorker]   {k}: shape={v.shape}, dtype={v.dtype}", flush=True)
+        print(f"[EnvWorker] Stage {stage_id} 开始返回...", flush=True)
+        
         return env_batch
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
@@ -315,38 +324,13 @@ class EnvWorker(Worker):
                     continue
                     
                 if isinstance(images_and_states_list[0][k], torch.Tensor):
-                    # Check if this is encoded image data (tensor of bytes/uint8)
-                    # Image keys typically contain "image" in their names
+                    # ⚠️ 关键修复：不要在这里解码图像！
+                    # 保持 JPEG 编码格式传输，在 Rollout Worker 那边再解码
+                    # 这样可以大大减少 Ray 对象存储的传输量（~50KB vs ~450KB）
                     if "image" in k.lower() and images_and_states_list[0][k].dtype == torch.uint8 and images_and_states_list[0][k].ndim == 2:
-                        # Decode images from all stages
-                        all_decoded_images = []
-                        total_decode_time = 0.0
-                        
-                        for stage_dict in images_and_states_list:
-                            # Extract encoded data for this stage
-                            encoded_tensor = stage_dict[k]  # Shape: (num_envs, max_len)
-                            
-                            # Convert tensor to list of bytes for decoding
-                            # Each row in the tensor is one encoded JPEG image (padded with zeros)
-                            encoded_data = []
-                            for i in range(encoded_tensor.shape[0]):
-                                # Convert each image's tensor row to bytes
-                                img_bytes = encoded_tensor[i].cpu().numpy().tobytes()
-                                encoded_data.append(img_bytes)
-                            
-                            # Decode images using the images_decoding function
-                            # The function handles zero-padding automatically via cv2.imdecode
-                            decoded_imgs, decode_time = images_decoding(encoded_data)
-                            total_decode_time += decode_time
-                            
-                            # Convert decoded images to tensor
-                            # decoded_imgs is list of numpy arrays (H, W, C) in BGR format
-                            img_tensors = torch.stack([torch.from_numpy(img) for img in decoded_imgs])
-                            all_decoded_images.append(img_tensors)
-                        
-                        # Concatenate all decoded images from all stages
-                        output_tensor_dict[k] = torch.cat(all_decoded_images, dim=0)
-                        print(f"[EnvWorker] reset时解码 {k}: {output_tensor_dict[k].shape}, decode_time={total_decode_time:.4f}s", flush=True)
+                        # 直接拼接编码数据，不解码
+                        output_tensor_dict[k] = torch.cat([d[k] for d in images_and_states_list])
+                        print(f"[EnvWorker] 保持 JPEG 编码传输 {k}: {output_tensor_dict[k].shape} (encoded)", flush=True)
                     else:
                         # For non-image tensors, just concatenate
                         output_tensor_dict[k] = torch.cat([d[k] for d in images_and_states_list])

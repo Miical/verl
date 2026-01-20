@@ -418,6 +418,7 @@ class ImageTransform:
                     ratio = max(original_width / target_width, original_height / target_height)
                     resized_height = int(original_height / ratio)
                     resized_width = int(original_width / ratio)
+                    img = img.float()
                     img = F.interpolate(img, size=(resized_height, resized_width), mode='bilinear', align_corners=False)
                     pad_height = max(0, int(target_height - resized_height))
                     pad_width = max(0, int(target_width - resized_width))

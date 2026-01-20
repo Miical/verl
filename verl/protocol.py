@@ -1192,10 +1192,11 @@ class DataProtoFuture:
     collect_fn: Callable
     futures: list[ray.ObjectRef]
     dispatch_fn: Callable = None
+    padding_size: int = 0  # Padding size to be removed in get()
 
     @staticmethod
-    def concat(data: list[ray.ObjectRef]) -> "DataProtoFuture":
-        output = DataProtoFuture(collect_fn=DataProto.concat, futures=data)
+    def concat(data: list[ray.ObjectRef], padding_size: int = 0) -> "DataProtoFuture":
+        output = DataProtoFuture(collect_fn=DataProto.concat, futures=data, padding_size=padding_size)
         return output
 
     def chunk(self, chunks: int) -> list["DataProtoFuture"]:
@@ -1208,18 +1209,32 @@ class DataProtoFuture:
                 return x.chunk(chunks=chunks)[i]
 
             arg_future = DataProtoFuture(
-                collect_fn=self.collect_fn, dispatch_fn=partial(dispatch_fn, i=i, chunks=chunks), futures=self.futures
+                collect_fn=self.collect_fn, dispatch_fn=partial(dispatch_fn, i=i, chunks=chunks), futures=self.futures,
+                padding_size=self.padding_size
             )
             arg_future_lst.append(arg_future)
         return arg_future_lst
 
     def get(self):
+        import time
+        print(f"[DataProtoFuture.get] Starting ray.get() on {len(self.futures)} futures...", flush=True)
+        t_start = time.perf_counter()
         output = ray.get(self.futures)  # dp_size.
+        ray_get_time = time.perf_counter() - t_start
+        print(f"[DataProtoFuture.get] ray.get() completed in {ray_get_time:.4f}s", flush=True)
         for o in output:
             assert isinstance(o, DataProto)
         output = self.collect_fn(output)  # select dp, concat
         if self.dispatch_fn is not None:
             output = self.dispatch_fn(output)  # split in batch dim, select using dp
+        
+        # Remove padding if padding_size > 0
+        if self.padding_size > 0 and isinstance(output, DataProto):
+            original_len = len(output) - self.padding_size
+            if original_len > 0:
+                output = output.select_idxs(list(range(original_len)))
+                print(f"[DataProtoFuture.get] Removed padding: {self.padding_size}, new len: {original_len}", flush=True)
+        
         return output
 
 

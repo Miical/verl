@@ -238,8 +238,43 @@ class PI0RolloutRob(NaiveRolloutRob):
         self.module = module
         self.tokenizer = tokenizer
 
-        self.module.dummy_forward()
+        # FIXME: dummy_forward() causes CUDA illegal memory access in FSDP multi-GPU setup
+        # The model is already initialized by FSDP, so this warm-up forward is not necessary
+        # self.module.dummy_forward()
 
+    def _decode_jpeg_images(self, encoded_tensor: torch.Tensor) -> torch.Tensor:
+        """解码 JPEG 编码的图像数据。
+        
+        Args:
+            encoded_tensor: [batch, encoded_len] JPEG 编码的图像数据
+            
+        Returns:
+            decoded_tensor: [batch, H, W, C] 解码后的图像数据 (uint8)
+        """
+        import cv2
+        import numpy as np
+        
+        batch_size = encoded_tensor.shape[0]
+        decoded_images = []
+        
+        for i in range(batch_size):
+            # 将 tensor 转换为 bytes
+            img_bytes = encoded_tensor[i].cpu().numpy().tobytes()
+            
+            # 使用 cv2 解码 JPEG
+            nparr = np.frombuffer(img_bytes, np.uint8)
+            img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+            
+            # cv2 返回 BGR，转换为 RGB
+            if img is not None:
+                img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+                decoded_images.append(torch.from_numpy(img))
+            else:
+                # 如果解码失败，使用黑色图像
+                decoded_images.append(torch.zeros((224, 224, 3), dtype=torch.uint8))
+        
+        return torch.stack(decoded_images)
+    
     @torch.no_grad()
     def generate_sequences(self, prompts: DataProto) -> DataProto:
         """Generate sequences """
@@ -253,6 +288,14 @@ class PI0RolloutRob(NaiveRolloutRob):
 
         timing_generate = {}
         with simple_timer("rollout generate_sequences", timing_generate):
+            # 检查图像是否是 JPEG 编码格式（2D tensor）
+            # 如果是，需要先解码
+            if head_image.ndim == 2:
+                # JPEG 编码格式: [batch, encoded_len]
+                head_image = self._decode_jpeg_images(head_image)
+                left_wrist_image = self._decode_jpeg_images(left_wrist_image)
+                right_wrist_image = self._decode_jpeg_images(right_wrist_image)
+            
             with torch.autocast(device_type=get_device_name(), dtype=torch.bfloat16):
                 batch_size = head_image.shape[0]
                 cam_high = head_image.permute(0, 3, 1, 2).to(prompts.batch.device)

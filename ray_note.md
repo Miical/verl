@@ -12,12 +12,14 @@ ray stop --force
 rm -rf /tmp/ray
 ray start --head --dashboard-host=0.0.0.0 --port=6379 --resources='{"node:A": 1, "train_rollout": 1}'
 Node：B
+conda activate raytest2
 ray stop --force
 rm -rf /tmp/ray
 export CUDA_VISIBLE_DEVICES=0 
 ray start --address='192.168.18.151:6379' --resources='{"node:B": 1, "sim": 1}'
 
-bash recipe/vla/run_pi05_robot_test.sh 
+<!-- 机器人测试 -->
+bash recipe/vla/run_pi05_robot_test.sh
 
 
 

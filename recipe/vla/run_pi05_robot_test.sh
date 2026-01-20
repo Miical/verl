@@ -3,6 +3,11 @@ export HOME=/shared_disk/users/weijie.ke
 export HYDRA_OUTPUT_DIR=/shared_disk/users/weijie.ke/verl/outputs
 export RAY_RUNTIME_ENV_CACHE_TTL_SECONDS=0
 export RAY_memory_usage_threshold=0.98
+export RAY_record_ref_creation_sites=1
+# Increase timeout for model initialization (large models need more time)
+export VERL_RAY_GET_TIMEOUT=1200  # 20 minutes instead of default 5 minutes
+export VERL_DEBUG_RPC=1  # Enable debug output to see where it's stuck
+
 # Data path for agilex dual-arm robot dataset
 DATA_PATH=/shared_disk/users/yejun.zeng/datasets/huggingface/lerobot/catch_bowl/
 TEST_DATA_PATH=${TEST_DATA_PATH:-"$DATA_PATH"}
@@ -13,17 +18,25 @@ export CUDA_VISIBLE_DEVICES=0,1
 train_files=$libero_train_path
 test_files=$libero_test_path
 
-OUTPUT_DIR=${MLP_MODEL_OUTPUT:-"$HOME/verl/models/vla_test_env_grpo"}
+OUTPUT_DIR=${MLP_MODEL_OUTPUT:-"$HOME/verl/models/vla_robot_grpo"}
 VIDEO_OUTPUT=${MLP_MODEL_OUTPUT:-"$HOME/verl"}/video
 SFT_MODEL_PATH=${SFT_MODEL_PATH:-"$HOME/weight/giga-openpi/pick_catch_bowl_model"}
 TOKENIZER_PATH=${TOKENIZER_PATH:-"/shared_disk/models/huggingface/models--google--paligemma-3b-pt-224"}
 
+# Disaggregation mode configuration
+# NUM_NODES: Number of train/rollout nodes (main nodes)
+# NUM_SIM_NODES: Number of simulation/environment nodes (robot/env nodes)
 NUM_NODES=1
-NUM_GPUS=2
-NUM_ENV_GPUS=1
-# rollout.n should equal to num_envs for test env
+NUM_SIM_NODES=1  # Enable 1 simulation node (node B - robot side)
+ENABLE_DISAGG_SIM=True  # Enable disaggregation: node A for train, node B for env
+
+NUM_GPUS=1
+NUM_ROLLOUT_GPUS=1  # Use 1 GPU on node A for rollout
+NUM_ENV_GPUS=1      # Use 1 GPU on node B for environment
+
+# rollout.n should equal to num_envs for real robot
 ROLLOUT_N=1
-# test means test_env using LeRobot dataset replay
+# test means test_env using LeRobot dataset replay (also works for real robot)
 SIM_TYPE="test"
 PROJECT_NAME="vla_test_env_RL"
 EXPERIMENT_NAME="${SIM_TYPE}_reinforce_plus_plus"
@@ -56,11 +69,29 @@ $PYTHON -m recipe.vla.main_sac \
     data.max_response_length=128 \
     env.rollout.pipeline_stage_num=1 \
     env.train.simulator_type=$SIM_TYPE \
+    env.disagg_sim.enable=$ENABLE_DISAGG_SIM \
+    env.disagg_sim.nnodes=$NUM_SIM_NODES \
+    +env.train.data_path="$TEST_DATA_PATH" \
+    +env.train.step_size=$TEST_STEP_SIZE \
+    +env.train.action_chunk=$TEST_ACTION_CHUNK \
     +env.train.robot_config_path="$ROBOT_CONFIG_PATH" \
+    +env.train.env.name="gym_testenv" \
+    +env.train.env.data_path="$TEST_DATA_PATH" \
+    +env.train.env.step_size=$TEST_STEP_SIZE \
+    +env.train.env.action_chunk=$TEST_ACTION_CHUNK \
+    +env.train.env.robot.type="piper" \
+    +env.train.env.robot.config="$ROBOT_CONFIG_PATH" \
+    +env.train.env.teleop.type=null \
+    +env.train.env.teleop.config=null \
+    +env.train.env.processor.gripper.use_gripper=True \
+    +env.train.env.processor.gripper.gripper_penalty=0.0 \
+    +env.train.env.processor.reset.terminate_on_success=True \
+    +env.train.env.processor.observation.display_cameras=False \
+    +env.train.env.device="cpu" \
     env.actor.model.num_action_chunks=10 \
     env.actor.model.action_dim=16 \
     env.train.only_eval=True \
-    env.train.max_episode_steps=10 \
+    env.train.max_episode_steps=300 \
     env.train.video_cfg.save_video=False \
     env.train.video_cfg.video_base_dir=${VIDEO_OUTPUT} \
     env.train.seed=42 \
@@ -75,8 +106,8 @@ $PYTHON -m recipe.vla.main_sac \
     actor_rollout_ref.actor.ppo_mini_batch_size=128 \
     actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=1 \
     actor_rollout_ref.actor.use_dynamic_bsz=False \
-    actor_rollout_ref.actor.strategy=fsdp2 \
-    critic.strategy=fsdp2 \
+    actor_rollout_ref.actor.strategy=fsdp \
+    critic.strategy=fsdp \
     actor_rollout_ref.actor.grad_clip=1 \
     actor_rollout_ref.actor.clip_ratio_high=0.28 \
     actor_rollout_ref.actor.clip_ratio_low=0.2 \
@@ -91,7 +122,7 @@ $PYTHON -m recipe.vla.main_sac \
     actor_rollout_ref.rollout.log_prob_micro_batch_size=16 \
     actor_rollout_ref.rollout.tensor_model_parallel_size=1 \
     actor_rollout_ref.rollout.name=hf \
-    actor_rollout_ref.rollout.gpu_memory_utilization=0.9 \
+    actor_rollout_ref.rollout.gpu_memory_utilization=0.7 \
     actor_rollout_ref.rollout.free_cache_engine=False \
     actor_rollout_ref.ref.log_prob_micro_batch_size=16 \
     actor_rollout_ref.ref.fsdp_config.param_offload=True \
@@ -102,7 +133,7 @@ $PYTHON -m recipe.vla.main_sac \
     trainer.default_local_dir=$OUTPUT_DIR \
     trainer.n_gpus_per_node=$NUM_GPUS \
     +trainer.n_env_gpus_per_node=$NUM_ENV_GPUS \
-    +trainer.n_rollout_gpus_per_node=$((NUM_GPUS - NUM_ENV_GPUS)) \
+    +trainer.n_rollout_gpus_per_node=$NUM_ROLLOUT_GPUS \
     trainer.nnodes=$NUM_NODES \
     trainer.save_freq=30 \
     trainer.test_freq=-1 \

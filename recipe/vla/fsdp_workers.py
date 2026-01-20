@@ -235,6 +235,24 @@ class RobActorRolloutRefWorker(ActorRolloutRefWorker):
                     except Exception as e:
                         print(f"[trainer_mode] FSDP1: failed to close exit_stack: {e}", flush=True)
                         logger.warning(f"Failed to close FSDP1 unshard exit stack: {e}")
+                        # The exit_stack close failed due to FSDP internal state issues.
+                        # This is a known issue with FSDP summon_full_params.
+                        # We'll try to recover by:
+                        # 1. Synchronizing all ranks
+                        # 2. Clearing the exit stack without closing
+                        # 3. Hoping the model state is still usable
+                        print(f"[trainer_mode] FSDP1: Attempting recovery...", flush=True)
+                        try:
+                            if torch.distributed.is_initialized():
+                                torch.distributed.barrier()
+                                print(f"[trainer_mode] FSDP1: barrier completed", flush=True)
+                            # Clear CUDA cache to free any inconsistent memory
+                            if torch.cuda.is_available():
+                                torch.cuda.empty_cache()
+                                print(f"[trainer_mode] FSDP1: CUDA cache cleared", flush=True)
+                        except Exception as recovery_e:
+                            print(f"[trainer_mode] FSDP1: recovery failed: {recovery_e}", flush=True)
+                        print(f"[trainer_mode] FSDP1: Continuing despite error (model may be in inconsistent state)", flush=True)
                     self.fsdp_unshard_exit_stack = None
             elif fsdp_ver == 2:
                 try:

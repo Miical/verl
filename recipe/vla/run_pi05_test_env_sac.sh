@@ -4,13 +4,16 @@ export HYDRA_OUTPUT_DIR=/shared_disk/users/weijie.ke/verl/outputs
 export RAY_RUNTIME_ENV_CACHE_TTL_SECONDS=0
 export RAY_memory_usage_threshold=0.98
 export RAY_record_ref_creation_sites=1
+# Increase timeout for model initialization (large models need more time)
+export VERL_RAY_GET_TIMEOUT=1200  # 20 minutes instead of default 5 minutes
+export VERL_DEBUG_RPC=1  # Enable debug output to see where it's stuck
 # Data path for agilex dual-arm robot dataset
 DATA_PATH=/shared_disk/users/yejun.zeng/datasets/huggingface/lerobot/catch_bowl/
 TEST_DATA_PATH=${TEST_DATA_PATH:-"$DATA_PATH"}
 libero_train_path=/shared_disk/users/yejun.zeng/datasets/huggingface/lerobot/catch_bowl/
 libero_test_path=/shared_disk/users/yejun.zeng/datasets/huggingface/lerobot/catch_bowl/
 
-export CUDA_VISIBLE_DEVICES=0
+export CUDA_VISIBLE_DEVICES=0,1,2,3
 train_files=$libero_train_path
 test_files=$libero_test_path
 
@@ -23,12 +26,12 @@ TOKENIZER_PATH=${TOKENIZER_PATH:-"/shared_disk/models/huggingface/models--google
 # NUM_NODES: Number of train/rollout nodes (main nodes)
 # NUM_SIM_NODES: Number of simulation/environment nodes (robot/env nodes)
 NUM_NODES=1
-NUM_SIM_NODES=1
-ENABLE_DISAGG_SIM=True
+NUM_SIM_NODES=1  # Enable 1 simulation node (node B)
+ENABLE_DISAGG_SIM=True  # Enable disaggregation: node A for train, node B for env
 
-NUM_GPUS=2
-NUM_ROLLOUT_GPUS=1  # GPUs for train-rollout on main node
-NUM_ENV_GPUS=1      # GPUs for simulation/env on sim node
+NUM_GPUS=1
+NUM_ROLLOUT_GPUS=1  # Use all 4 GPUs on node A for rollout
+NUM_ENV_GPUS=1      # Use 1 GPU on node B for environment
 
 # rollout.n should equal to num_envs for test env
 ROLLOUT_N=1
@@ -82,7 +85,7 @@ $PYTHON -m recipe.vla.main_sac \
     env.actor.model.num_action_chunks=10 \
     env.actor.model.action_dim=16 \
     env.train.only_eval=True \
-    env.train.max_episode_steps=10 \
+    env.train.max_episode_steps=100 \
     env.train.video_cfg.save_video=False \
     env.train.video_cfg.video_base_dir=${VIDEO_OUTPUT} \
     env.train.seed=42 \
@@ -113,7 +116,7 @@ $PYTHON -m recipe.vla.main_sac \
     actor_rollout_ref.rollout.log_prob_micro_batch_size=16 \
     actor_rollout_ref.rollout.tensor_model_parallel_size=1 \
     actor_rollout_ref.rollout.name=hf \
-    actor_rollout_ref.rollout.gpu_memory_utilization=0.9 \
+    actor_rollout_ref.rollout.gpu_memory_utilization=0.7 \
     actor_rollout_ref.rollout.free_cache_engine=False \
     actor_rollout_ref.ref.log_prob_micro_batch_size=16 \
     actor_rollout_ref.ref.fsdp_config.param_offload=True \

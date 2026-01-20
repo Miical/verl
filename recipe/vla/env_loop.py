@@ -34,15 +34,44 @@ def force_print(*args, **kwargs):
     print(*args, **kwargs, flush=True)
     sys.stdout.flush()
     sys.stderr.flush()
+def estimate_dataproto_size(data_proto: DataProto) -> int:
+    """估算 DataProto 的数据大小（字节）"""
+    total_size = 0
+    
+    # 计算 tensor batch 大小
+    if data_proto.batch is not None:
+        for key in data_proto.batch.keys():
+            tensor = data_proto.batch[key]
+            if isinstance(tensor, torch.Tensor):
+                total_size += tensor.numel() * tensor.element_size()
+    
+    # 计算 non_tensor_batch 大小（粗略估计）
+    if data_proto.non_tensor_batch:
+        for key, val in data_proto.non_tensor_batch.items():
+            if isinstance(val, np.ndarray):
+                total_size += val.nbytes
+            elif isinstance(val, (list, tuple)):
+                # 粗略估计字符串列表大小
+                total_size += sum(len(str(v)) for v in val)
+    
+    return total_size
+
+
 class PerformanceMonitor:
     """性能监控器，记录各个步骤的耗时"""
     def __init__(self):
         self.timings = defaultdict(list)
+        self.data_sizes = defaultdict(list)  # 记录数据大小（字节）
         self.step_count = 0
     
     def record(self, name: str, duration: float):
         """记录一次耗时"""
         self.timings[name].append(duration)
+    
+    def record_with_size(self, name: str, duration: float, size_bytes: int):
+        """记录耗时和数据大小"""
+        self.timings[name].append(duration)
+        self.data_sizes[name].append(size_bytes)
     
     def report(self):
         """打印性能报告"""
@@ -58,6 +87,18 @@ class PerformanceMonitor:
                 force_print(f"  最小耗时: {min(durations):.4f} s")
                 force_print(f"  最大耗时: {max(durations):.4f} s")
                 force_print(f"  总耗时: {sum(durations):.4f} s")
+                
+                # 如果有数据大小记录，打印带宽信息
+                if name in self.data_sizes and self.data_sizes[name]:
+                    sizes = self.data_sizes[name]
+                    avg_size_mb = mean(sizes) / (1024 * 1024)
+                    total_size_mb = sum(sizes) / (1024 * 1024)
+                    avg_duration = mean(durations)
+                    if avg_duration > 0:
+                        bandwidth_mbps = avg_size_mb / avg_duration
+                        force_print(f"  平均数据大小: {avg_size_mb:.2f} MB")
+                        force_print(f"  总数据传输量: {total_size_mb:.2f} MB")
+                        force_print(f"  估算带宽: {bandwidth_mbps:.2f} MB/s")
         
         force_print("\n" + "="*80)
 
@@ -202,8 +243,13 @@ class EnvLoop:
             torch.cuda.synchronize()
         reset_duration = time.perf_counter() - t_start
         if self.enable_perf_monitoring:
-            self.perf_monitor.record("1. Env Reset (NodeB->NodeA)", reset_duration)
-            print(f"[PerfMonitor] Env Reset耗时: {reset_duration:.4f}s", flush=True)
+            # 计算回传数据大小
+            reset_data_size = estimate_dataproto_size(reset_results)
+            self.perf_monitor.record_with_size("1. Env Reset (NodeB->NodeA)", reset_duration, reset_data_size)
+            force_print(f"[PerfMonitor] Env Reset: "
+                       f"耗时={reset_duration:.4f}s, "
+                       f"数据大小={reset_data_size/(1024*1024):.2f}MB, "
+                       f"带宽={reset_data_size/(1024*1024)/reset_duration:.2f}MB/s")
 
         staged_obs = self._restructure_obs_data(reset_results)
         # --- Pipeline state ---
@@ -247,13 +293,28 @@ class EnvLoop:
             staged_next_obs = {}
             for stage_id in range(self.stage_num):
                 # 【性能监控】 等待环境step结果 (NodeB执行+回传到NodeA)
+                force_print(f"[EnvLoop] Step {step}, Stage {stage_id}: 开始等待 env_step 结果...")
+                force_print(f"[EnvLoop] env_step_futures[{stage_id}] type: {type(env_step_futures[stage_id])}")
                 t_env_wait_start = time.perf_counter()
                 env_result: DataProto = env_step_futures[stage_id].get()
+                force_print(f"[EnvLoop] Step {step}, Stage {stage_id}: 收到 env_step 结果!")
                 if torch.cuda.is_available():
                     torch.cuda.synchronize()
                 env_step_duration = time.perf_counter() - t_env_wait_start
+                
+                # 【性能监控】 计算回传数据大小并记录
                 if self.enable_perf_monitoring:
-                    self.perf_monitor.record("3. Env Step+Transfer (NodeB->NodeA)", env_step_duration)
+                    data_size = estimate_dataproto_size(env_result)
+                    self.perf_monitor.record_with_size(
+                        "3. Env Step+Transfer (NodeB->NodeA)", 
+                        env_step_duration, 
+                        data_size
+                    )
+                    # 打印每次传输的详细信息
+                    force_print(f"[PerfMonitor] Step {step}, Stage {stage_id}: "
+                               f"耗时={env_step_duration:.4f}s, "
+                               f"数据大小={data_size/(1024*1024):.2f}MB, "
+                               f"带宽={data_size/(1024*1024)/env_step_duration:.2f}MB/s")
 
                 # Store rewards and terminations
                 trajectories[stage_id][-1]["rew"] = env_result.batch["rews"]

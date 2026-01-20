@@ -1725,6 +1725,7 @@ class RealRobotEnvWrapper:
                 )
                 
                 # 使用转换后的 end-effector pose action
+                force_print(f"[RealRobotEnvWrapper] End-effector pose action: {endpose_action}")
                 action = endpose_action
         
         # 通过处理器管道执行步骤（处理人工介入）

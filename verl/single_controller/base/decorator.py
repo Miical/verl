@@ -132,7 +132,7 @@ def collect_all_to_all(worker_group, output):
     return output
 
 
-def _concat_data_proto_or_future(output: list):
+def _concat_data_proto_or_future(output: list, padding_size: int = 0):
     import ray
 
     from verl.protocol import DataProto, DataProtoFuture
@@ -144,9 +144,15 @@ def _concat_data_proto_or_future(output: list):
     o = output[0]
 
     if isinstance(o, DataProto):
-        return DataProto.concat(output)
+        result = DataProto.concat(output)
+        # Remove padding if padding_size > 0
+        if padding_size > 0:
+            original_len = len(result) - padding_size
+            if original_len > 0:
+                result = result.select_idxs(list(range(original_len)))
+        return result
     elif isinstance(o, ray.ObjectRef):
-        return DataProtoFuture.concat(output)
+        return DataProtoFuture.concat(output, padding_size=padding_size)
     elif isinstance(o, BatchMeta):
         return BatchMeta.concat(output)
     else:
@@ -226,7 +232,7 @@ def dispatch_nd_compute(dp_rank_mapping: list[int], dp_size, worker_group, *args
     
     if use_parallel_put:
         args = [parallel_put(arg, max_workers=max_workers) for arg in args]
-        kwargs = {k: parallel_put(v, max_workers=max_workers) for k, v in kwargs.items()}
+        kwargs = {k: parallel_put(v, max_workers=max_workers) for k, v in kwargs.items() if k != _padding_size_key}
     # else: 直接使用原始数据，让 Ray 在 remote() 调用时自动序列化
 
     all_args = []
@@ -241,6 +247,10 @@ def dispatch_nd_compute(dp_rank_mapping: list[int], dp_size, worker_group, *args
 
     all_kwargs = {}
     for k, v in kwargs.items():
+        # Skip _padding_size_key which is an integer added by _split_args_kwargs_data_proto_with_auto_padding
+        if k == _padding_size_key:
+            all_kwargs[k] = v  # Pass through as-is (it's an integer, not a list)
+            continue
         assert isinstance(v, tuple | list) and len(v) == dp_size
         transformed_v = []
         for i in range(worker_group.world_size):
@@ -265,11 +275,22 @@ def collect_nd_compute(collect_mask: list[bool], worker_group, output):
 
 
 def dispatch_nd_compute_dataproto(dp_rank_mapping: list[int], dp_size, worker_group, *args, **kwargs):
-    splitted_args, splitted_kwargs = _split_args_kwargs_data_proto(dp_size, *args, **kwargs)
+    from verl.protocol import DataProto, DataProtoFuture, DataProtoConfig
+    
+    # Enable auto_padding for all DataProto args to support batch sizes not divisible by dp_size
+    for arg in args:
+        if isinstance(arg, DataProto):
+            arg.meta_info[DataProtoConfig.auto_padding_key] = True
+    for key, val in kwargs.items():
+        if isinstance(val, DataProto):
+            val.meta_info[DataProtoConfig.auto_padding_key] = True
+    
+    # Use auto padding version to support batch sizes not divisible by dp_size
+    splitted_args, splitted_kwargs = _split_args_kwargs_data_proto_with_auto_padding(dp_size, *args, **kwargs)
     return dispatch_nd_compute(dp_rank_mapping, dp_size, worker_group, *splitted_args, **splitted_kwargs)
 
 
-def collect_nd_compute_dataproto(collect_mask: list[bool], worker_group, output):
+def collect_nd_compute_dataproto(collect_mask: list[bool], worker_group, output, padding_size: int = 0):
     output = collect_nd_compute(collect_mask, worker_group, output)
     import ray
 
@@ -279,7 +300,8 @@ def collect_nd_compute_dataproto(collect_mask: list[bool], worker_group, output)
         assert isinstance(o, DataProto | ray.ObjectRef | BatchMeta), (
             f"expecting {o} to be DataProto or BatchMeta, but got {type(o)}"
         )
-    return _concat_data_proto_or_future(output)
+    # Pass padding_size to _concat_data_proto_or_future for proper padding removal
+    return _concat_data_proto_or_future(output, padding_size=padding_size)
 
 
 def dispatch_lazy_compute_data_proto(mesh_name, worker_group, *args, **kwargs):
@@ -295,7 +317,18 @@ def dispatch_lazy_compute_data_proto(mesh_name, worker_group, *args, **kwargs):
     dp_rank_mapping = worker_group._dispatch_info[mesh_name]
     # perform dispatch
     dp_size = max(dp_rank_mapping) + 1
-    return dispatch_nd_compute_dataproto(dp_rank_mapping, dp_size, worker_group, *args, **kwargs)
+    result = dispatch_nd_compute_dataproto(dp_rank_mapping, dp_size, worker_group, *args, **kwargs)
+    
+    # Store padding_size for later use in collect
+    # result[1] is kwargs, which may contain _padding_size_key
+    if isinstance(result, tuple) and len(result) == 2:
+        result_kwargs = result[1]
+        if isinstance(result_kwargs, dict) and _padding_size_key in result_kwargs:
+            if not hasattr(worker_group, '_padding_info'):
+                worker_group._padding_info = {}
+            worker_group._padding_info[mesh_name] = result_kwargs[_padding_size_key]
+    
+    return result
 
 
 def collect_lazy_compute_data_proto(mesh_name, worker_group, *args, **kwargs):
@@ -312,8 +345,16 @@ def collect_lazy_compute_data_proto(mesh_name, worker_group, *args, **kwargs):
 
     # a boolean of whether the dp_rank is used for collect
     collect_mask = worker_group._collect_info[mesh_name]
-    # perform dispatch
-    return collect_nd_compute_dataproto(collect_mask, worker_group, *args, **kwargs)
+    
+    # Get padding_size from dispatch phase
+    padding_size = 0
+    if hasattr(worker_group, '_padding_info') and mesh_name in worker_group._padding_info:
+        padding_size = worker_group._padding_info[mesh_name]
+        # Clear padding info after use
+        del worker_group._padding_info[mesh_name]
+    
+    # perform collect with padding removal
+    return collect_nd_compute_dataproto(collect_mask, worker_group, *args, padding_size=padding_size, **kwargs)
 
 
 def make_nd_compute_dataproto_dispatch_fn(mesh_name):
