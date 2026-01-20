@@ -27,7 +27,7 @@ from verl.single_controller.base.decorator import Dispatch, make_nd_compute_data
 from verl.utils.device import (
     get_device_name,
 )
-from verl.utils.distributed import initialize_global_process_group_ray
+from verl.utils.distributed import initialize_global_process_group_ray, initialize_global_process_group_ray_cpu
 
 
 def put_tensor_cpu(data_dict):
@@ -81,7 +81,8 @@ class EnvWorker(Worker):
         self.eval_simulator_list = []
 
         self.stage_num = self.cfg.rollout.pipeline_stage_num
-        initialize_global_process_group_ray(timeout_second=None)
+        # initialize_global_process_group_ray(timeout_second=None)
+        initialize_global_process_group_ray_cpu(timeout_second=None)
         device_name = get_device_name()
         env_device_mesh = init_device_mesh(device_name, mesh_shape=(self.world_size, 1), mesh_dim_names=["dp", "tp"])
         self._register_dispatch_collect_info("env", dp_rank=env_device_mesh["dp"].get_local_rank(), is_collect=True)
