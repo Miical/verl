@@ -320,7 +320,7 @@ class PI0RobDataParallelPPOActor(BaseSACActor):
         batch["valid"] = batch["response_mask"].any(dim=-1).float() # (B,)
         micro_batches = batch.split(self.config.ppo_micro_batch_size_per_gpu)
         global_steps = data.meta_info["global_steps"]
-        grad_accum_steps = len(micro_batches)
+        grad_accum_steps = len(micro_batches) * torch.distributed.get_world_size()
 
         actor_logprobs_list = []
         actor_loss_list, critic_loss_list, alpha_loss_list = [], [], []
