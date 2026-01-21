@@ -2,20 +2,42 @@ set -x
 libero_train_path=$HOME/data/libero_rl/train.parquet
 libero_test_path=$HOME/data/libero_rl/test.parquet
 
-
 train_files=$libero_train_path
 test_files=$libero_test_path
+rlpd_files="/root/dataset/20251027T005_install_belt_cyt001_01"
 
 OUTPUT_DIR=${MLP_MODEL_OUTPUT:-"$HOME/models/vla_libero_grpo"}
 VIDEO_OUTPUT=${MLP_MODEL_OUTPUT:-"$HOME"}/video
 SFT_MODEL_PATH=${SFT_MODEL_PATH:-"$HOME/data/pi05_libero_torch"}
-TOKENIZER_PATH=${TOKENIZER_PATH:-"google/paligemma-3b-pt-224"}
+TOKENIZER_PATH="$SFT_MODEL_PATH"
 
-NUM_NODES=1
-NUM_GPUS=6
-NUM_ENV_GPUS=2
-# rollout.n should equal to num_envs for isaac env
-ROLLOUT_N=8
+# Physical Node Config
+NUM_NODES=1                                    # number of nodes
+NUM_GPUS=4                                     # total number of gpus per node
+
+# Role Config
+NUM_ENV_GPUS=2                                 # number of gpus for env workers per node
+NUM_ROLLOUT_GPUS=$((NUM_GPUS - NUM_ENV_GPUS))  # number of gpus for rollout workers per node
+
+# Rollout Config
+# NOTE: TRAIN_BATCH_SIZE * ROLLOUT_N == NUM_ENV_GPUS * NUM_STAGE * NUM_ENV
+TRAIN_BATCH_SIZE=32                            # batch size for dataloaders per step
+ROLLOUT_N=1                                    # response number for each prompt (for GRPO)
+NUM_STAGE=2                                    # number of pipeline stages
+NUM_ENV=8                                      # number of envs per env worker
+
+NUM_ACTION_CHUNKS=10                           # number of action chunks
+MAX_EPISODE_STEPS=30                           # max episode steps for each env
+                                               # max_interactions = MAX_EPISODE_STEPS / num_action_chunks
+
+# Training Config
+MINI_BATCH_SIZE=128                            # mini batch size (batch size per GPU, automatically multiplied by ROLLOUT_N)
+                                               # invalid in SAC, currently
+                                               # In SAC, it equal to (max_interactions - 1) * TRAIN_BATCH_SIZE * ROLLOUT_N / NUM_ROLLOUT_GPUS
+MICRO_BATCH_SIZE=8                             # micro batch size (per GPU, for gradient accumulation, should divide MINI_BATCH_SIZE)
+
+
+
 # isaac or libero
 # libero means original libero benchmark with mujoco sim
 # isaac means libero benchmark using isaac sim
@@ -43,18 +65,19 @@ fi
 $PYTHON -m recipe.vla.main_sac \
     data.train_files="$train_files" \
     data.val_files="$test_files" \
-    data.train_batch_size=4 \
+    +data.rlpd_files="$rlpd_files" \
+    data.train_batch_size=$TRAIN_BATCH_SIZE \
     data.val_batch_size=4 \
     actor_rollout_ref.rollout.n=$ROLLOUT_N \
-    env.train.num_envs=$ROLLOUT_N \
+    env.train.num_envs=$NUM_ENV \
     data.max_prompt_length=256 \
     data.max_response_length=128 \
-    env.rollout.pipeline_stage_num=2 \
+    env.rollout.pipeline_stage_num=$NUM_STAGE \
     env.train.simulator_type=$SIM_TYPE \
-    env.actor.model.num_action_chunks=10 \
+    env.actor.model.num_action_chunks=$NUM_ACTION_CHUNKS \
     env.actor.model.action_dim=7 \
     env.train.only_eval=False \
-    env.train.max_episode_steps=20\
+    env.train.max_episode_steps=$MAX_EPISODE_STEPS \
     env.train.video_cfg.save_video=True \
     env.train.video_cfg.video_base_dir=${VIDEO_OUTPUT} \
     env.train.seed=42 \
@@ -65,8 +88,8 @@ $PYTHON -m recipe.vla.main_sac \
     actor_rollout_ref.rollout.mode=async_envloop \
     actor_rollout_ref.actor.optim.lr=5e-6 \
     actor_rollout_ref.actor.optim.warmup_style=constant \
-    actor_rollout_ref.actor.ppo_mini_batch_size=128 \
-    actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=1 \
+    actor_rollout_ref.actor.ppo_mini_batch_size=$MINI_BATCH_SIZE \
+    actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=$MICRO_BATCH_SIZE \
     actor_rollout_ref.actor.use_dynamic_bsz=False \
     actor_rollout_ref.actor.strategy=fsdp2 \
     critic.strategy=fsdp2 \
@@ -95,11 +118,12 @@ $PYTHON -m recipe.vla.main_sac \
     trainer.default_local_dir=$OUTPUT_DIR \
     trainer.n_gpus_per_node=$NUM_GPUS \
     +trainer.n_env_gpus_per_node=$NUM_ENV_GPUS \
-    +trainer.n_rollout_gpus_per_node=$((NUM_GPUS - NUM_ENV_GPUS)) \
+    +trainer.n_rollout_gpus_per_node=$NUM_ROLLOUT_GPUS \
+    +trainer.rlpd_enable=False \
     trainer.nnodes=$NUM_NODES \
-    trainer.save_freq=30 \
+    trainer.save_freq=60 \
     trainer.test_freq=-1 \
-    trainer.total_epochs=10 \
+    trainer.total_epochs=100 \
     trainer.val_only=False \
     algorithm.adv_estimator=reinforce_plus_plus \
     trainer.val_before_train=False
