@@ -176,8 +176,8 @@ class EnvWorker(Worker):
                     )
                 )
         
-        elif self.cfg.train.simulator_type == "test":
-            from recipe.vla.envs.test_env.test_env import TestEnv
+        elif self.cfg.train.simulator_type == "robot":
+            from recipe.vla.envs.robot_env.robot_env import RealRobotEnv
 
             for i in range(self.stage_num):
                 logger.info(f"  Creating TestEnv EnvManager {i+1}/{self.stage_num}...")
@@ -186,7 +186,7 @@ class EnvWorker(Worker):
                         self.cfg.train,
                         rank=self._rank,
                         world_size=self._world_size,
-                        env_cls=TestEnv,
+                        env_cls=RealRobotEnv,
                     )
                 )
         
