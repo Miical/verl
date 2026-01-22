@@ -59,8 +59,32 @@ class PiperFollowerEndEffector(PiperFollower):
         if not hasattr(self.config, "orientation_activation_eps"):
             self.config.orientation_activation_eps = 1e-9
 
-        kinL = RobotKinematics(urdf_path=self.config.urdf_path, target_frame_name=self.config.target_frame_name)
-        kinR = RobotKinematics(urdf_path=self.config.urdf_path, target_frame_name=self.config.target_frame_name)
+        # 🔧 硬编码绝对路径，避免路径查找问题
+        import os
+        from pathlib import Path
+        
+        # 硬编码的绝对路径
+        HARDCODED_URDF_PATH = "/home/agilex-home/agilex/keweijie/verl/recipe/vla/envs/test_env/robot/controller/piper/local_assets/piper.urdf/robot.urdf"
+        HARDCODED_MESH_DIR = "/home/agilex-home/agilex/keweijie/verl/recipe/vla/envs/test_env/robot/controller/piper/local_assets"
+        
+        # 使用硬编码路径
+        urdf_abs_path = Path(HARDCODED_URDF_PATH)
+        mesh_dir = Path(HARDCODED_MESH_DIR)
+        
+        original_cwd = os.getcwd()
+        
+        # 切换到包含 meshes/ 的目录
+        logger.info(f"[PiperFollowerEndEffector] Switching to mesh directory: {mesh_dir}")
+        logger.info(f"[PiperFollowerEndEffector] URDF file: {urdf_abs_path}")
+        os.chdir(str(mesh_dir))
+        
+        # 创建运动学求解器（placo 会基于当前工作目录查找 mesh 文件）
+        kinL = RobotKinematics(urdf_path=str(urdf_abs_path), target_frame_name=self.config.target_frame_name)
+        kinR = RobotKinematics(urdf_path=str(urdf_abs_path), target_frame_name=self.config.target_frame_name)
+        
+        # 创建完成后恢复工作目录
+        os.chdir(original_cwd)
+        logger.info(f"[PiperFollowerEndEffector] Restored working directory: {original_cwd}")
 
         model_joint_order = ["joint1","joint2","joint3","joint4","joint5","joint6","joint7","joint8"]
         for kin in (kinL, kinR):

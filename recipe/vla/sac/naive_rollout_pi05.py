@@ -24,6 +24,7 @@ import json
 import logging
 import os
 
+import numpy as np
 import torch
 from PIL import Image
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
@@ -37,6 +38,7 @@ from verl import DataProto
 from verl.utils.device import get_device_id, get_device_name, get_torch_device
 from verl.utils.profiler import simple_timer
 from verl.workers.rollout.base import BaseRollout
+
 
 logger = logging.getLogger(__name__)
 
@@ -267,8 +269,8 @@ class PI0RolloutRob(NaiveRolloutRob):
             
             # cv2 返回 BGR，转换为 RGB
             if img is not None:
-                img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-                decoded_images.append(torch.from_numpy(img))
+                img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+                decoded_images.append(torch.from_numpy(img_rgb))
             else:
                 # 如果解码失败，使用黑色图像
                 decoded_images.append(torch.zeros((224, 224, 3), dtype=torch.uint8))
@@ -292,6 +294,7 @@ class PI0RolloutRob(NaiveRolloutRob):
             # 如果是，需要先解码
             if head_image.ndim == 2:
                 # JPEG 编码格式: [batch, encoded_len]
+                # 解码图像
                 head_image = self._decode_jpeg_images(head_image)
                 left_wrist_image = self._decode_jpeg_images(left_wrist_image)
                 right_wrist_image = self._decode_jpeg_images(right_wrist_image)
@@ -326,9 +329,10 @@ class PI0RolloutRob(NaiveRolloutRob):
 
         print("rollout generate_sequences time (s): %s" % timing_generate.get("rollout generate_sequences", 0.0))
 
+        # 直接使用模型推理出的连续action
         ret = DataProto.from_dict(
             {
-                "action": action[:, :10, :7],
+                "action": action[:, :30, :14],
                 "full_action": action,
                 "images": torch.stack(images_out, dim=1),
                 "image_masks": torch.stack(img_masks, dim=1),

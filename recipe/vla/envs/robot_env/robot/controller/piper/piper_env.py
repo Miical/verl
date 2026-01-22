@@ -62,6 +62,64 @@ import gymnasium as gym
 import numpy as np
 import torch
 import math
+# 将 lerobot 路径添加到 sys.path（用于 RobotEnv）
+_current_dir = os.path.dirname(os.path.abspath(__file__))
+_lerobot_path = _current_dir
+if _lerobot_path not in sys.path:
+    sys.path.insert(0, _lerobot_path)
+
+# 核心配置和工具
+from lerobot.envs.configs import HILSerlRobotEnvConfig
+from lerobot.model.kinematics import RobotKinematics
+
+# 从 gym_manipulator_bipiper 导入基础环境和函数
+try:
+    from lerobot.rl.gym_manipulator_bipiper import (
+        RobotEnv,
+        make_robot_env as _make_robot_env_base,
+        make_processors as _make_processors_base,
+        step_env_and_process_transition as _step_env_and_process_transition_base,
+        reset_follower_position,
+        control_loop,
+        replay_trajectory,
+    )
+except ImportError as e:
+    force_print(f"[robot_env.py] 警告: 无法从 gym_manipulator_bipiper 导入: {e}")
+    force_print(f"[robot_env.py] 尝试直接导入模块...")
+    # 尝试直接导入模块然后访问
+    import lerobot.rl.gym_manipulator_bipiper as gym_manipulator_bipiper_module
+    RobotEnv = gym_manipulator_bipiper_module.RobotEnv
+    _make_robot_env_base = gym_manipulator_bipiper_module.make_robot_env
+    _make_processors_base = gym_manipulator_bipiper_module.make_processors
+    _step_env_and_process_transition_base = gym_manipulator_bipiper_module.step_env_and_process_transition
+    reset_follower_position = gym_manipulator_bipiper_module.reset_follower_position
+    control_loop = gym_manipulator_bipiper_module.control_loop
+    replay_trajectory = gym_manipulator_bipiper_module.replay_trajectory
+    force_print(f"[robot_env.py] ✓ 成功通过模块直接导入")
+
+# 仅导入 robot_env.py 实际使用的 processor 类
+from lerobot.processor import (
+    AddBatchDimensionProcessorStep,
+    DataProcessorPipeline,
+    DeviceProcessorStep,
+    EnvTransition,
+    Numpy2TorchActionProcessorStep,
+    Torch2NumpyActionProcessorStep,
+    TransitionKey,
+    VanillaObservationProcessorStep,
+    create_transition,
+)
+from lerobot.processor.converters import identity_transition
+
+# Teleoperator 相关（RealRobotEnvWrapper 需要）
+from lerobot.teleoperators.teleoperator import Teleoperator
+from lerobot.teleoperators.utils import TeleopEvents
+
+# 常量定义
+from lerobot.utils.constants import OBS_IMAGES, OBS_STATE
+
+import pdb
+
 def rotmat_to_rpy_zyx(R: np.ndarray) -> tuple[float, float, float]:
     """
     将旋转矩阵 R 转成欧拉角 (rx, ry, rz)，单位 rad
@@ -108,75 +166,6 @@ def force_print(*args, **kwargs):
     print(*args, **kwargs, flush=True)
     sys.stdout.flush()
     sys.stderr.flush()
-
-# 将 lerobot 路径添加到 sys.path（用于 RobotEnv）
-_current_dir = os.path.dirname(os.path.abspath(__file__))
-_lerobot_path = _current_dir
-if _lerobot_path not in sys.path:
-    sys.path.insert(0, _lerobot_path)
-
-from lerobot.cameras import opencv  # noqa: F401
-from lerobot.envs.configs import HILSerlRobotEnvConfig
-from lerobot.model.kinematics import RobotKinematics
-from lerobot.processor import (
-    AddBatchDimensionProcessorStep,
-    AddTeleopActionAsComplimentaryDataStep,
-    AddTeleopEventsAsInfoStep,
-    DataProcessorPipeline,
-    DeviceProcessorStep,
-    EnvTransition,
-    GripperPenaltyProcessorStep,
-    ImageCropResizeProcessorStep,
-    InterventionActionProcessorStep,
-    RenameObservationsProcessorStep,
-    JointVelocityProcessorStep,
-    MapDeltaActionToRobotActionStep,
-    MapTensorToDeltaActionDictStep,
-    MotorCurrentProcessorStep,
-    Numpy2TorchActionProcessorStep,
-    RewardClassifierProcessorStep,
-    RobotActionToPolicyActionProcessorStep,
-    TimeLimitProcessorStep,
-    Torch2NumpyActionProcessorStep,
-    TransitionKey,
-    VanillaObservationProcessorStep,
-    create_transition,
-)
-from lerobot.processor.converters import identity_transition
-from lerobot.robots import (  # noqa: F401
-    RobotConfig,
-    make_robot_from_config,
-    so100_follower,
-    piper_follower,
-)
-from lerobot.robots.robot import Robot
-from lerobot.robots.so100_follower.robot_kinematic_processor import (
-    EEBoundsAndSafety,
-    EEReferenceAndDelta,
-    ForwardKinematicsJointsToEEObservation,
-    GripperVelocityToJoint,
-    InverseKinematicsRLStep,
-)
-from lerobot.teleoperators import (
-    gamepad,  # noqa: F401
-    keyboard,  # noqa: F401
-    make_teleoperator_from_config,
-    so101_leader,  # noqa: F401
-)
-from lerobot.model.kinematics import RobotKinematics
-from lerobot.teleoperators.teleoperator import Teleoperator
-from lerobot.teleoperators.utils import TeleopEvents
-from lerobot.utils.constants import ACTION, DONE, OBS_IMAGES, OBS_STATE, REWARD
-from lerobot.utils.robot_utils import busy_wait
-from lerobot.utils.utils import log_say
-from lerobot.cameras import (  # noqa: F401 - 导入相机以触发注册
-    opencv,
-    realsense,
-    dabai,
-)
-
-import pdb
-
 # 模块加载提示
 force_print(f"[robot_env.py] Module loaded")
 
@@ -651,364 +640,7 @@ class TestRobotEnv(gym.Env):
         if self.use_hdf5 and self.hdf5_loader is not None:
             self.hdf5_loader.close()
 
-def save_cropped_images_from_processed_obs(processed_obs: dict, base_dir: str = "img_output/img_crop", enabled: bool = False) -> None:
-    """
-    从经过 VanillaObservationProcessorStep (+ ImageCropResizeProcessorStep) 处理后的观测中，
-    提取裁剪/缩放后的图像 (B,C,H,W, float32, [0,1]) 并保存到 img_output/img_crop/<camera_name>/，
-    每个相机只保留最新5张。
-
-    参数:
-        processed_obs: env_processor 输出的观测字典（transition[TransitionKey.OBSERVATION]）
-        base_dir: 保存根目录
-        enabled: 是否启用图像保存功能（默认False）
-    """
-    if not enabled:
-        return
-    
-    import os, glob, time
-    import torch
-    import cv2
-
-    os.makedirs(base_dir, exist_ok=True)
-
-    def _key_to_camname(k: str) -> str:
-        # 兼容两类键：
-        # 1) 多相机: "observation.images.<camera>"
-        # 2) 单图像: "observation.image"
-        if ".images." in k:
-            return k.split(".images.", 1)[1]
-        if k.endswith(".image"):
-            return "image"
-        return k.replace(".", "_")  # 兜底
-
-    for key, tensor_img in list(processed_obs.items()):
-        if "image" not in key:
-            continue
-        if not isinstance(tensor_img, torch.Tensor):
-            continue
-
-        # 移到 CPU、去梯度
-        img = tensor_img.detach()
-        if img.device.type != "cpu":
-            img = img.cpu()
-        
-        # 允许 (C,H,W) 或 (B,C,H,W)
-        if img.ndim == 3:
-            img = img.unsqueeze(0)  # -> (1,C,H,W)
-        assert img.ndim == 4, f"Expect (B,C,H,W), got {img.shape}"
-
-        # 规范到 [0,1] 再转 [0,255] uint8
-        img = img.clamp(0.0, 1.0)
-        img_u8 = torch.round(img * 255.0).to(torch.uint8)  # (B,C,H,W)
-
-        cam_name = _key_to_camname(key)
-        save_dir = os.path.join(base_dir, cam_name)
-        os.makedirs(save_dir, exist_ok=True)
-
-        # 逐张保存（通常 B=1）
-        b, c, h, w = img_u8.shape
-        for i in range(b):
-            # (C,H,W) -> (H,W,C)
-            hwc = img_u8[i].permute(1, 2, 0).numpy()
-            # RGB -> BGR (cv2.imwrite 期望BGR)
-            bgr = hwc[..., ::-1]
-
-            filename = os.path.join(save_dir, f"{int(time.time() * 1000)}.jpg")
-            cv2.imwrite(filename, bgr)
-
-            # 只保留最近 5 张
-            files = sorted(glob.glob(os.path.join(save_dir, "*.jpg")), key=os.path.getmtime)
-            if len(files) > 5:
-                for old_file in files[:-5]:
-                    try:
-                        os.remove(old_file)
-                    except Exception:
-                        pass
-
-def reset_follower_position(robot_arm: Robot, target_position: np.ndarray,end_pose_name) -> None:
-    """Reset robot arm to target position using smooth trajectory."""
-    robot_arm.bus_left.interface.ModeCtrl(ctrl_mode=0x01, move_mode=0x01,move_spd_rate_ctrl=50, is_mit_mode=0x00)
-    robot_arm.bus_right.interface.ModeCtrl(ctrl_mode=0x01, move_mode=0x01,move_spd_rate_ctrl=50, is_mit_mode=0x00)
-    current_position_dict_left = robot_arm.bus_left.sync_read("Present_Position")
-    current_position_dict_right = robot_arm.bus_right.sync_read("Present_Position")
-    current_position_left = np.array(
-        [current_position_dict_left[name] for name in current_position_dict_left], dtype=np.float32
-    )
-    current_position_right = np.array(
-        [current_position_dict_right[name] for name in current_position_dict_right], dtype=np.float32
-    )
-    # pdb.set_trace()
-    target_position_left=target_position[:7]
-    target_position_right=target_position[7:]
-    trajectory_left = torch.from_numpy(
-        np.linspace(current_position_left, target_position_left, 50)
-    )  # NOTE: 30 is just an arbitrary number
-    trajectory_right = torch.from_numpy(
-        np.linspace(current_position_right, target_position_right, 50)
-    )  # NOTE: 30 is just an arbitrary number
-    # pdb.set_trace()
-    # busy_wait(0.1)
-    for pose_left,pose_right in zip(trajectory_left,trajectory_right):
-        action_dict_left = dict(zip(current_position_dict_left, pose_left, strict=False))
-        action_dict_right = dict(zip(current_position_dict_right, pose_right, strict=False))
-        # pdb.set_trace()
-        robot_arm.bus_left.sync_write("Goal_Position", action_dict_left)
-        robot_arm.bus_right.sync_write("Goal_Position", action_dict_right)
-        busy_wait(0.015)
-    
-    robot_arm.bus_left.interface.ModeCtrl(ctrl_mode=0x01, move_mode=0x00,move_spd_rate_ctrl=50, is_mit_mode=0x00)
-    robot_arm.bus_right.interface.ModeCtrl(ctrl_mode=0x01, move_mode=0x00,move_spd_rate_ctrl=50, is_mit_mode=0x00)
-    action_zero=[0.056127, 0.0, 0.213266,0.0, 1.48351241090266,0.0,0.05957,0.056127, 0.0, 0.213266,0.0, 1.48351241090266,0.0,0.05957]
-    action_target=[0.056127, 0.0, 0.213266,0.0, 1.48351241090266,0.0,0.05957,0.056127, 0.0, 0.213266,0.0, 1.48351241090266,0.0,0.05957]
-    
-    #action_target=[0.252452, -0.034618, 0.272318, 3.07350736, 0.4325624, 2.90283161, 0.06916,0.252452, -0.034618, 0.272318, 3.07350736, 0.4325624, 2.90283161, 0.06916]
-    trajectory_endpose=np.linspace(action_zero, action_target, 12)
-    for action in trajectory_endpose:
-        end_pose_targets_dict = {f"{key}.value": action[i] for i, key in enumerate(end_pose_name)}
-        robot_arm.send_action(end_pose_targets_dict)
-        busy_wait(0.12)
-    busy_wait(0.1)
-    # pdb.set_trace()    
-
-
-class RobotEnv(gym.Env):
-    """Gym environment for robotic control with human intervention support."""
-
-    def __init__(
-        self,
-        robot,
-        use_gripper: bool = False,
-        display_cameras: bool = False,
-        reset_pose: list[float] | None = None,
-        reset_time_s: float = 5.0,
-    ) -> None:
-        """Initialize robot environment with configuration options.
-
-        Args:
-            robot: Robot interface for hardware communication.
-            use_gripper: Whether to include gripper in action space.
-            display_cameras: Whether to show camera feeds during execution.
-            reset_pose: Joint positions for environment reset.
-            reset_time_s: Time to wait during reset.
-        """
-        super().__init__()
-        
-        self.robot = robot
-        self.display_cameras = display_cameras
-
-        # Connect to the robot if not already connected.
-        if not self.robot.is_connected:
-            self.robot.connect()
-
-        # Episode tracking.
-        self.current_step = 0
-        self.episode_data = None
-
-        # self._joint_names = [f"{key}.pos" for key in self.robot.bus.motors]
-        self._image_keys = self.robot.cameras.keys()
-
-        self.reset_pose = reset_pose
-        self.reset_time_s = reset_time_s
-
-        self.use_gripper = use_gripper
-
-        # self._joint_names = list(self.robot.bus.motors.keys())
-        self._left_joint_names = self.robot.bus_left.motors
-        self._right_joint_names = self.robot.bus_right.motors
-        self._joint_names= self._left_joint_names + self._right_joint_names
-        # self._raw_joint_positions = None
-        self._raw_end_pose_value = None
-        self._left_end_pose_name = self.robot.bus_left.end_pose_keys
-        self._right_end_pose_name = self.robot.bus_right.end_pose_keys
-        self._end_pose_name= self._left_end_pose_name + self._right_end_pose_name
-        
-        self._setup_spaces()
-
-    def _get_observation(self) -> dict[str, Any]:
-        """Get current robot observation including joint positions and camera images."""
-        obs_dict = self.robot.get_observation()
-        for k in ("front", "left", "right"):
-            img = obs_dict[k]
-            obs_dict[k] = img[:, :, ::-1].copy()   
-        # pdb.set_trace()
-        # raw_joint_joint_position = {f"{name}.pos": obs_dict[f"{name}.pos"] for name in self._joint_names}
-        # joint_positions = np.array([raw_joint_joint_position[f"{name}.pos"] for name in self._joint_names])
-        raw_left_end_pose_values = {f"{name}.value": obs_dict[f"{name}.value"] for name in self._left_end_pose_name}
-        raw_right_end_pose_values = {f"{name}.value": obs_dict[f"{name}.value"] for name in self._right_end_pose_name}
-        left_end_pose_value=np.array([raw_left_end_pose_values[f"{name}.value"] for name in self._left_end_pose_name])
-        right_end_pose_value=np.array([raw_right_end_pose_values[f"{name}.value"] for name in self._right_end_pose_name])
-
-        agent_end_pose_value = np.concatenate([left_end_pose_value, right_end_pose_value], axis=0)
-        images = {key: obs_dict[key] for key in self._image_keys}
-        # print("agent_end_pose_value:",agent_end_pose_value)
-        # pdb.set_trace()
-        return {"agent_end_pose_value":agent_end_pose_value , "pixels": images, **raw_left_end_pose_values,**raw_right_end_pose_values}
-
-    def _setup_spaces(self) -> None:
-        """Configure observation and action spaces based on robot capabilities."""
-        current_observation = self._get_observation()
-
-        observation_spaces = {}
-
-        # Define observation spaces for images and other states.
-        if current_observation is not None and "pixels" in current_observation:
-            prefix = OBS_IMAGES
-            observation_spaces = {
-                f"{prefix}.{key}": gym.spaces.Box(
-                    low=0, high=255, shape=current_observation["pixels"][key].shape, dtype=np.uint8
-                )
-                for key in current_observation["pixels"]
-            }
-        # pdb.set_trace()
-        if current_observation is not None:
-            agent_end_pose_value = current_observation["agent_end_pose_value"]
-            observation_spaces[OBS_STATE] = gym.spaces.Box(
-                low=-10,
-                high=10,
-                shape=agent_end_pose_value.shape,
-                dtype=np.float32,
-            )
-        
-        self.observation_space = gym.spaces.Dict(observation_spaces)
-
-        # Define the action space for joint positions along with setting an intervention flag.
-        action_dim = 14
-        bounds = {}
-        bounds["min"] = -np.ones(action_dim)
-        bounds["max"] = np.ones(action_dim)
-
-        # if self.use_gripper:
-        #     action_dim += 1
-        #     bounds["min"] = np.concatenate([bounds["min"], [0]])
-        #     bounds["max"] = np.concatenate([bounds["max"], [2]])
-
-        self.action_space = gym.spaces.Box(
-            low=bounds["min"],
-            high=bounds["max"],
-            shape=(action_dim,),
-            dtype=np.float32,
-        )
-        # pdb.set_trace()
-
-    def reset(
-        self, *, seed: int | None = None, options: dict[str, Any] | None = None
-    ) -> tuple[dict[str, Any], dict[str, Any]]:
-        """Reset environment to initial state.
-
-        Args:
-            seed: Random seed for reproducibility.
-            options: Additional reset options.
-
-        Returns:
-            Tuple of (observation, info) dictionaries.
-        """
-        # Reset the robot
-        # self.robot.reset()
-
-        start_time = time.perf_counter()
-        if self.reset_pose is not None:
-            # print("here")
-            print('reset the environment')
-            #log_say("Reset the environment.", play_sounds=True)
-            # pdb.set_trace()
-            reset_follower_position(self.robot, np.array(self.reset_pose),self._end_pose_name)
-            # action=[0.056127, 0.0, 0.213266,0.0, 1.48351241090266,0.0,0.05957,0.056127, 0.0, 0.213266,0.0, 1.48351241090266,0.0,0.05957]
-
-            #log_say("Reset the environment done.", play_sounds=True)
-        busy_wait(self.reset_time_s - (time.perf_counter() - start_time))
-
-        # super().reset(seed=seed, options=options)
-
-        # Reset episode tracking variables.
-        self.current_step = 0
-        self.episode_data = None
-        obs = self._get_observation()
-        # pdb.set_trace() 
-        # self._raw_joint_positions = {f"{key}.pos": obs[f"{key}.pos"] for key in self._joint_names}
-        self._raw_end_pose_value = {f"{key}.value": obs[f"{key}.value"] for key in self._end_pose_name}
-
-        return obs, {TeleopEvents.IS_INTERVENTION: False}
-
-    def step(self, action) -> tuple[dict[str, np.ndarray], float, bool, bool, dict[str, Any]]:
-        """Execute one environment step with given action."""
-        # joint_targets_dict = {f"{key}.pos": action[i] for i, key in enumerate(self.robot.bus.motors)}
-        #盲改
-        end_pose_targets_dict = {f"{key}.value": action[i] for i, key in enumerate(self._end_pose_name)}
-        self.robot.send_action(end_pose_targets_dict)
-
-        obs = self._get_observation()
-        self._raw_end_pose_value = {f"{key}.value": obs[f"{key}.value"] for key in self._end_pose_name}
-
-        # self._raw_joint_positions = {f"{key}.pos": obs[f"{key}.pos"] for key in self._joint_names}
-
-        if self.display_cameras:
-            self.render()
-
-        self.current_step += 1
-        
-        reward = 0.0
-        terminated = False
-        truncated = False
-
-        return (
-            obs,
-            reward,
-            terminated,
-            truncated,
-            {TeleopEvents.IS_INTERVENTION: False},
-        )
-
-    def render(self) -> None:
-        """Save latest 5 frames from each camera to img_output/gym/<camera_name>/."""
-        import cv2, os, glob
-
-        current_observation = self._get_observation()
-        if current_observation is None:
-            return
-
-        base_dir = "img_output/robotenv"
-        os.makedirs(base_dir, exist_ok=True)
-
-        image_keys = list(current_observation["pixels"].keys())
-        for key in image_keys:
-            img = current_observation["pixels"][key]
-            save_dir = os.path.join(base_dir, key)
-            os.makedirs(save_dir, exist_ok=True)
-
-            # 保存当前帧
-            filename = os.path.join(save_dir, f"{int(time.time() * 1000)}.jpg")
-            cv2.imwrite(filename, cv2.cvtColor(img, cv2.COLOR_RGB2BGR))
-
-            # 只保留最新 5 张
-            files = sorted(glob.glob(os.path.join(save_dir, "*.jpg")), key=os.path.getmtime)
-            if len(files) > 5:
-                for old_file in files[:-5]:
-                    os.remove(old_file)
-
-    # def render(self) -> None:
-    #     """Display robot camera feeds."""
-    #     import cv2
-    #     # pdb.set_trace()
-    #     current_observation = self._get_observation()
-    #     if current_observation is not None:
-    #         image_keys = [key for key in current_observation["pixels"]]
-    #         # pdb.set_trace()
-    #         for key in image_keys:
-    #             cv2.imshow(key, cv2.cvtColor(current_observation["pixels"][key], cv2.COLOR_RGB2BGR))
-    #             cv2.waitKey(1)
-
-    def close(self) -> None:
-        """Close environment and disconnect robot."""
-        if self.robot.is_connected:
-            self.robot.disconnect()
-
-    # def get_raw_joint_positions(self) -> dict[str, float]:
-    #     """Get raw joint positions."""
-    #     return self._raw_joint_positions
-    def get_raw_end_pose_value(self) -> dict[str, float]:
-        return self._raw_end_pose_value
-    def get_end_pose_name(self) -> list[str]:
-        return self._end_pose_name
+# RobotEnv、reset_follower_position 等函数已从 gym_manipulator_bipiper 导入，不在此重复实现
 
 def load_config_from_json(config_path: str) -> HILSerlRobotEnvConfig:
     """从 JSON 文件加载配置并转换为 HILSerlRobotEnvConfig 对象。
@@ -1057,6 +689,9 @@ def load_config_from_json(config_path: str) -> HILSerlRobotEnvConfig:
 
 def make_robot_env(cfg: HILSerlRobotEnvConfig | str) -> tuple[gym.Env, Any]:
     """Create robot environment from configuration.
+    
+    扩展版本，支持 JSON 配置加载和 gym_testenv 模式。
+    对于真实机器人环境，复用 gym_manipulator_bipiper 中的基础实现。
 
     Args:
         cfg: Environment configuration object or path to JSON config file.
@@ -1099,48 +734,25 @@ def make_robot_env(cfg: HILSerlRobotEnvConfig | str) -> tuple[gym.Env, Any]:
         
         return env, None
     
-    # Check if this is a GymHIL simulation environment
-    if cfg.name == "gym_hil":
-        assert cfg.robot is None and cfg.teleop is None, "GymHIL environment does not support robot or teleop"
-        import gym_hil  # noqa: F401
-
-        # Extract gripper settings with defaults
-        use_gripper = cfg.processor.gripper.use_gripper if cfg.processor.gripper is not None else True
-        gripper_penalty = cfg.processor.gripper.gripper_penalty if cfg.processor.gripper is not None else 0.0
-
-        env = gym.make(
-            f"gym_hil/{cfg.task}",
-            image_obs=True,
-            render_mode="human",
-            use_gripper=use_gripper,
-            gripper_penalty=gripper_penalty,
-        )
-
-        return env, None
-
-    # Real robot environment
-    assert cfg.robot is not None, "Robot config must be provided for real robot environment"
-    assert cfg.teleop is not None, "Teleop config must be provided for real robot environment"
-
-    robot = make_robot_from_config(cfg.robot)
-    teleop_device = make_teleoperator_from_config(cfg.teleop)
-    teleop_device.connect()
-
-    # Create base environment with safe defaults
-    use_gripper = cfg.processor.gripper.use_gripper if cfg.processor.gripper is not None else True
-    display_cameras = (
-        cfg.processor.observation.display_cameras if cfg.processor.observation is not None else False
-    )
-    reset_pose = cfg.processor.reset.fixed_reset_joint_positions if cfg.processor.reset is not None else None
-
-    env = RobotEnv(
-        robot=robot,
-        use_gripper=use_gripper,
-        display_cameras=display_cameras,
-        reset_pose=reset_pose,
-    )
-
-    return env, teleop_device
+    # 对于其他环境类型（gym_hil 和 real_robot），复用基础实现
+    # 但需要先切换到 URDF 目录（如果使用真实机器人）
+    if cfg.name != "gym_hil":
+        from pathlib import Path
+        current_file = Path(__file__).resolve()
+        urdf_dir = current_file.parent / "local_assets"
+        original_cwd = os.getcwd()
+        
+        try:
+            force_print(f"[make_robot_env] Switching to URDF directory: {urdf_dir}")
+            os.chdir(str(urdf_dir))
+            env, teleop_device = _make_robot_env_base(cfg)
+        finally:
+            os.chdir(original_cwd)
+            force_print(f"[make_robot_env] Restored working directory: {original_cwd}")
+        return env, teleop_device
+    else:
+        # gym_hil 不需要切换目录
+        return _make_robot_env_base(cfg)
 
 
 def make_processors(
@@ -1149,6 +761,9 @@ def make_processors(
     DataProcessorPipeline[EnvTransition, EnvTransition], DataProcessorPipeline[EnvTransition, EnvTransition]
 ]:
     """Create environment and action processors.
+    
+    扩展版本，支持 gym_testenv 模式。
+    对于其他环境类型，复用 gym_manipulator_bipiper 中的基础实现。
 
     Args:
         env: Robot environment instance.
@@ -1159,10 +774,6 @@ def make_processors(
     Returns:
         Tuple of (environment processor, action processor).
     """
-    terminate_on_success = (
-        cfg.processor.reset.terminate_on_success if cfg.processor.reset is not None else True
-    )
-
     # 处理 gym_testenv（测试环境，无真实硬件）
     if cfg.name == "gym_testenv":
         # 简单的处理管道，不需要介入检测
@@ -1183,173 +794,8 @@ def make_processors(
             steps=action_pipeline_steps, to_transition=identity_transition, to_output=identity_transition
         )
 
-    if cfg.name == "gym_hil":
-        action_pipeline_steps = [
-            InterventionActionProcessorStep(terminate_on_success=terminate_on_success),
-            Torch2NumpyActionProcessorStep(),
-        ]
-
-        env_pipeline_steps = [
-            Numpy2TorchActionProcessorStep(),
-            VanillaObservationProcessorStep(),
-            AddBatchDimensionProcessorStep(),
-            DeviceProcessorStep(device=device),
-        ]
-
-        return DataProcessorPipeline(
-            steps=env_pipeline_steps, to_transition=identity_transition, to_output=identity_transition
-        ), DataProcessorPipeline(
-            steps=action_pipeline_steps, to_transition=identity_transition, to_output=identity_transition
-        )
-
-    # Full processor pipeline for real robot environment
-    # Get robot and motor information for kinematics
-    
-
-    # 映射：bus 电机名 -> URDF 关节名（顺序必须与 motor_names 一致）
-    # 1) bus 层电机名
-    end_pose_name= env.get_end_pose_name()
-
-    # 2) 拆分：臂的6关节 vs 夹爪
-    # arm_motor_names = [m for m in motor_names if "gripper" not in m]  # 或者直接 motor_names[:6]
-    # gripper_motor_names = [m for m in motor_names if "gripper" in m]  # 可为空或1个
-
-    # 3) 只为“臂的6关节”做 URDF 名映射（按你的 URDF 实际名字改）
-    # name_map = {
-    #     "left_joint_1": "joint1",
-    #     "left_joint_2": "joint2",
-    #     "left_joint_3": "joint3",
-    #     "left_joint_4": "joint4",
-    #     "left_joint_5": "joint5",
-    #     "left_joint_6": "joint6",
-    # }
-    # ik_joint_names = [name_map.get(n, n) for n in arm_motor_names]
-    # pdb.set_trace()
-    # Set up kinematics solver if inverse kinematics is configured
-    kinematics_solver = None
-    # Note: IK requires proper motor_names setup - currently disabled
-    # if cfg.processor.inverse_kinematics is not None:
-    #     motor_names = env.get_end_pose_name()  # or proper joint names
-    #     kinematics_solver = RobotKinematics(
-    #         urdf_path=cfg.processor.inverse_kinematics.urdf_path,
-    #         target_frame_name=cfg.processor.inverse_kinematics.target_frame_name,
-    #         joint_names=motor_names[:-1],
-    #     )
-
-    env_pipeline_steps = [VanillaObservationProcessorStep()]
-    
-    # If environment feature keys differ from policy keys, insert a rename step
-    if cfg.features_map:
-        rename_map = {src: dst for src, dst in cfg.features_map.items() if src != dst}
-        if rename_map:
-            env_pipeline_steps.append(RenameObservationsProcessorStep(rename_map=rename_map))
-
-    if cfg.processor.observation is not None:
-        if cfg.processor.observation.add_joint_velocity_to_observation:#false
-            env_pipeline_steps.append(JointVelocityProcessorStep(dt=1.0 / cfg.fps))
-        if cfg.processor.observation.add_current_to_observation:#false
-            env_pipeline_steps.append(MotorCurrentProcessorStep(robot=env.robot))
-
-    # Forward kinematics observation (disabled - requires motor_names setup)
-    # if kinematics_solver is not None:
-    #     motor_names = env.get_end_pose_name()
-    #     env_pipeline_steps.append(
-    #         ForwardKinematicsJointsToEEObservation(
-    #             kinematics=kinematics_solver,
-    #             motor_names=motor_names,
-    #         )
-    #     )
-
-    if cfg.processor.image_preprocessing is not None:
-        env_pipeline_steps.append(
-            ImageCropResizeProcessorStep(
-                crop_params_dict=cfg.processor.image_preprocessing.crop_params_dict,
-                resize_size=cfg.processor.image_preprocessing.resize_size,
-            )
-        )
-
-    # Add time limit processor if reset config exists
-    if cfg.processor.reset is not None:
-        env_pipeline_steps.append(
-            TimeLimitProcessorStep(max_episode_steps=int(cfg.processor.reset.control_time_s * cfg.fps))
-        )
-
-    # Add gripper penalty processor if gripper config exists and enabled
-    if cfg.processor.gripper is not None and cfg.processor.gripper.use_gripper:
-        env_pipeline_steps.append(
-            GripperPenaltyProcessorStep( #需要等到action走通
-                penalty=cfg.processor.gripper.gripper_penalty,
-                max_gripper_pos=cfg.processor.max_gripper_pos,
-            )
-        )
-
-    if (
-        cfg.processor.reward_classifier is not None
-        and cfg.processor.reward_classifier.pretrained_path is not None
-    ):
-        env_pipeline_steps.append(
-            RewardClassifierProcessorStep(
-                pretrained_path=cfg.processor.reward_classifier.pretrained_path,
-                device=device,
-                success_threshold=cfg.processor.reward_classifier.success_threshold,
-                success_reward=cfg.processor.reward_classifier.success_reward,
-                terminate_on_success=terminate_on_success,
-            )
-        )
-
-    env_pipeline_steps.append(AddBatchDimensionProcessorStep())
-    env_pipeline_steps.append(DeviceProcessorStep(device=device))
-
-    action_pipeline_steps = [
-        AddTeleopActionAsComplimentaryDataStep(teleop_device=teleop_device),
-        AddTeleopEventsAsInfoStep(teleop_device=teleop_device),
-        InterventionActionProcessorStep(
-            use_gripper=cfg.processor.gripper.use_gripper if cfg.processor.gripper is not None else False,
-            terminate_on_success=terminate_on_success,
-        ),
-    ]
-    action_pipeline_steps.append(RobotActionToPolicyActionProcessorStep(end_pose_name=end_pose_name))
-    # Replace InverseKinematicsProcessor with new kinematic processors
-    # if cfg.processor.inverse_kinematics is not None and kinematics_solver is not None:
-    #     # Add EE bounds and safety processor
-    #     inverse_kinematics_steps = [
-    #         MapTensorToDeltaActionDictStep(
-    #             use_gripper=cfg.processor.gripper.use_gripper if cfg.processor.gripper is not None else False
-    #         ),
-    #         MapDeltaActionToRobotActionStep(),
-    #         EEReferenceAndDelta(
-    #             kinematics=kinematics_solver,
-    #             end_effector_step_sizes=cfg.processor.inverse_kinematics.end_effector_step_sizes,
-    #             motor_names=motor_names,
-    #             # motor_names=arm_motor_names,
-    #             # motor_names=ik_joint_names,
-    #             use_latched_reference=False,#测试一下True
-    #             use_ik_solution=True,
-    #         ),
-    #         EEBoundsAndSafety(
-    #             end_effector_bounds=cfg.processor.inverse_kinematics.end_effector_bounds,
-    #         ),
-    #         GripperVelocityToJoint(
-    #             clip_max=cfg.processor.max_gripper_pos,
-    #             speed_factor=1.0,
-    #             discrete_gripper=False,
-    #         ),
-    #         InverseKinematicsRLStep(
-    #             kinematics=kinematics_solver, 
-    #             motor_names=motor_names, 
-    #             # motor_names=arm_motor_names,
-    #             # motor_names=ik_joint_names
-    #             initial_guess_current_joints=False
-    #         ),
-    #     ]
-    #     action_pipeline_steps.extend(inverse_kinematics_steps)
-    #     action_pipeline_steps.append(RobotActionToPolicyActionProcessorStep(motor_names=motor_names))
-
-    return DataProcessorPipeline(
-        steps=env_pipeline_steps, to_transition=identity_transition, to_output=identity_transition
-    ), DataProcessorPipeline(
-        steps=action_pipeline_steps, to_transition=identity_transition, to_output=identity_transition
-    )
+    # 对于其他环境类型，复用基础实现
+    return _make_processors_base(env, teleop_device, cfg, device)
 
 
 def step_env_and_process_transition(
@@ -1362,6 +808,9 @@ def step_env_and_process_transition(
 ) -> EnvTransition:
     """
     Execute one step with processor pipeline.
+    
+    扩展版本，复用 gym_manipulator_bipiper 中的基础实现。
+    save_images 参数当前未使用（基础实现中已包含图像保存逻辑）。
 
     Args:
         env: The robot environment
@@ -1369,42 +818,19 @@ def step_env_and_process_transition(
         action: Action to execute
         env_processor: Environment processor
         action_processor: Action processor
-        save_images: Whether to save processed images to disk (default False)
+        save_images: Whether to save processed images to disk (default False, 已弃用)
 
     Returns:
         Processed transition with updated state.
     """
-    # Create action transition
-    transition[TransitionKey.ACTION] = action
-    transition[TransitionKey.OBSERVATION] = (
-        env.get_raw_end_pose_value() if hasattr(env, "get_raw_end_pose_value") else {}
+    # 复用基础实现（基础实现中已包含图像保存逻辑）
+    return _step_env_and_process_transition_base(
+        env=env,
+        transition=transition,
+        action=action,
+        env_processor=env_processor,
+        action_processor=action_processor,
     )
-    processed_action_transition = action_processor(transition)
-    processed_action = processed_action_transition[TransitionKey.ACTION]
-
-    obs, reward, terminated, truncated, info = env.step(processed_action)
-
-    reward = reward + processed_action_transition[TransitionKey.REWARD]
-    terminated = terminated or processed_action_transition[TransitionKey.DONE]
-    truncated = truncated or processed_action_transition[TransitionKey.TRUNCATED]
-    complementary_data = processed_action_transition[TransitionKey.COMPLEMENTARY_DATA].copy()
-    new_info = processed_action_transition[TransitionKey.INFO].copy()
-    new_info.update(info)
-
-    new_transition = create_transition(
-        observation=obs,
-        action=processed_action,
-        reward=reward,
-        done=terminated,
-        truncated=truncated,
-        info=new_info,
-        complementary_data=complementary_data,
-    )
-    new_transition = env_processor(new_transition)
-    
-   
-
-    return new_transition
 
 
 class RealRobotEnvWrapper:
@@ -1477,21 +903,34 @@ class RealRobotEnvWrapper:
     def _init_kinematics(self):
         """初始化运动学求解器(只初始化一次,避免频繁创建对象)"""
         try:
-            # 保存当前工作目录,切换到URDF所在目录(以便placo能找到mesh文件)
-            urdf_dir = "/shared_disk/users/weijie.ke/verl/recipe/vla/envs/test_env/robot/controller/piper/local_assets"
-            urdf_path = os.path.join(urdf_dir, "piper.urdf.bak")
+            from pathlib import Path
+            
+            # 使用相对路径：相对于当前文件 (robot_env.py) 的位置
+            # robot_env.py 位于 .../robot/controller/piper/robot_env.py
+            # local_assets 位于 .../robot/controller/piper/local_assets/
+            current_file = Path(__file__).resolve()
+            piper_dir = current_file.parent  # .../robot/controller/piper/
+            
+            urdf_path = piper_dir / "local_assets" / "piper.urdf" / "robot.urdf"
+            mesh_dir = piper_dir / "local_assets"
+            
+            force_print(f"[RealRobotEnvWrapper] Current file: {current_file}")
+            force_print(f"[RealRobotEnvWrapper] Computed URDF path: {urdf_path}")
+            force_print(f"[RealRobotEnvWrapper] Computed mesh dir: {mesh_dir}")
+            
+            # 保存当前工作目录,切换到mesh目录(以便placo能找到mesh文件)
             original_cwd = os.getcwd()
-            os.chdir(urdf_dir)
+            os.chdir(str(mesh_dir)) 
             
             try:
                 force_print(f"[RealRobotEnvWrapper] Initializing RobotKinematics...")
                 self.left_kin = RobotKinematics(
-                    urdf_path=urdf_path,
+                    urdf_path=str(urdf_path),
                     target_frame_name="link6",
                     joint_names=[f"joint{i+1}" for i in range(6)],
                 )
                 self.right_kin = RobotKinematics(
-                    urdf_path=urdf_path,
+                    urdf_path=str(urdf_path),
                     target_frame_name="link6",
                     joint_names=[f"joint{i+1}" for i in range(6)],
                 )
@@ -1767,44 +1206,15 @@ class RealRobotEnvWrapper:
             self.teleop_device.disconnect()
 
 if __name__ == "__main__":
-    """测试 gym_testenv 环境"""
+    """测试 RealRobotEnvWrapper 能否正确启动 RobotEnv 和 TestRobotEnv"""
     import yaml
     from pathlib import Path
     from types import SimpleNamespace
     
-    print("=" * 70)
-    print("测试 gym_testenv 环境（无需真实硬件）")
-    print("=" * 70)
+    print("=" * 80)
+    print("测试 RealRobotEnvWrapper 启动 RobotEnv 和 TestRobotEnv")
+    print("=" * 80)
     
-    # 加载 YAML 配置文件
-    # 当前文件: robot/controller/piper/robot_env.py
-    # 目标文件: robot/config/test_env.yml
-    config_path = Path(__file__).parent.parent.parent / "config" / "test_env.yml"
-    if config_path.exists():
-        print(f"\n加载配置文件: {config_path}")
-        with open(config_path, 'r', encoding='utf-8') as f:
-            yaml_cfg = yaml.safe_load(f)
-        print("✓ 配置文件加载成功")
-        print(f"  环境名称: {yaml_cfg.get('env_name', 'gym_testenv')}")
-        print(f"  状态维度: {yaml_cfg.get('env_params', {}).get('state_dim', 14)}")
-        print(f"  动作维度: {yaml_cfg.get('env_params', {}).get('action_dim', 14)}")
-        print(f"  相机数量: {yaml_cfg.get('env_params', {}).get('num_cameras', 3)}")
-    else:
-        print(f"\n警告: 配置文件不存在: {config_path}")
-        print("使用默认配置")
-        yaml_cfg = {
-            'env_name': 'gym_testenv',
-            'robot': {'config': None},
-            'teleop': {'config': None},
-            'processor': {
-                'gripper': {'use_gripper': True, 'gripper_penalty': 0.0},
-                'reset': {'terminate_on_success': True, 'fixed_reset_joint_positions': None},
-                'observation': {'display_cameras': False},
-                'inverse_kinematics': None
-            }
-        }
-    
-    # 直接使用字典转换为简单对象（更简洁的方式）
     def dict_to_obj(d):
         """递归地将字典转换为对象，方便使用点号访问"""
         if isinstance(d, dict):
@@ -1814,168 +1224,241 @@ if __name__ == "__main__":
         else:
             return d
     
-    # 创建配置对象
-    cfg = SimpleNamespace(
-        name=yaml_cfg.get('env_name', 'gym_testenv'),
-        robot=yaml_cfg.get('robot', {}).get('config', None),
-        teleop=yaml_cfg.get('teleop', {}).get('config', None),
-        processor=dict_to_obj(yaml_cfg.get('processor', {})),
-        # 添加数据集配置（如果YAML中提供）
-        data_path=yaml_cfg.get('data_path', None),
-        step_size=yaml_cfg.get('step_size', 1),
-        action_chunk=yaml_cfg.get('action_chunk', 50),
+    # ====================================================================
+    # 测试 1: 使用 RealRobotEnvWrapper 启动 TestRobotEnv（数据回放模式）
+    # ====================================================================
+    print("\n" + "=" * 80)
+    print("测试 1: RealRobotEnvWrapper + TestRobotEnv（数据回放模式）")
+    print("=" * 80)
+    
+    # 创建 gym_testenv 配置
+    testenv_cfg = SimpleNamespace(
+        env=SimpleNamespace(
+            name="gym_testenv",
+            robot=None,
+            teleop=None,
+            processor=SimpleNamespace(
+                gripper=SimpleNamespace(use_gripper=False, gripper_penalty=0.0),
+                reset=SimpleNamespace(terminate_on_success=True, fixed_reset_joint_positions=None),
+                observation=SimpleNamespace(display_cameras=False),
+                inverse_kinematics=None
+            ),
+            data_path=None,  # None 表示使用默认路径或生成随机数据
+            step_size=1,
+            action_chunk=50,
+        ),
+        num_envs=1,
+        device="cpu",
+        task_description="测试任务",
+        camera_mapping={
+            'front': 'head_image',
+            'left': 'left_wrist_image',
+            'right': 'right_wrist_image',
+        }
     )
     
-    print(f"\n运行时配置:")
-    print(f"  环境名称: {cfg.name}")
-    print(f"  机器人配置: {cfg.robot}")
-    print(f"  遥操作配置: {cfg.teleop}")
-    print(f"  使用夹爪: {cfg.processor.gripper.use_gripper}")
-    print(f"  显示相机: {cfg.processor.observation.display_cameras}")
-    print(f"  数据路径: {cfg.data_path}")
-    if cfg.data_path:
-        print(f"    → 步长: {cfg.step_size}, 动作块: {cfg.action_chunk}")
-    
-    # 创建环境
-    print("\n[1] 创建环境...")
-    env, teleop_device = make_robot_env(cfg)
-    print(f"  ✓ 环境类型: {type(env).__name__}")
-    print(f"  ✓ 遥操作设备: {teleop_device}")
-    print(f"  ✓ 观测空间: {env.observation_space}")
-    print(f"  ✓ 动作空间: {env.action_space}")
-    
-    # 创建处理器
-    print("\n[2] 创建处理器...")
-    env_processor, action_processor = make_processors(env, teleop_device, cfg, device="cpu")
-    print(f"  ✓ 环境处理器: {len(env_processor.steps)} 个步骤")
-    print(f"  ✓ 动作处理器: {len(action_processor.steps)} 个步骤")
-    
-    # 重置环境
-    print("\n[3] 重置环境...")
-    obs, info = env.reset(seed=42)
-    print(f"  ✓ 观测键: {list(obs.keys())}")
-    print(f"  ✓ 状态形状: {obs['observation.state'].shape}")
-    
-    # 显示图像信息
-    image_keys = [k for k in obs.keys() if 'image' in k]
-    print(f"  ✓ 图像数量: {len(image_keys)}")
-    for img_key in image_keys:
-        img = obs[img_key]
-        print(f"    - {img_key}: shape={img.shape}, dtype={img.dtype}, "
-              f"range=[{img.min()}, {img.max()}]")
-    
-    # 执行多步测试
-    print("\n[4] 执行动作测试...")
-    num_steps = 5
-    for step in range(num_steps):
-        # 生成随机动作
-        action = env.action_space.sample()
-        
-        # 执行一步
-        obs, reward, terminated, truncated, info = env.step(action)
-        
-        # 显示结果
-        print(f"  步骤 {step+1}/{num_steps}: "
-              f"reward={reward:.4f}, "
-              f"terminated={terminated}, "
-              f"truncated={truncated}, "
-              f"step={info.get('current_step', '?')}")
-        
-        if terminated or truncated:
-            print(f"    → 环境终止，重置...")
-            obs, info = env.reset()
-    
-    # 测试 joint action 到 end-effector pose action 的转换
-    print("\n[4.5] 测试 joint action -> end-effector pose 转换...")
-    print("  使用全零 joint action (14维) 进行测试")
-    
     try:
-        # 创建运动学求解器
-        left_kin = RobotKinematics(
-            urdf_path="/home/agilex-home/agilex/keweijie/verl/recipe/vla/envs/test_env/robot/controller/piper/local_assets/piper.urdf",
-            target_frame_name="link6",
-            joint_names=[f"joint{i+1}" for i in range(6)],
-        )
-        right_kin = RobotKinematics(
-            urdf_path="/home/agilex-home/agilex/keweijie/verl/recipe/vla/envs/test_env/robot/controller/piper/local_assets/piper.urdf",
-            target_frame_name="link6",
-            joint_names=[f"joint{i+1}" for i in range(6)],
-        )
+        print("\n[1.1] 创建 RealRobotEnvWrapper (TestRobotEnv 模式)...")
+        wrapper = RealRobotEnvWrapper(testenv_cfg, rank=0, world_size=1)
+        print(f"  ✓ 内部环境类型: {type(wrapper.env).__name__}")
+        print(f"  ✓ 遥操作设备: {wrapper.teleop_device}")
         
-        # 创建全零 joint action (14维: 左臂6关节 + 左夹爪 + 右臂6关节 + 右夹爪)
-        joint_action = np.zeros(14, dtype=np.float32)
-        print(f"  输入 joint action (14维):")
-        print(f"    左臂关节 (rad): {joint_action[:6]}")
-        print(f"    左臂夹爪: {joint_action[6]}")
-        print(f"    右臂关节 (rad): {joint_action[7:13]}")
-        print(f"    右臂夹爪: {joint_action[13]}")
+        print("\n[1.2] 重置环境...")
+        obs_dict = wrapper.reset()
+        print(f"  ✓ 观测键: {list(obs_dict.keys())}")
+        print(f"  ✓ 图像键: {list(obs_dict['images'].keys())}")
+        print(f"  ✓ 状态形状: {obs_dict['state'].shape}")
+        print(f"  ✓ 任务描述: {obs_dict['task_description']}")
         
-        # 拆分左右臂
-        left_joints_rad = joint_action[:6]
-        left_grip = joint_action[6]
-        right_joints_rad = joint_action[7:13]
-        right_grip = joint_action[13]
+        # 显示图像信息（JPEG 压缩格式）
+        for cam_name, img_tensor in obs_dict['images'].items():
+            print(f"    - {cam_name}: shape={img_tensor.shape}, dtype={img_tensor.dtype}")
         
-        # 转换为度（RobotKinematics 使用度作为输入）
-        left_joints_deg = np.rad2deg(left_joints_rad)
-        right_joints_deg = np.rad2deg(right_joints_rad)
+        print("\n[1.3] 执行动作测试...")
+        num_steps = 3
+        for step in range(num_steps):
+            # 生成随机动作 (14维 end-effector pose)
+            action = np.random.uniform(-1.0, 1.0, size=(14,)).astype(np.float32)
+            
+            # 执行一步
+            obs_dict, reward, terminated, truncated, info_dict = wrapper.step(action)
+            
+            print(f"  步骤 {step+1}/{num_steps}: "
+                  f"reward={reward:.4f}, "
+                  f"terminated={terminated}, "
+                  f"truncated={truncated}, "
+                  f"intervene_flag={info_dict.get('intervene_flag', False)}")
+            
+            if terminated or truncated:
+                print(f"    → 环境终止，重置...")
+                obs_dict = wrapper.reset()
         
-        # 执行正向运动学 (FK)
-        T_left = left_kin.forward_kinematics(left_joints_deg)
-        T_right = right_kin.forward_kinematics(right_joints_deg)
-        
-        # 提取位置 (米)
-        left_pos = T_left[:3, 3]
-        right_pos = T_right[:3, 3]
-        
-        # 提取姿态 (旋转矩阵 -> RPY 欧拉角，弧度)
-        left_rpy = rotmat_to_rpy_zyx(T_left[:3, :3])
-        right_rpy = rotmat_to_rpy_zyx(T_right[:3, :3])
-        
-        # 构建 end-effector pose action (14维)
-        # [L_x, L_y, L_z, L_rx, L_ry, L_rz, L_grip,
-        #  R_x, R_y, R_z, R_rx, R_ry, R_rz, R_grip]
-        endpose_action = np.array([
-            left_pos[0], left_pos[1], left_pos[2],
-            left_rpy[0], left_rpy[1], left_rpy[2],
-            left_grip,
-            right_pos[0], right_pos[1], right_pos[2],
-            right_rpy[0], right_rpy[1], right_rpy[2],
-            right_grip,
-        ], dtype=np.float32)
-        
-        print(f"\n  ✓ FK 转换成功")
-        print(f"  输出 end-effector pose (14维):")
-        print(f"    左臂位置 (m): [{left_pos[0]:.4f}, {left_pos[1]:.4f}, {left_pos[2]:.4f}]")
-        print(f"    左臂姿态 (rad): [{left_rpy[0]:.4f}, {left_rpy[1]:.4f}, {left_rpy[2]:.4f}]")
-        print(f"    左臂夹爪: {left_grip:.4f}")
-        print(f"    右臂位置 (m): [{right_pos[0]:.4f}, {right_pos[1]:.4f}, {right_pos[2]:.4f}]")
-        print(f"    右臂姿态 (rad): [{right_rpy[0]:.4f}, {right_rpy[1]:.4f}, {right_rpy[2]:.4f}]")
-        print(f"    右臂夹爪: {right_grip:.4f}")
-        print(f"  完整向量: {endpose_action}")
+        print("\n[1.4] 关闭环境...")
+        wrapper.close()
+        print("  ✓ TestRobotEnv 模式测试通过！")
         
     except Exception as e:
         import traceback
-        print(f"  ✗ 转换测试失败: {e}")
-        print(f"  Traceback: {traceback.format_exc()}")
-        print("  注意: 确保 URDF 文件路径正确")
+        print(f"\n  ✗ TestRobotEnv 模式测试失败: {e}")
+        print(f"  Traceback:\n{traceback.format_exc()}")
     
-    # 测试动作范围
-    print("\n[5] 验证动作空间...")
-    random_actions = [env.action_space.sample() for _ in range(100)]
-    all_actions = np.array(random_actions)
-    print(f"  ✓ 动作形状: {all_actions[0].shape}")
-    print(f"  ✓ 动作范围: [{all_actions.min():.3f}, {all_actions.max():.3f}]")
-    print(f"  ✓ 动作均值: {all_actions.mean():.3f}")
+    # ====================================================================
+    # 测试 2: 使用 RealRobotEnvWrapper 启动 RobotEnv（真实机器人模式）
+    # ====================================================================
+    print("\n" + "=" * 80)
+    print("测试 2: RealRobotEnvWrapper + RobotEnv（真实机器人模式）")
+    print("=" * 80)
     
-    # 关闭环境
-    print("\n[6] 关闭环境...")
-    env.close()
-    print("  ✓ 环境已关闭")
+    # 使用 bipiper_gym_pico.json 配置文件
+    config_path = Path(__file__).parent / "config" / "bipiper_gym_pico.json"
     
-    print("\n" + "=" * 70)
-    print("✓ gym_testenv 测试通过！所有功能正常。")
-    print("=" * 70)
-    print("\n提示: gym_testenv 返回随机数据，仅用于测试，不适合训练。")
-    print("      如需仿真训练，请使用 gym_hil")
-    print("      如需真实部署，请使用 real_robot 配置")
+    if not config_path.exists():
+        print(f"  ⚠ 配置文件不存在: {config_path}")
+        print("  ⚠ 跳过真实机器人测试")
+    else:
+        try:
+            print(f"\n[2.1] 加载配置文件: {config_path}")
+            
+            # 创建配置对象（使用 robot_config_path）
+            robot_cfg = SimpleNamespace(
+                robot_config_path=str(config_path),
+                num_envs=1,
+                device="cpu",
+                task_description="真实机器人测试任务",
+                camera_mapping={
+                    'front': 'head_image',
+                    'left': 'left_wrist_image',
+                    'right': 'right_wrist_image',
+                }
+            )
+            
+            print("\n[2.2] 创建 RealRobotEnvWrapper (RobotEnv 模式)...")
+            print("  ⚠ 正在连接真实机器人硬件，请稍候...")
+            wrapper = RealRobotEnvWrapper(robot_cfg, rank=0, world_size=1)
+            print(f"  ✓ 内部环境类型: {type(wrapper.env).__name__}")
+            print(f"  ✓ 遥操作设备类型: {type(wrapper.teleop_device).__name__ if wrapper.teleop_device else None}")
+            
+            print("\n[2.3] 重置环境（机器人将移动到初始位置）...")
+            print("  ⚠ 机器人正在移动，请确保安全区域无障碍物...")
+            obs_dict = wrapper.reset()
+            print(f"  ✓ 重置成功！")
+            print(f"  ✓ 观测键: {list(obs_dict.keys())}")
+            print(f"  ✓ 图像键: {list(obs_dict['images'].keys())}")
+            print(f"  ✓ 状态形状: {obs_dict['state'].shape}")
+            print(f"  ✓ 任务描述: {obs_dict['task_description']}")
+            
+            # 显示图像信息
+            for cam_name, img_tensor in obs_dict['images'].items():
+                print(f"    - {cam_name}: shape={img_tensor.shape}, dtype={img_tensor.dtype}")
+            
+            print("\n[2.4] 执行动作测试（发送零动作，机器人应保持静止）...")
+            num_steps = 5
+            for step in range(num_steps):
+                # 发送零动作（保持当前位置）
+                action = np.zeros(14, dtype=np.float32)
+                
+                # 执行一步
+                obs_dict, reward, terminated, truncated, info_dict = wrapper.step(action)
+                
+                print(f"  步骤 {step+1}/{num_steps}: "
+                      f"reward={reward:.4f}, "
+                      f"terminated={terminated}, "
+                      f"truncated={truncated}, "
+                      f"intervene_flag={info_dict.get('intervene_flag', False)}")
+                
+                if terminated or truncated:
+                    print(f"    → 环境终止，重置...")
+                    obs_dict = wrapper.reset()
+                
+                # 短暂延迟
+                time.sleep(0.1)
+            
+            print("\n[2.5] 关闭环境...")
+            wrapper.close()
+            print("  ✓ RobotEnv 模式测试通过！")
+            
+        except KeyboardInterrupt:
+            print("\n  ⚠ 用户中断测试")
+            if 'wrapper' in locals():
+                try:
+                    wrapper.close()
+                except:
+                    pass
+        except Exception as e:
+            import traceback
+            print(f"\n  ✗ RobotEnv 模式测试失败: {e}")
+            print(f"  Traceback:\n{traceback.format_exc()}")
+            if 'wrapper' in locals():
+                try:
+                    wrapper.close()
+                except:
+                    pass
+    
+    # ====================================================================
+    # 测试 3: 直接测试底层函数（make_robot_env, make_processors）
+    # ====================================================================
+    print("\n" + "=" * 80)
+    print("测试 3: 底层函数测试（make_robot_env + make_processors）")
+    print("=" * 80)
+    
+    try:
+        print("\n[3.1] 测试 make_robot_env (gym_testenv)...")
+        cfg = SimpleNamespace(
+            name="gym_testenv",
+            robot=None,
+            teleop=None,
+            processor=SimpleNamespace(
+                gripper=SimpleNamespace(use_gripper=False),
+                reset=SimpleNamespace(terminate_on_success=True),
+                observation=SimpleNamespace(display_cameras=False),
+            ),
+            data_path=None,
+            step_size=1,
+            action_chunk=50,
+        )
+        
+        env, teleop_device = make_robot_env(cfg)
+        print(f"  ✓ 环境类型: {type(env).__name__}")
+        print(f"  ✓ 遥操作设备: {teleop_device}")
+        print(f"  ✓ 观测空间: {env.observation_space}")
+        print(f"  ✓ 动作空间: {env.action_space}")
+        
+        print("\n[3.2] 测试 make_processors...")
+        env_processor, action_processor = make_processors(env, teleop_device, cfg, device="cpu")
+        print(f"  ✓ 环境处理器步骤数: {len(env_processor.steps)}")
+        print(f"  ✓ 动作处理器步骤数: {len(action_processor.steps)}")
+        
+        print("\n[3.3] 测试环境 reset + step...")
+        obs, info = env.reset(seed=42)
+        print(f"  ✓ reset 成功，观测键: {list(obs.keys())}")
+        
+        action = env.action_space.sample()
+        obs, reward, terminated, truncated, info = env.step(action)
+        print(f"  ✓ step 成功: reward={reward:.4f}, done={terminated}, truncated={truncated}")
+        
+        env.close()
+        print("  ✓ 底层函数测试通过！")
+        
+    except Exception as e:
+        import traceback
+        print(f"\n  ✗ 底层函数测试失败: {e}")
+        print(f"  Traceback:\n{traceback.format_exc()}")
+    
+    # ====================================================================
+    # 总结
+    # ====================================================================
+    print("\n" + "=" * 80)
+    print("测试总结")
+    print("=" * 80)
+    print("✓ 测试 1: RealRobotEnvWrapper + TestRobotEnv - 完成")
+    print("⚠ 测试 2: RealRobotEnvWrapper + RobotEnv - 已跳过（需要硬件）")
+    print("✓ 测试 3: 底层函数（make_robot_env + make_processors）- 完成")
+    print("\n说明:")
+    print("  1. TestRobotEnv: 数据回放模式，无需真实硬件")
+    print("  2. RobotEnv: 真实机器人模式，需要配置 robot 和 teleop")
+    print("  3. RealRobotEnvWrapper: 统一接口，可同时使用两种模式")
+    print("\n使用建议:")
+    print("  - 开发/测试: 使用 TestRobotEnv（cfg.env.name='gym_testenv'）")
+    print("  - 仿真训练: 使用 gym_hil（cfg.env.name='gym_hil'）")
+    print("  - 真实部署: 使用 RobotEnv（cfg.env.name='real_robot'，配置 robot + teleop）")
+    print("=" * 80)

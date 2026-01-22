@@ -85,7 +85,7 @@ $PYTHON -m recipe.vla.main_sac \
     env.actor.model.num_action_chunks=10 \
     env.actor.model.action_dim=16 \
     env.train.only_eval=True \
-    env.train.max_episode_steps=100 \
+    env.train.max_episode_steps=300 \
     env.train.video_cfg.save_video=False \
     env.train.video_cfg.video_base_dir=${VIDEO_OUTPUT} \
     env.train.seed=42 \

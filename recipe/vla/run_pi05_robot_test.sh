@@ -37,7 +37,7 @@ NUM_ENV_GPUS=1      # Use 1 GPU on node B for environment
 # rollout.n should equal to num_envs for real robot
 ROLLOUT_N=1
 # test means test_env using LeRobot dataset replay (also works for real robot)
-SIM_TYPE="test"
+SIM_TYPE="robot"
 PROJECT_NAME="vla_test_env_RL"
 EXPERIMENT_NAME="${SIM_TYPE}_reinforce_plus_plus"
 
@@ -88,7 +88,7 @@ $PYTHON -m recipe.vla.main_sac \
     +env.train.env.processor.reset.terminate_on_success=True \
     +env.train.env.processor.observation.display_cameras=False \
     +env.train.env.device="cpu" \
-    env.actor.model.num_action_chunks=10 \
+    env.actor.model.num_action_chunks=30 \
     env.actor.model.action_dim=16 \
     env.train.only_eval=True \
     env.train.max_episode_steps=300 \
