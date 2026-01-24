@@ -190,6 +190,14 @@ class RobActorRolloutRefWorker(ActorRolloutRefWorker):
 
         logger.info("trainer mode")
 
+
+    @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"), blocking=False)
+    @DistProfiler.annotate(color="blue", role="process_dataset_batch")
+    def process_dataset_batch(self, batch: DataProto) -> DataProto:
+        batch = self.actor.process_dataset_batch(batch)
+        return batch
+
+
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="rollout"), blocking=False)
     @DistProfiler.annotate(color="red", role="rollout_generate")
     def generate_sequences(self, prompts: DataProto):
@@ -274,7 +282,10 @@ class RobActorRolloutRefWorker(ActorRolloutRefWorker):
             OmegaConf.set_struct(self.config.actor, True)
             # TODO(liujincheng): configurable
             self.actor = PI0RobDataParallelPPOActor(
-                config=self.config.actor, actor_module=self.actor_module_fsdp, actor_optimizer=self.actor_optimizer
+                config=self.config.actor, 
+                actor_module=self.actor_module_fsdp, 
+                actor_optimizer=self.actor_optimizer,
+                tokenizer=self.tokenizer,
             )
 
         if self._is_rollout:

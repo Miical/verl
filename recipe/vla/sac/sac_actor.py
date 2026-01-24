@@ -108,6 +108,7 @@ class PI0RobDataParallelPPOActor(BaseSACActor):
         config,
         actor_module: SupportSACTraining,
         actor_optimizer: torch.optim.Optimizer,
+        tokenizer = None,
     ):
         super().__init__()
         self.config = config
@@ -117,6 +118,7 @@ class PI0RobDataParallelPPOActor(BaseSACActor):
         self.actor_optimizer = actor_optimizer
         self.actor_module = actor_module
         self.actor_module.sac_init()
+        self.tokenizer = tokenizer
 
         self.replay_pool = SACReplayPool(capacity=self.config.replay_pool_capacity, sample_device=self.device)
         self.replay_pool.load(self.config.replay_pool_save_dir)
@@ -305,18 +307,7 @@ class PI0RobDataParallelPPOActor(BaseSACActor):
     @override
     def update_policy(self, data: DataProto):
 
-        batch: TensorDict = data.select([
-            "a0.full_action", "a1.full_action",
-            "s0.states", "s1.states",
-            "s0.images", "s1.images",
-            "s0.image_masks", "s1.image_masks",
-            "s0.lang_tokens", "s1.lang_tokens",
-            "s0.lang_masks", "s1.lang_masks",
-            "rewards",
-            "response_mask"
-        ]).batch
-
-        batch = self.replay_pool.insert_and_resample(batch)
+        batch = self.replay_pool.insert_and_resample(data.batch)
         batch["valid"] = batch["response_mask"].any(dim=-1).float() # (B,)
         micro_batches = batch.split(self.config.ppo_micro_batch_size_per_gpu)
         global_steps = data.meta_info["global_steps"]
@@ -398,6 +389,24 @@ class PI0RobDataParallelPPOActor(BaseSACActor):
         }
 
         return metrics
+
+    def process_dataset_batch(self, batch: DataProto) -> DataProto:
+        """Process dataset batch for SAC training.
+
+        Args:
+            batch: DataProto containing the dataset batch.
+        """
+
+        batch = batch.to(self.device)
+
+        batch = self.actor_module.process_dataset_batch(
+            batch = batch.batch,
+            non_tensor_batch = batch.non_tensor_batch,
+            tokenizer = self.tokenizer
+        )
+
+        batch = DataProto.from_single_dict(batch)
+        return batch.to("cpu")
 
     def _optimizer_step(self, optimizer: torch.optim.Optimizer) -> torch.Tensor:
         assert self.config.grad_clip is not None

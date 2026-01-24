@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import numpy as np
 from onnx_ir import Tensor
 from typing import Literal
 from typing_extensions import override
@@ -8,6 +9,7 @@ import torch
 from torch import nn
 from torch.distributions import Normal
 from torch.distributed.fsdp import register_fsdp_forward_method
+from tensordict import TensorDict
 from transformers import PreTrainedModel
 from verl.utils.device import get_device_name
 
@@ -194,6 +196,86 @@ class PI0ForActionPrediction(PreTrainedModel, SupportSACTraining):
         vision_tower = self.model.paligemma_with_expert.vision_tower
         vision_tower.requires_grad_(False)
         vision_tower.eval()
+
+    def process_dataset_batch(
+        self, 
+        batch: TensorDict,
+        non_tensor_batch: dict[str, np.ndarray],
+        tokenizer,
+    ) -> dict[str, torch.Tensor]:
+        # TODO: abstract this function
+
+        out = {}
+        batch_size = batch.shape[0]
+
+        # Process images
+        # s0
+        images = {
+            "observation.images.cam_high": batch["t0.observation.images.cam_high"],
+            "observation.images.cam_left_wrist": batch["t0.observation.images.cam_left_wrist"],
+            "observation.images.cam_right_wrist": batch["t0.observation.images.cam_right_wrist"],
+        }
+        images, img_masks = self.image_transform.call_batch(images)
+        img_masks =[torch.ones((batch_size,), dtype=torch.bool),
+                    torch.ones((batch_size,), dtype=torch.bool),
+                    torch.zeros((batch_size,), dtype=torch.bool)]
+        out['s0.images'] = torch.stack(images, dim=1)
+        out['s0.image_masks'] = torch.stack(img_masks, dim=1)
+        # s1
+        images = {
+            "observation.images.cam_high": batch["t1.observation.images.cam_high"],
+            "observation.images.cam_left_wrist": batch["t1.observation.images.cam_left_wrist"],
+            "observation.images.cam_right_wrist": batch["t1.observation.images.cam_right_wrist"],
+        }
+        images, img_masks = self.image_transform.call_batch(images)
+        img_masks = [torch.ones((batch_size,), dtype=torch.bool),
+                    torch.ones((batch_size,), dtype=torch.bool),
+                    torch.zeros((batch_size,), dtype=torch.bool)]
+        out['s1.images'] = torch.stack(images, dim=1)
+        out['s1.image_masks'] = torch.stack(img_masks, dim=1)
+
+        # Process language
+        # s0
+        lang_tokens, lang_masks = self.prompt_tokenizer_transform.call_batch(
+            {'task': non_tensor_batch['t0.task'], 'observation.state': batch['t0.observation.state']},
+            tokenizer=tokenizer
+        )
+        out['s0.lang_tokens'] = lang_tokens
+        out['s0.lang_masks'] = lang_masks
+
+        # s1
+        lang_tokens, lang_masks = self.prompt_tokenizer_transform.call_batch(
+            {'task': non_tensor_batch['t1.task'], 'observation.state': batch['t1.observation.state']},
+            tokenizer=tokenizer
+        )
+        out['s1.lang_tokens'] = lang_tokens
+        out['s1.lang_masks'] = lang_masks
+
+        def pad_to_32(x: torch.Tensor) -> torch.Tensor:
+            """Pad the last dimension to be multiple of 32."""
+            last_dim = x.shape[-1]
+            pad_size = (32 - (last_dim % 32)) % 32
+            if pad_size > 0:
+                padding = torch.zeros((*x.shape[:-1], pad_size), device=x.device, dtype=x.dtype)
+                x = torch.cat([x, padding], dim=-1)
+            return x
+
+        # Process states
+        out['s0.states'] = self.state_normalize_transform(pad_to_32(batch['t0.observation.state']))
+        out['s1.states'] = self.state_normalize_transform(pad_to_32(batch['t1.observation.state']))
+
+        # Process actions
+        out['a0.full_action'] = self.action_normalize_transform(pad_to_32(batch['t0.action']))
+        out['a1.full_action'] = self.action_normalize_transform(pad_to_32(batch['t1.action']))
+
+        # Process rewards
+        out['rewards'] = batch['t0.next.done'].float().unsqueeze(-1).expand(*batch['t0.next.done'].shape, 10)
+
+        # Process response masks
+        out['response_mask'] = torch.ones((batch_size, 70), dtype=torch.bool)
+
+        return out
+
 
     # --- SAC Algorithm Support ---
 

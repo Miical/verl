@@ -21,32 +21,29 @@ This trainer supports model-agonistic model initialization with huggingface
 import uuid
 from collections import defaultdict
 from pprint import pprint
+import itertools
 
 import numpy as np
 import torch
 from omegaconf import OmegaConf
 from tqdm import tqdm
+from typing import Dict, Optional
+from torch.utils.data import Dataset, Sampler
+from torchdata.stateful_dataloader import StatefulDataLoader
 
 from verl import DataProto
 from verl.experimental.dataset.sampler import AbstractCurriculumSampler
 from verl.protocol import pad_dataproto_to_divisor, unpad_dataproto
-from verl.single_controller.ray import RayClassWithInitArgs
+from verl.single_controller.ray import RayClassWithInitArgs, RayWorkerGroup
 from verl.single_controller.ray.base import create_colocated_worker_cls
-from verl.trainer.ppo.core_algos import agg_loss
-from verl.trainer.ppo.metric_utils import (
-    compute_data_metrics,
-    compute_throughout_metrics,
-    compute_timing_metrics,
-    process_validation_metrics,
-)
-from verl.trainer.ppo.ray_trainer import RayPPOTrainer, apply_kl_penalty, compute_advantage
+from verl.trainer.ppo.metric_utils import process_validation_metrics
+
+from verl.trainer.ppo.ray_trainer import RayPPOTrainer, ResourcePoolManager, ResourcePoolManager
 from verl.trainer.ppo.reward import compute_reward
-from verl.trainer.ppo.utils import Role
+from verl.trainer.ppo.utils import Role, WorkerType
 from verl.utils.checkpoint.checkpoint_manager import should_save_ckpt_esi
 from verl.utils.debug import marked_timer
 from verl.utils.metric import reduce_metrics
-
-from recipe.vla.sac.core_algos import compute_discounted_returns
 
 def compute_response_mask(data: DataProto) -> torch.Tensor:
     """Compute the attention mask for the response part of the sequence.
@@ -143,6 +140,57 @@ class RobRayPPOTrainer(RayPPOTrainer):
     managing actor rollouts, critic training, and reward computation with Ray backend.
     Supports various model architectures including FSDP, Megatron, vLLM, and SGLang integration.
     """
+
+
+    def __init__(
+        self,
+        config,
+        tokenizer,
+        role_worker_mapping: dict[Role, WorkerType],
+        resource_pool_manager: ResourcePoolManager,
+        ray_worker_group_cls: type[RayWorkerGroup] = RayWorkerGroup,
+        processor=None,
+        reward_fn=None,
+        val_reward_fn=None,
+        train_dataset: Optional[Dataset] = None,
+        val_dataset: Optional[Dataset] = None,
+        collate_fn=None,
+        train_sampler: Optional[Sampler] = None,
+        rlpd_dataset: Optional[Dataset] = None,
+        rlpd_sampler: Optional[Sampler] = None,
+        rlpd_collate_fn=None,
+        device_name=None,
+    ):
+        super().__init__(
+            config=config,
+            tokenizer=tokenizer,
+            role_worker_mapping=role_worker_mapping,
+            resource_pool_manager=resource_pool_manager,
+            ray_worker_group_cls=ray_worker_group_cls,
+            processor=processor,
+            reward_fn=reward_fn,
+            val_reward_fn=val_reward_fn,
+            train_dataset=train_dataset,
+            val_dataset=val_dataset,
+            collate_fn=collate_fn,
+            train_sampler=train_sampler,
+            device_name=device_name,
+        )
+
+        if self.config.trainer.rlpd_enable:
+            assert rlpd_dataset is not None, "rlpd_dataset must be provided when rlpd_enable is True"
+            assert rlpd_sampler is not None, "rlpd_sampler must be provided when rlpd_enable is True"
+            self.rlpd_dataloader = StatefulDataLoader(
+                rlpd_dataset,
+                batch_size=self.config.data.rlpd_batch_size,
+                sampler=rlpd_sampler,
+                collate_fn=rlpd_collate_fn,
+                num_workers=self.config.data.dataloader_num_workers,
+                drop_last=True,
+            )
+
+            assert len(self.rlpd_dataloader) >= 1, "RLPD dataloader is empty!"
+            print(f"Size of RLPD dataloader: {len(self.rlpd_dataloader)}")
 
     def init_workers(self):
         self.resource_pool_manager.create_resource_pool()
@@ -267,6 +315,9 @@ class RobRayPPOTrainer(RayPPOTrainer):
         )
         next_step_profile = False
 
+        if self.config.trainer.rlpd_enable:
+            rlpd_dataloader_iter = itertools.cycle(self.rlpd_dataloader)
+
         for epoch in range(self.config.trainer.total_epochs):
             for batch_dict in self.train_dataloader:
                 metrics = {}
@@ -307,18 +358,40 @@ class RobRayPPOTrainer(RayPPOTrainer):
                         reward_tensor, reward_extra_infos_dict = compute_reward(batch, self.reward_fn)
 
                     batch.batch["rewards"] = reward_tensor
-                    batch.batch["returns"] = compute_discounted_returns(reward_tensor, gamma=0.99)
                     batch = add_transition_prefixes(batch)
                     batch = flatten_trajectories(batch)
 
                     # batch.meta_info["global_token_num"] = torch.sum(batch.batch["attention_mask"], dim=-1).tolist()
                     batch.meta_info["global_token_num"] = [0]
 
+
+                    if self.config.trainer.rlpd_enable:
+                        rlpd_batch = next(rlpd_dataloader_iter)
+                        rlpd_batch = DataProto.from_single_dict(rlpd_batch)
+                        rlpd_batch = self.actor_rollout_wg.process_dataset_batch(rlpd_batch).get()
+
+                        rl_batch = batch.select([
+                            "a0.full_action", "a1.full_action",
+                            "s0.states", "s1.states",
+                            "s0.images", "s1.images",
+                            "s0.image_masks", "s1.image_masks",
+                            "s0.lang_tokens", "s1.lang_tokens",
+                            "s0.lang_masks", "s1.lang_masks",
+                            "rewards",
+                            "response_mask"
+                        ])
+
+                        train_batch = DataProto.concat([rl_batch, rlpd_batch])
+                        print(f"RLPD enabled: RL batch size {len(rl_batch)}, RLPD batch size {len(rlpd_batch)}, total {len(train_batch)}")
+                    else:
+                        train_batch = batch
+
+
                     # update actor
                     if self.config.trainer.critic_warmup <= self.global_steps:
                         with marked_timer("update_actor", timing_raw, color="red"):
-                            batch.meta_info["multi_turn"] = self.config.actor_rollout_ref.rollout.multi_turn.enable
-                            actor_output = self.actor_rollout_wg.update_actor(batch)
+                            train_batch.meta_info["multi_turn"] = self.config.actor_rollout_ref.rollout.multi_turn.enable
+                            actor_output = self.actor_rollout_wg.update_actor(train_batch)
                         actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
                         metrics.update(actor_output_metrics)
 

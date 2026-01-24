@@ -35,6 +35,7 @@ MINI_BATCH_SIZE=128                            # mini batch size (batch size per
                                                # invalid in SAC, currently
                                                # In SAC, it equal to (max_interactions - 1) * TRAIN_BATCH_SIZE * ROLLOUT_N / NUM_ROLLOUT_GPUS
 MICRO_BATCH_SIZE=8                             # micro batch size (per GPU, for gradient accumulation, should divide MINI_BATCH_SIZE)
+RLPD_BATCH_SIZE=$(((MAX_EPISODE_STEPS / NUM_ACTION_CHUNKS - 1) * TRAIN_BATCH_SIZE * ROLLOUT_N))  # batch size for RLPD data loader
 
 
 
@@ -68,6 +69,7 @@ $PYTHON -m recipe.vla.main_sac \
     +data.rlpd_files="$rlpd_files" \
     data.train_batch_size=$TRAIN_BATCH_SIZE \
     data.val_batch_size=4 \
+    +data.rlpd_batch_size=$RLPD_BATCH_SIZE \
     actor_rollout_ref.rollout.n=$ROLLOUT_N \
     env.train.num_envs=$NUM_ENV \
     data.max_prompt_length=256 \

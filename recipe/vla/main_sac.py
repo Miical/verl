@@ -14,17 +14,19 @@
 
 
 import logging
-
 import datasets
 import hydra
 import ray
 import torch
+from pprint import pprint
 from omegaconf import OmegaConf
 
 from verl import DataProto
 from verl.trainer.constants_ppo import get_ppo_ray_runtime_env
 from verl.trainer.ppo.ray_trainer import ResourcePoolManager
 from verl.trainer.ppo.utils import Role
+from verl.utils.fs import copy_local_path_from_hdfs
+from verl.utils import hf_tokenizer
 
 from recipe.vla.sac.sac_ray_trainer import RobRayPPOTrainer
 
@@ -54,12 +56,6 @@ def main(config):
 @ray.remote
 def main_task(config):
     # print initial config
-    from pprint import pprint
-
-    from omegaconf import OmegaConf
-
-    from verl.utils.fs import copy_local_path_from_hdfs
-
     pprint(OmegaConf.to_container(config, resolve=True))  # resolve=True will eval symbol values
     OmegaConf.resolve(config)
 
@@ -67,8 +63,6 @@ def main_task(config):
     local_path = copy_local_path_from_hdfs(config.actor_rollout_ref.model.path)
 
     # instantiate tokenizer
-    from verl.utils import hf_tokenizer
-
     tokenizer = hf_tokenizer(local_path)
 
     # define worker classes
@@ -79,60 +73,55 @@ def main_task(config):
         from .fsdp_workers import RobActorRolloutRefWorker
 
         ray_worker_group_cls = RayWorkerGroup
-
     else:
         raise NotImplementedError
 
     role_worker_mapping = {
-        # Role.Critic: ray.remote(RobActorRolloutRefWorker),
         Role.ActorRollout: ray.remote(RobActorRolloutRefWorker),
-        # Role.RefPolicy: ray.remote(RobActorRolloutRefWorker),
         Role.Env: ray.remote(EnvWorker),
     }
 
-    train_rollout_pool_id = "train_rollout_pool"
-
-    num_nodes_actor_rollout = config.trainer.nnodes
+    # setup resource pool manager
     train_rollout_gpu_num = config.trainer.n_rollout_gpus_per_node
+    train_rollout_nodes_num = config.trainer.nnodes
     env_gpu_num = config.trainer.n_env_gpus_per_node
-    if config.env.disagg_sim.enable:
-        # disaggregated sim and actor rollout
-        num_nodes_sim = config.env.disagg_sim.nnodes
-    else:
-        # colocated sim and actor rollout
-        num_nodes_sim = config.trainer.nnodes
+    env_nodes_num = config.env.disagg_sim.nnodes if config.env.disagg_sim.enable else config.trainer.nnodes
 
     resource_pool_spec = {
-        train_rollout_pool_id: [train_rollout_gpu_num] * num_nodes_actor_rollout,
-        "env_gpu_pool": [env_gpu_num] * num_nodes_sim,
+        "train_rollout_pool": [train_rollout_gpu_num] * train_rollout_nodes_num,
+        "env_gpu_pool":       [env_gpu_num]           * env_nodes_num,
     }
     mapping = {
-        Role.ActorRollout: train_rollout_pool_id,
-        # Role.Critic: global_pool_id,
-        # Role.RefPolicy: global_pool_id,
+        Role.ActorRollout: "train_rollout_pool",
         Role.Env: "env_gpu_pool",
     }
-
-    reward_fn = calculate_reward
-    val_reward_fn = calculate_reward
-
     resource_pool_manager = ResourcePoolManager(resource_pool_spec=resource_pool_spec, mapping=mapping)
 
-    # Create training and validation datasets.
+    # create datasets
     train_dataset = datasets.load_dataset("parquet", data_files=config.data.train_files)["train"]
     val_dataset = datasets.load_dataset("parquet", data_files=config.data.val_files)["train"]
+    if config.trainer.rlpd_enable:
+        from recipe.vla.dataloader.lerobot import make_dataset, make_sampler, make_collator
+        rlpd_dataset = make_dataset("parquet", config.data.rlpd_files)
+        rlpd_sampler = make_sampler(rlpd_dataset)
+        rlpd_collate_fn = make_collator()
 
+    # instantiate trainer and start training
     trainer = RobRayPPOTrainer(
         config=config,
         tokenizer=tokenizer,
         role_worker_mapping=role_worker_mapping,
         resource_pool_manager=resource_pool_manager,
         ray_worker_group_cls=ray_worker_group_cls,
-        reward_fn=reward_fn,
-        val_reward_fn=val_reward_fn,
+        reward_fn=calculate_reward,
+        val_reward_fn=calculate_reward,
         train_dataset=train_dataset,
         val_dataset=val_dataset,
+        rlpd_dataset=rlpd_dataset if config.trainer.rlpd_enable else None,
+        rlpd_sampler=rlpd_sampler if config.trainer.rlpd_enable else None,
+        rlpd_collate_fn=rlpd_collate_fn if config.trainer.rlpd_enable else None,
     )
+
     trainer.init_workers()
     trainer.fit()
 
