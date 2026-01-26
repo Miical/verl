@@ -13,7 +13,6 @@ import gymnasium as gym
 import numpy as np
 import torch
 import sys
-import ray
 
 def images_decoding(encoded_data, valid_len=None):
     """解码图像并记录耗时"""
@@ -50,9 +49,7 @@ def force_print(*args, **kwargs):
     sys.stdout.flush()
     sys.stderr.flush()
 
-force_print(f"[test_env.py] Importing RealRobotEnvWrapper...")
-from .robot.controller.piper.piper_env import RealRobotEnvWrapper as RobotEnv
-force_print(f"[test_env.py] RobotEnv = {RobotEnv}")
+from .robot.controller.piper.piper_env import RealRobotEnvWrapper as PiperEnv
 from recipe.vla.envs.action_utils import (
     list_of_dict_to_dict_of_list,
     put_info_on_image,
@@ -64,7 +61,7 @@ from recipe.vla.envs.action_utils import (
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)  # 设置日志级别
 
-class TestEnv(gym.Env):
+class RealRobotEnv(gym.Env):
     """Test environment that interfaces with robot_env for robot control.
     
     This environment wraps RealRobotEnvWrapper to provide a unified interface
@@ -83,18 +80,17 @@ class TestEnv(gym.Env):
     """
     
     def __init__(self, cfg, rank, world_size):
-        force_print(f"[TestEnv] __init__ CALLED! rank={rank}, world_size={world_size}")
         self.rank = rank
         self.cfg = cfg
         self.world_size = world_size
         self.seed = getattr(cfg, 'seed', 42) + rank
         self.num_envs = getattr(cfg, 'num_envs', 1)
-        force_print(f"[TestEnv] num_envs={self.num_envs}, seed={self.seed}")
         
         # 检测是否使用真实机器人模式（通过检查 robot_config_path 或 env.name）
         # 真实机器人模式：不使用 hdf5_loader，每次 reset 都是真实的机器人重置
         self.use_real_robot = self._detect_real_robot_mode(cfg)
-        force_print(f"[TestEnv] use_real_robot={self.use_real_robot}")
+        logger.info(f"[RealRobotEnv] Initializing: rank={rank}, num_envs={self.num_envs}, "
+                   f"use_real_robot={self.use_real_robot}, seed={self.seed}")
         
         # Distributed inference related configs
         self.auto_reset = getattr(cfg, 'auto_reset', True)
@@ -102,7 +98,6 @@ class TestEnv(gym.Env):
         self.use_fixed_reset_state_ids = getattr(cfg, 'use_fixed_reset_state_ids', False)
         self.group_size = getattr(cfg, 'group_size', 1)
         self.num_group = self.num_envs // self.group_size
-        force_print(f"[TestEnv] auto_reset={self.auto_reset}, group_size={self.group_size}")
         
         self._is_start = True
         self._generator = np.random.default_rng(seed=self.seed)
@@ -110,16 +105,11 @@ class TestEnv(gym.Env):
         self._torch_generator.manual_seed(self.seed)
         
         # 为每个环境创建RobotEnv实例，传递完整配置
-        logger.info(f"[TestEnv] Using robot_env backend")
-        force_print(f"[TestEnv] About to create RobotEnv, RobotEnv class = {RobotEnv}")
-        force_print(f"[TestEnv] cfg type={type(cfg)}, has 'env' attr={hasattr(cfg, 'env')}")
         self.robot_backends = []
         for i in range(self.num_envs):
-            force_print(f"[TestEnv] Creating RobotEnv instance {i}/{self.num_envs}...")
-            robot_backend = RobotEnv(cfg, rank, world_size)
-            force_print(f"[TestEnv] RobotEnv instance {i} created successfully!")
+            robot_backend = PiperEnv(cfg, rank, world_size)
             self.robot_backends.append(robot_backend)
-        force_print(f"[TestEnv] All {self.num_envs} RobotEnv instances created!")
+        logger.info(f"[RealRobotEnv] Created {self.num_envs} robot backend(s)")
         
         # Metrics
         self.prev_step_reward = np.zeros(self.num_envs)
@@ -161,13 +151,12 @@ class TestEnv(gym.Env):
         try:
             # 检查是否有 robot_config_path
             robot_config_path = getattr(cfg, 'robot_config_path', None)
-            force_print(f"[TestEnv] _detect_real_robot_mode: robot_config_path={robot_config_path}")
             
             if robot_config_path is not None:
                 # 检查文件是否存在
                 if not os.path.exists(robot_config_path):
-                    force_print(f"[TestEnv] WARNING: robot_config_path does not exist: {robot_config_path}")
-                    force_print(f"[TestEnv] This may cause issues if running on a different node!")
+                    logger.warning(f"[RealRobotEnv] robot_config_path does not exist: {robot_config_path}")
+                    logger.warning("[RealRobotEnv] This may cause issues if running on a different node!")
                     # 文件不存在时，尝试从 cfg.env.name 判断
                 else:
                     # 尝试加载配置文件检查 name
@@ -176,33 +165,26 @@ class TestEnv(gym.Env):
                         with open(robot_config_path, 'r') as f:
                             robot_cfg = json.load(f)
                         env_name = robot_cfg.get('name', '')
-                        force_print(f"[TestEnv] Loaded robot config from {robot_config_path}, name={env_name}")
                         if env_name != "gym_testenv":
-                            force_print(f"[TestEnv] Detected REAL ROBOT mode (config name={env_name})")
+                            logger.info(f"[RealRobotEnv] Detected REAL ROBOT mode (config name={env_name})")
                             return True
                         else:
-                            force_print(f"[TestEnv] Config is gym_testenv, using DATA REPLAY mode")
+                            logger.info("[RealRobotEnv] Config is gym_testenv, using DATA REPLAY mode")
                             return False
                     except Exception as e:
-                        force_print(f"[TestEnv] Failed to load robot config: {e}")
-                        import traceback
-                        force_print(f"[TestEnv] Traceback: {traceback.format_exc()}")
+                        logger.warning(f"[RealRobotEnv] Failed to load robot config: {e}")
             
             # 检查 cfg.env.name
             if hasattr(cfg, 'env') and hasattr(cfg.env, 'name'):
                 env_name = cfg.env.name
-                force_print(f"[TestEnv] cfg.env.name={env_name}")
                 if env_name != "gym_testenv":
-                    force_print(f"[TestEnv] Detected REAL ROBOT mode (cfg.env.name={env_name})")
+                    logger.info(f"[RealRobotEnv] Detected REAL ROBOT mode (cfg.env.name={env_name})")
                     return True
             
-            force_print(f"[TestEnv] Detected DATA REPLAY mode (gym_testenv)")
+            logger.info("[RealRobotEnv] Detected DATA REPLAY mode (gym_testenv)")
             return False
         except Exception as e:
-            import traceback
-            force_print(f"[TestEnv] Error detecting robot mode: {e}")
-            force_print(f"[TestEnv] Traceback: {traceback.format_exc()}")
-            force_print(f"[TestEnv] Defaulting to data replay mode")
+            logger.warning(f"[RealRobotEnv] Error detecting robot mode: {e}, defaulting to data replay mode")
             return False
 
     def _build_state_mapping(self):
@@ -213,11 +195,8 @@ class TestEnv(gym.Env):
         
         For real robot mode, we use a single state (state_id=0) since there's no dataset.
         """
-        force_print(f"[TestEnv] _build_state_mapping: use_real_robot={self.use_real_robot}")
-        
         # 真实机器人模式：不依赖 hdf5_loader，使用单一状态
         if self.use_real_robot:
-            force_print(f"[TestEnv] Real robot mode: using single state (no hdf5_loader needed)")
             self.total_num_group_envs = 1
             self.trial_id_bins = [1]
             self.cumsum_trial_id_bins = np.array([1])
@@ -225,36 +204,22 @@ class TestEnv(gym.Env):
         
         # 数据回放模式：尝试从 robot_backends 获取 episode 数量
         try:
-            force_print(f"[TestEnv] _build_state_mapping: robot_backends={self.robot_backends}")
-            force_print(f"[TestEnv] _build_state_mapping: robot_backends[0]={self.robot_backends[0]}")
-            
             if hasattr(self.robot_backends[0], 'env'):
-                force_print(f"[TestEnv] robot_backends[0].env = {self.robot_backends[0].env}")
                 if hasattr(self.robot_backends[0].env, 'hdf5_loader') and self.robot_backends[0].env.hdf5_loader is not None:
-                    force_print(f"[TestEnv] robot_backends[0].env.hdf5_loader = {self.robot_backends[0].env.hdf5_loader}")
                     num_episodes = self.robot_backends[0].env.hdf5_loader.num_episodes
-                    logger.info(f"[TestEnv] Found {num_episodes} episodes in dataset")
-                    force_print(f"[TestEnv] Found {num_episodes} episodes in dataset")
+                    logger.info(f"[RealRobotEnv] Found {num_episodes} episodes in dataset")
                     self.total_num_group_envs = num_episodes
                     self.trial_id_bins = [1] * num_episodes  # 每个episode一个state
                     self.cumsum_trial_id_bins = np.arange(1, num_episodes + 1)
                     return
-                else:
-                    force_print(f"[TestEnv] robot_backends[0].env has no hdf5_loader attribute or it's None")
-            else:
-                force_print(f"[TestEnv] robot_backends[0] has no env attribute")
             
             # 如果无法获取episode数量，使用默认值
-            logger.warning("[TestEnv] Cannot get episode count from robot_backends, using default (1 state)")
-            force_print("[TestEnv] Cannot get episode count from robot_backends, using default (1 state)")
+            logger.warning("[RealRobotEnv] Cannot get episode count from robot_backends, using default (1 state)")
             self.total_num_group_envs = 1
             self.trial_id_bins = [1]
             self.cumsum_trial_id_bins = np.array([1])
         except Exception as e:
-            import traceback
-            logger.warning(f"[TestEnv] Error getting episode count: {e}, using default")
-            force_print(f"[TestEnv] Error getting episode count: {e}")
-            force_print(f"[TestEnv] Traceback: {traceback.format_exc()}")
+            logger.warning(f"[RealRobotEnv] Error getting episode count: {e}, using default")
             self.total_num_group_envs = 1
             self.trial_id_bins = [1]
             self.cumsum_trial_id_bins = np.array([1])
@@ -451,18 +416,13 @@ class TestEnv(gym.Env):
         
         if self.use_real_robot:
             # 真实机器人模式：直接调用 reset，不传递 episode_id
-            force_print(f"[TestEnv] Real robot mode: resetting {len(env_idx)} envs")
             for i, eid in enumerate(env_idx):
-                force_print(f"[TestEnv] Resetting real robot env {eid}...")
                 try:
                     # 真实机器人的 reset 不需要 episode_id 参数
                     single_obs = self.robot_backends[eid].reset(episode_id=None)
                     obs_list.append(single_obs)
-                    force_print(f"[TestEnv] Real robot env {eid} reset complete")
                 except Exception as e:
-                    import traceback
-                    force_print(f"[TestEnv] ERROR: Failed to reset real robot env {eid}: {e}")
-                    force_print(f"[TestEnv] Traceback: {traceback.format_exc()}")
+                    logger.error(f"[RealRobotEnv] Failed to reset real robot env {eid}: {e}")
                     raise
         else:
             # 数据回放模式：使用 episode_id 来选择数据
@@ -542,10 +502,7 @@ class TestEnv(gym.Env):
         env_idx = np.arange(0, self.num_envs)[dones]
         final_info = copy.deepcopy(infos)
         
-        if self.use_real_robot:
-            # 真实机器人模式：直接重置
-            force_print(f"[TestEnv] Real robot mode: auto-resetting {len(env_idx)} envs")
-        else:
+        if not self.use_real_robot:
             # 数据回放模式：标记完成的环境需要选择新episode
             for eid in env_idx:
                 logger.info(f"[TestEnv] Episode completed for env {eid}, marking for new episode selection")
@@ -719,7 +676,6 @@ class TestEnv(gym.Env):
                 raw_chunk_intervene_actions.append(infos["intervene_action"])
                 raw_chunk_intervene_flag.append(infos["intervene_flag"])
             time.sleep(1/30)
-            force_print(f"[TestEnv] step {i} done")
             chunk_rewards.append(step_reward)
             raw_chunk_terminations.append(terminations)
             raw_chunk_truncations.append(truncations)
@@ -822,23 +778,15 @@ class TestEnv(gym.Env):
                 - First dict contains "images_and_states" with tensors
                 - Second dict contains "task_descriptions" for that environment
         """
-        force_print(f"[TestEnv] reset_envs_to_state_ids ENTER, num_envs={len(state_ids_list)}, use_real_robot={self.use_real_robot}")
-        force_print(f"[TestEnv] state_ids_list: {state_ids_list}")
-        force_print(f"[TestEnv] task_ids_list: {task_ids_list}")
-        
         try:
             env_idx = np.arange(len(state_ids_list))
             
             if self.use_real_robot:
                 # 真实机器人模式：忽略 state_ids，直接重置
-                force_print(f"[TestEnv] Real robot mode: ignoring state_ids, resetting to initial pose")
                 obs, infos = self.reset(env_idx=env_idx, reset_state_ids=None)
             else:
                 # 数据回放模式：使用 state_ids 选择 episode
                 obs, infos = self.reset(env_idx=env_idx, reset_state_ids=state_ids_list)
-            
-            force_print(f"[TestEnv] Reset complete, obs keys: {obs.keys()}")
-            force_print(f"[TestEnv] Task descriptions: {self.task_descriptions}")
             
             # obs 已经是正确格式: {"images_and_states": {...}, "task_descriptions": list}
             # env_worker 期望: [dict, dict] 其中:
@@ -846,21 +794,10 @@ class TestEnv(gym.Env):
             #   - 第二个dict也包含 "task_descriptions" 键（用于兼容性）
             
             num_envs = len(state_ids_list)
-            
-            # 直接使用 obs 中的数据
             images_and_states = obs["images_and_states"]
             task_descriptions = obs["task_descriptions"]
             
-            # 打印图像 tensor 的形状信息
-            force_print(f"[TestEnv] images_and_states keys: {images_and_states.keys()}")
-            for k, v in images_and_states.items():
-                if isinstance(v, torch.Tensor):
-                    force_print(f"[TestEnv]   {k}: shape={v.shape}, dtype={v.dtype}")
-                else:
-                    force_print(f"[TestEnv]   {k}: type={type(v)}")
-            
             # 返回格式: [dict, dict]
-            # 第一个dict必须同时包含 "images_and_states" 和 "task_descriptions"
             result = [
                 {
                     "images_and_states": images_and_states,
@@ -869,17 +806,9 @@ class TestEnv(gym.Env):
                 {"task_descriptions": task_descriptions}
             ]
             
-            force_print(f"[TestEnv] reset_envs_to_state_ids SUCCESS, returning result")
-            
         except Exception as e:
-            import traceback
-            force_print(f"[TestEnv] reset_envs_to_state_ids FAILED: {e}")
-            force_print(f"[TestEnv] Traceback: {traceback.format_exc()}")
+            logger.error(f"[RealRobotEnv] reset_envs_to_state_ids failed: {e}")
             raise
-        
-        logger.info(f"[TestEnv] Returning result for {num_envs} envs")
-        logger.info(f"[TestEnv] images_and_states keys: {images_and_states.keys()}")
-        logger.info(f"[TestEnv] task_descriptions count: {len(task_descriptions)}")
         
         return result
 

@@ -129,3 +129,8 @@ logs
 log
 outputs
 .history
+# 排除输出文件夹
+img_output/
+outputs/
+Log/
+*.code-workspace

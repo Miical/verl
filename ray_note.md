@@ -17,7 +17,7 @@ conda activate raytest2
 ray stop --force
 rm -rf /tmp/ray
 export CUDA_VISIBLE_DEVICES=0 
-ray start --address='192.168.18.238:6379' --resources='{"node:B": 1, "sim": 1}'
+ray start --address='192.168.1.222:6379' --resources='{"node:B": 1, "sim": 1}'
 
 <!-- 机器人测试 -->
 bash recipe/vla/run_pi05_robot_test.sh
