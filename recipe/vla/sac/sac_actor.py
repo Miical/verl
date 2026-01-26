@@ -204,39 +204,31 @@ class PI0RobDataParallelPPOActor(BaseSACActor):
         alpha_loss = (alpha_loss * valid).sum() / (valid.sum().clamp_min(1.0))
         return alpha_loss
 
-    def _calculate_critic_loss(
-        self,
-        q_predict: torch.Tensor,
-        q_target: torch.Tensor,
-        rewards: torch.Tensor,
-        valid: torch.Tensor,
-        next_log_prob: torch.Tensor,
-    ) -> torch.Tensor:
-        """Calculate critic loss using the SAC loss function.
-
-        Args:
-            q_predict: Tensor of shape (B, critic_num) representing predicted Q-values.
-            q_target: Tensor of shape (B,) representing target Q-values.
-            rewards: Tensor of shape (B,) representing rewards.
-            valid: Tensor of shape (B,) indicating valid samples (1 for valid, 0 for invalid).
-            next_log_prob: Tensor of shape (B,) representing log probabilities of next actions.
-
-        Returns:
-            Tensor of shape (1,) representing the critic loss.
-        """
-
-        gamma = self.sac_config.gamma
+    def _calculate_critic_loss(self, q_predict, q_target, rewards, valid, next_log_prob):
+        # rewards: (B,n) 或 (B,)
+        gamma = float(self.sac_config.gamma)   # 这里把 sac.gamma 定义为“micro-step gamma”
         alpha = self._get_alpha()
 
-        with torch.no_grad():
-            y = rewards + valid * gamma * (q_target - alpha * next_log_prob)
+        if rewards.ndim == 2:
+            n = rewards.size(1)
+            discounts = (gamma ** torch.arange(n, device=rewards.device, dtype=rewards.dtype))[None, :]  # (1,n)
+            R = (rewards * discounts).sum(dim=-1)  # (B,)
+            gamma_eff = gamma ** n
+        else:
+            R = rewards
+            gamma_eff = gamma
 
-        y = y.unsqueeze(1).expand_as(q_predict)  # (B, critic_num)
+        with torch.no_grad():
+            y = R + valid * gamma_eff * (q_target - alpha * next_log_prob)
+
+        y = y.unsqueeze(1).expand_as(q_predict)
         valid_mask = valid.unsqueeze(1)
         mse = F.mse_loss(q_predict, y, reduction="none")
         per_critic = (mse * valid_mask).sum(dim=0) / valid_mask.sum().clamp_min(1.0)
         critic_loss = per_critic.sum()
+
         return critic_loss
+
 
     def _forward_critic(self, micro_batch: TensorDict) -> torch.Tensor:
         s0 = get_dict_from_prefix(micro_batch, "s0.")
@@ -270,7 +262,8 @@ class PI0RobDataParallelPPOActor(BaseSACActor):
                 critic_loss = self._calculate_critic_loss(
                     q_predict=q_values_0,
                     q_target=q_values_1,
-                    rewards=micro_batch["rewards"].max(dim=-1).values,
+                    # rewards=micro_batch["rewards"].max(dim=-1).values,
+                    rewards=micro_batch["rewards"],#yag
                     valid=micro_batch["valid"],
                     next_log_prob=log_probs_1
                 )
