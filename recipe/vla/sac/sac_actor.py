@@ -325,7 +325,7 @@ class PI0RobDataParallelPPOActor(BaseSACActor):
             raw_critic_loss = self._forward_critic(micro_batch)
             (raw_critic_loss / grad_accum_steps).backward()
             critic_loss_list.append(raw_critic_loss.detach().item())
-        critic_grad_norm = self._optimizer_step(self.actor_optimizer)
+        critic_grad_norm = self._optimizer_step()
 
         if global_steps >= self.config.critic_warmup_steps:
             # Training actor
@@ -338,7 +338,7 @@ class PI0RobDataParallelPPOActor(BaseSACActor):
                 (raw_actor_loss / grad_accum_steps).backward()
                 actor_loss_list.append(raw_actor_loss.detach().item())
                 actor_logprobs_list.append(log_probs.detach())
-            actor_grad_norm = self._optimizer_step(self.actor_optimizer)
+            actor_grad_norm = self._optimizer_step()
 
             # Training alpha
             # NOTE: We reuse the log-probabilities computed during the actor forward pass
@@ -352,9 +352,9 @@ class PI0RobDataParallelPPOActor(BaseSACActor):
                     (raw_alpha_loss / grad_accum_steps).backward()
                     alpha_loss_list.append(raw_alpha_loss.detach().item())
                 torch.distributed.all_reduce(
-                    self.raw_alpha.grad, op=torch.distributed.ReduceOp.AVG
+                    self.raw_alpha.grad, op=torch.distributed.ReduceOp.SUM
                 )
-                alpha_grad_norm = self._optimizer_step(self.alpha_optimizer)
+                alpha_grad_norm = torch.nn.utils.clip_grad_norm_(self.raw_alpha, max_norm=self.config.grad_clip)
                 self.alpha_scheduler.step()
 
         # Update target networks
@@ -366,9 +366,8 @@ class PI0RobDataParallelPPOActor(BaseSACActor):
 
         # Log metrics
         metrics = {
-            "reward/mean": batch["rewards"].mean().item(),
-            "reward/std": batch["rewards"].std().item(),
-            "valid_ratio": batch["valid"].float().mean().item(),
+            "data/reward_mean": batch["rewards"].mean().item(),
+            "data/valid_ratio": batch["valid"].float().mean().item(),
 
             "sac/alpha": self._get_alpha().detach().item(),
             "sac/alpha_lr": self.alpha_optimizer.param_groups[0]['lr'] if self.auto_entropy else 0.0,
@@ -408,12 +407,12 @@ class PI0RobDataParallelPPOActor(BaseSACActor):
         batch = DataProto.from_single_dict(batch)
         return batch.to("cpu")
 
-    def _optimizer_step(self, optimizer: torch.optim.Optimizer) -> torch.Tensor:
+    def _optimizer_step(self) -> torch.Tensor:
         assert self.config.grad_clip is not None
 
         if isinstance(self.actor_module, FSDP):
             grad_norm = self.actor_module.clip_grad_norm_(max_norm=self.config.grad_clip)
         else:
             grad_norm = torch.nn.utils.clip_grad_norm_(self.actor_module.parameters(), max_norm=self.config.grad_clip)
-        optimizer.step()
+        self.actor_optimizer.step()
         return grad_norm

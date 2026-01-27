@@ -58,8 +58,8 @@ class PI0ForActionPrediction(PreTrainedModel, SupportSACTraining):
 
             self.critic_heads = nn.ModuleList([
                 MLP(
-                    input_dim=3680,  # 2048(prefix mean) + 32(state) + 50*32(action flat)
-                    hidden_dims=[256, 256, 256],
+                    input_dim=2150,  # 2048(prefix mean) + 32(state) + 10*7(action flat)
+                    hidden_dims=[1024, 512, 256],
                     output_dim=1,
                     activation='relu',
                     init_method='kaiming'
@@ -69,8 +69,8 @@ class PI0ForActionPrediction(PreTrainedModel, SupportSACTraining):
 
             self.target_network_heads = nn.ModuleList([
                 MLP(
-                    input_dim=3680,
-                    hidden_dims=[256, 256, 256],
+                    input_dim=2150,
+                    hidden_dims=[1024, 512, 256],
                     output_dim=1,
                     activation='relu',
                     init_method='kaiming'
@@ -503,8 +503,9 @@ class PI0ForActionPrediction(PreTrainedModel, SupportSACTraining):
         prefix_embs, _, _ = prefix_features
         mean_prefix_embs = prefix_embs.mean(dim=1, keepdim=False)                        # (B, 2048)
         actions = self.action_normalize_transform(a["full_action"])                      # (B, 50, 32)
-        flattened_actions = actions.view(actions.size(0), -1)                            # (B, 50*32)
-        critic_input = torch.cat([mean_prefix_embs, states, flattened_actions], dim=-1)  # (B, 3680)
+        actions = actions[:, :10, :7]                                                    # (B, 10, 7)
+        flattened_actions = actions.reshape(actions.shape[0], -1)                        # (B, 70)
+        critic_input = torch.cat([mean_prefix_embs, states, flattened_actions], dim=-1)  # (B, 2150)
 
         q_values = self._multi_heads_value(critic_head, critic_input, method=method)
 

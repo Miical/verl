@@ -47,7 +47,7 @@ actor_rollout_ref:
     sac:
       gamma: 0.96
       tau: 0.005
-      initial_alpha: 0.2
+      initial_alpha: 0.01
       auto_entropy: true
       alpha_type: softplus
       alpha_lr: 0.0003

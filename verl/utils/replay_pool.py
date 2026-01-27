@@ -83,9 +83,8 @@ class SACReplayPool:
     def save(self, directory: str):
         """Save the replay pool to a directory."""
 
-        if not os.path.exists(directory):
-            os.makedirs(directory)
-
+        os.makedirs(directory, exist_ok=True)
+            
         filepath = f"{directory}/sac_replay_pool_rank_{self.rank}.pt"
         if self.pool is not None:
             meta_info = {
