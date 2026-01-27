@@ -126,21 +126,6 @@ class PI0ForActionPrediction(PreTrainedModel, SupportSACTraining):
             timestep,
         )
 
-    def dummy_forward(self) -> None:
-        """Run a dummy forward pass to initialize fsdp sharding."""
-
-        device = get_device_name()
-        with torch.no_grad(), torch.autocast(device_type=device, dtype=torch.bfloat16):
-            _ = self(
-                images=[torch.zeros((1, 3, 224, 224), device=device, dtype=torch.float32)],
-                img_masks=[torch.ones((1,), device=device, dtype=torch.bool)],
-                lang_tokens=torch.zeros((1, 1), device=device, dtype=torch.long),
-                lang_masks=torch.ones((1, 1), device=device, dtype=torch.bool),
-                state=torch.zeros((1, 32), device=device, dtype=torch.float32),
-                x_t=self.model.sample_noise((1, 50, 32), device=device),
-                timestep=torch.full((1,), 0.5, device=device, dtype=torch.float32),
-            )
-
     @torch.no_grad()
     def sample_actions(
         self,

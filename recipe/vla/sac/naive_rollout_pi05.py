@@ -238,7 +238,8 @@ class PI0RolloutRob(NaiveRolloutRob):
         self.module = module
         self.tokenizer = tokenizer
 
-        self.module.dummy_forward()
+        from torch.distributed.fsdp import register_fsdp_forward_method
+        register_fsdp_forward_method(self.module, "sample_actions")
 
     @torch.no_grad()
     def generate_sequences(self, prompts: DataProto) -> DataProto:
