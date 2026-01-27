@@ -244,56 +244,23 @@ class PI0RolloutRob(NaiveRolloutRob):
     def generate_sequences(self, prompts: DataProto) -> DataProto:
         """Generate sequences """
 
-        images = prompts.batch["full_image"]
-        wrist_images = prompts.batch["wrist_image"]
-        state = prompts.batch["state"]
-        task_descriptions = prompts.non_tensor_batch["task_descriptions"]
-
         timing_generate = {}
         with simple_timer("rollout generate_sequences", timing_generate):
             with torch.autocast(device_type=get_device_name(), dtype=torch.bfloat16):
-                batch_size = images.shape[0]
-                cam_high = images.permute(0, 3, 1, 2).to(prompts.batch.device)
-                left_wrist = wrist_images.permute(0, 3, 1, 2).to(prompts.batch.device)
-                zeros = torch.zeros(
-                    (batch_size, 3, cam_high.shape[2], cam_high.shape[3]),
-                    device=prompts.batch.device,
-                    dtype=torch.uint8,
-                )
-                (
-                    action,
-                    images_out,
-                    img_masks,
-                    lang_tokens,
-                    lang_masks,
-                    state_out,
-                ) = self.module.sample_actions(
-                    images={
-                        "observation.images.cam_high": cam_high,
-                        "observation.images.cam_left_wrist": left_wrist,
-                        "observation.images.cam_right_wrist": zeros,
-                    },
-                    img_masks=[torch.ones((batch_size,), device=prompts.batch.device, dtype=torch.bool),
-                               torch.ones((batch_size,), device=prompts.batch.device, dtype=torch.bool),
-                               torch.zeros((batch_size,), device=prompts.batch.device, dtype=torch.bool)],
-                    task=task_descriptions.tolist() if hasattr(task_descriptions, "tolist") else list(task_descriptions),
-                    state=torch.nn.functional.pad(
-                        state, (0, max(0, 32 - state.shape[-1])), "constant", 0,
-                    ).to(prompts.batch.device, dtype=torch.float32),
-                    tokenizer=self.tokenizer,
-                )
+                prompts.to(get_device_id())
+                output, s, a = self.module.sample_actions(prompts, tokenizer=self.tokenizer)
 
         print("rollout generate_sequences time (s): %s" % timing_generate.get("rollout generate_sequences", 0.0))
 
         ret = DataProto.from_dict(
             {
-                "action": action[:, :10, :7],
-                "full_action": action,
-                "images": torch.stack(images_out, dim=1),
-                "image_masks": torch.stack(img_masks, dim=1),
-                "lang_tokens": lang_tokens,
-                "lang_masks": lang_masks,
-                "states": state_out,
+                "action": output.action,
+                "full_action": a["full_action"],
+                "images": s["images"],
+                "image_masks": s["image_masks"],
+                "lang_tokens": s["lang_tokens"],
+                "lang_masks": s["lang_masks"],
+                "states": s["states"],
             }
         )
 

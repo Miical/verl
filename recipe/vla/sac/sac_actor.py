@@ -389,24 +389,6 @@ class PI0RobDataParallelPPOActor(BaseSACActor):
 
         return metrics
 
-    def process_dataset_batch(self, batch: DataProto) -> DataProto:
-        """Process dataset batch for SAC training.
-
-        Args:
-            batch: DataProto containing the dataset batch.
-        """
-
-        batch = batch.to(self.device)
-
-        batch = self.actor_module.process_dataset_batch(
-            batch = batch.batch,
-            non_tensor_batch = batch.non_tensor_batch,
-            tokenizer = self.tokenizer
-        )
-
-        batch = DataProto.from_single_dict(batch)
-        return batch.to("cpu")
-
     def _optimizer_step(self) -> torch.Tensor:
         assert self.config.grad_clip is not None
 

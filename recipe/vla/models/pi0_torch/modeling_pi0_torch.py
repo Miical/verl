@@ -12,6 +12,7 @@ from torch.distributed.fsdp import register_fsdp_forward_method
 from tensordict import TensorDict
 from transformers import PreTrainedModel
 from verl.utils.device import get_device_name
+from verl.protocol import DataProto
 
 from .configuration_pi0_torch import PI0TorchConfig
 from .model.modeling_pi0 import PI0Model, make_att_2d_masks
@@ -21,8 +22,10 @@ from .pi0_utils import (
     PromptTokenizerTransform,
     Unnormalize,
 )
+from .policy.base import Pi0Input, Pi0Output
 from ..modules.mlp import MLP
 from ...sac.base import SupportSACTraining
+
 
 class PI0ForActionPrediction(PreTrainedModel, SupportSACTraining):
     config_class = PI0TorchConfig
@@ -141,41 +144,51 @@ class PI0ForActionPrediction(PreTrainedModel, SupportSACTraining):
     @torch.no_grad()
     def sample_actions(
         self,
-        images: dict[str, torch.Tensor],
-        img_masks: list[torch.Tensor],
-        task: list[str],
-        state: torch.Tensor,
+        env_obs: DataProto,
         tokenizer,
-    ) -> torch.Tensor:
+    ) -> tuple[Pi0Output, dict, dict]:
         """Run one forward pass from raw inputs to final action sequence.
 
         Args:
-            images: Observation images of the robot. Each value is a tensor with shape (B,C,H,W).
-            img_masks: A list of image masks corresponding to the images dict, each with shape (B,).
-            task: A list of natural language task descriptions.
-            state: The robot joint state tensor with shape (B, state_dim).
+            env_obs: The environment observations as DataProto.
             tokenizer: The tokenizer used for prompt tokenization.
 
         Returns:
-            A tensor of predicted actions with shape (batch, num_steps, original_action_dim) on the original input device.
         """
 
+        from .policy.libero_policy import LiberoPi0Input
+        pi0_input = LiberoPi0Input.from_env_obs(env_obs)
+
         # Input transforms
-        state = self.state_normalize_transform(state)
-        images, _ = self.image_transform.call_batch(images)
+        state = self.state_normalize_transform(pi0_input.state)
+        images, _ = self.image_transform.call_batch(pi0_input.images)
         lang_tokens, lang_masks = self.prompt_tokenizer_transform.call_batch(
-            { 'task': task, 'observation.state': state },
+            { 'task': pi0_input.task, 'observation.state': state },
             tokenizer
         )
 
         # Inference
-        pred_action = self.model.sample_actions(images, img_masks, lang_tokens, lang_masks, state=state)
+        pred_action = self.model.sample_actions(images, pi0_input.img_masks, lang_tokens, lang_masks, state=state)
 
         # Output transforms
         # state = self.state_unnormalize_transform(state)
         pred_action = self.action_unnormalize_transform(pred_action)
 
-        return pred_action, images, img_masks, lang_tokens, lang_masks, state
+
+        from .policy.libero_policy import LiberoPi0Output
+        pi0_output = LiberoPi0Output.from_model_output({'full_action': pred_action})
+        s = {
+            'states': state,
+            'images': torch.stack(images, dim=1),
+            'image_masks': torch.stack(pi0_input.img_masks, dim=1),
+            'lang_tokens': lang_tokens,
+            'lang_masks': lang_masks,
+        }
+        a = {
+            'full_action': pred_action,
+        }
+
+        return pi0_output, s, a
 
     @classmethod
     def from_pretrained(cls, pretrained_model_name_or_path, *model_args, **kwargs):
