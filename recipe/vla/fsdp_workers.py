@@ -203,8 +203,7 @@ class RobActorRolloutRefWorker(ActorRolloutRefWorker):
         batch = batch.to(get_device_id())
 
         batch = self.actor_module_fsdp.process_dataset_batch(
-            batch = batch.batch,
-            non_tensor_batch = batch.non_tensor_batch,
+            dataset_batch = batch,
             tokenizer = self.tokenizer
         )
 
