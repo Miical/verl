@@ -22,7 +22,7 @@ from .pi0_utils import (
     PromptTokenizerTransform,
     Unnormalize,
 )
-from .datasets.lerobot import LeRobotPi0DatasetInput
+from .datasets.lerobot_dataset import LeRobotPi0DatasetInput
 from .policy.base import Pi0Input, Pi0Output
 from ..modules.mlp import MLP
 from ...sac.base import SupportSACTraining
@@ -295,31 +295,21 @@ class PI0ForActionPrediction(PreTrainedModel, SupportSACTraining):
         self,
         s: dict[str, torch.Tensor],
         prefix_features: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
-        mode: Literal["train", "eval"] = "train",
         *,
-        # 推荐 SAC 用：直接传入“同一次采样的最后一步 transition”
         x_t: torch.Tensor | None = None,     # (B, T, A)
         x_next: torch.Tensor | None = None,  # (B, T, A)
         v_t: torch.Tensor | None = None,     # (B, T, A)
         t: torch.Tensor | None = None,       # (B,)
         step_idx: torch.Tensor | None = None # (B,)
     ) -> torch.Tensor:
-        """
-        Approx log π via one-step Gaussian approximation.
 
-        - SAC 正确用法：传入同一次采样里最后一步 (x_{K-1}, x_K, v_{K-1}, t_{K-1})
-          这样 logπ 至少和最终 action 对齐。
-        - 如果没传 transition，则会 fallback 自己采样一遍（不推荐用于 SAC 训练）。
-        """
-        assert self.model is not None
-        prefix_embs, prefix_pad_masks, prefix_att_masks = prefix_features
+        prefix_embs, prefix_pad_masks, _  = prefix_features
         states = s["states"]
         B = prefix_embs.shape[0]
         device = prefix_embs.device
 
         past_key_values = self._build_kv_cache_from_prefix(prefix_features)
 
-        # fallback：没给 transition 就自己跑一遍，并用最后一步
         if x_t is None or x_next is None or v_t is None or t is None:
             actions_shape = (B, self.model.n_action_steps, self.model.max_action_dim)
             x = self.model.sample_noise(actions_shape, device=device)
@@ -345,13 +335,10 @@ class PI0ForActionPrediction(PreTrainedModel, SupportSACTraining):
             v_t = v_prev
             t = t_prev.expand(B)
 
-        # sigma schedule step index：默认用最后一步 K-1
+        # sigma schedule step index
         K = int(self.model.num_steps)
         if step_idx is None:
             step_idx = torch.full((B,), K - 1, device=device, dtype=torch.long)
-            if mode == "eval":
-                # eval 下也用最后一步；你想固定 0 也可以
-                pass
 
         # one-step mean/std
         dt_pos = 1.0 / float(K)
