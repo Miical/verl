@@ -13,8 +13,10 @@
 # limitations under the License.
 
 import os
+
 import torch
 from tensordict import TensorDict
+
 
 class SACReplayPool:
     """SAC Replay Pool for storing samples."""
@@ -33,7 +35,6 @@ class SACReplayPool:
 
         self.pool_device = pool_device
         self.sample_device = sample_device
-
 
     def add_batch(self, batch: TensorDict):
         """Add a batch of samples to the replay pool.
@@ -62,19 +63,16 @@ class SACReplayPool:
 
         idx = torch.randperm(self.size)[:batch_size]
         sampled_batch = TensorDict(
-            {
-                key: value.index_select(0, idx).to(self.sample_device)
-                for key, value in self.pool.items()
-            },
+            {key: value.index_select(0, idx).to(self.sample_device) for key, value in self.pool.items()},
             batch_size=[batch_size],
-            device=self.sample_device
+            device=self.sample_device,
         )
         return sampled_batch
 
     def insert_and_resample(
-            self,
-            source: TensorDict,
-        ) -> TensorDict:
+        self,
+        source: TensorDict,
+    ) -> TensorDict:
         """Insert a block of data from source to the replay pool and sample a batch with the same size."""
 
         self.add_batch(source)
@@ -84,7 +82,7 @@ class SACReplayPool:
         """Save the replay pool to a directory."""
 
         os.makedirs(directory, exist_ok=True)
-            
+
         filepath = f"{directory}/sac_replay_pool_rank_{self.rank}.pt"
         if self.pool is not None:
             meta_info = {
@@ -123,12 +121,9 @@ class SACReplayPool:
                     f"the current capacity {self.capacity}. Truncating the loaded pool."
                 )
                 self.pool = TensorDict(
-                    {
-                        key: value[:self.capacity]
-                        for key, value in pool.items()
-                    },
+                    {key: value[: self.capacity] for key, value in pool.items()},
                     batch_size=[self.capacity],
-                    device=self.pool_device
+                    device=self.pool_device,
                 )
                 self.size = min(self.size, self.capacity)
                 self.position = self.position % self.capacity
@@ -141,12 +136,20 @@ class SACReplayPool:
                 self.pool = TensorDict(
                     {
                         key: torch.cat(
-                            [value, torch.zeros((self.capacity - meta_info['capacity'], *value.shape[1:]),
-                                                 dtype=value.dtype, device=self.pool_device)], dim=0)
+                            [
+                                value,
+                                torch.zeros(
+                                    (self.capacity - meta_info["capacity"], *value.shape[1:]),
+                                    dtype=value.dtype,
+                                    device=self.pool_device,
+                                ),
+                            ],
+                            dim=0,
+                        )
                         for key, value in pool.items()
                     },
                     batch_size=[self.capacity],
-                    device=self.pool_device
+                    device=self.pool_device,
                 )
 
         self.size = min(meta_info["size"], self.capacity)
@@ -185,9 +188,9 @@ class SACReplayPool:
         return replay_pool
 
     def _insert_block_to_pool(
-            self,
-            source: TensorDict,
-        ):
+        self,
+        source: TensorDict,
+    ):
         """insert a block of data from source to the replay pool."""
 
         length = min(source.size(0), self.capacity)
@@ -197,7 +200,6 @@ class SACReplayPool:
 
         self.position = (self.position + length) % self.capacity
         self.size = min(self.size + length, self.capacity)
-
 
     def _lazy_init_pool(self, sample: TensorDict):
         """Lazily initialize the replay pool based on the sample structure."""
@@ -210,13 +212,14 @@ class SACReplayPool:
                 for key, value in sample.items()
             },
             batch_size=[self.capacity],
-            device=self.pool_device
+            device=self.pool_device,
         )
 
     def __repr__(self):
-        return f"SACReplayPool(capacity={self.capacity}, " \
-               f"size={self.size}, pool_device={self.pool_device}, sample_device={self.sample_device})"
-
+        return (
+            f"SACReplayPool(capacity={self.capacity}, "
+            f"size={self.size}, pool_device={self.pool_device}, sample_device={self.sample_device})"
+        )
 
     def __len__(self):
         return self.size

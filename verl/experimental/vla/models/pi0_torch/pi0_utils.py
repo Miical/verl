@@ -1,9 +1,22 @@
+# Copyright 2025 Bytedance Ltd. and/or its affiliates
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 from typing import Any
 
 import torch
 import torch.nn.functional as F
 from torchvision import transforms
-from transformers import AutoTokenizer
 
 
 class Normalize:
@@ -19,20 +32,20 @@ class Normalize:
         self.stats = stats
         self.use_quantiles = use_quantiles
 
-        required_attrs = ['mean', 'std']
+        required_attrs = ["mean", "std"]
         if self.use_quantiles:
-            required_attrs = ['q01', 'q99']
+            required_attrs = ["q01", "q99"]
 
         for attr in required_attrs:
             if attr not in stats:
-                raise AttributeError(f'stats object is missing the following attribute: {attr}')
+                raise AttributeError(f"stats object is missing the following attribute: {attr}")
 
         if self.use_quantiles:
-            self.q01 = torch.tensor(stats['q01'], dtype=torch.float32)
-            self.q99 = torch.tensor(stats['q99'], dtype=torch.float32)
+            self.q01 = torch.tensor(stats["q01"], dtype=torch.float32)
+            self.q99 = torch.tensor(stats["q99"], dtype=torch.float32)
         else:
-            self.mean = torch.tensor(stats['mean'], dtype=torch.float32)
-            self.std = torch.tensor(stats['std'], dtype=torch.float32)
+            self.mean = torch.tensor(stats["mean"], dtype=torch.float32)
+            self.std = torch.tensor(stats["std"], dtype=torch.float32)
 
     def to(self, device: torch.device | str) -> None:
         if self.use_quantiles:
@@ -45,7 +58,9 @@ class Normalize:
     def __call__(self, x: torch.Tensor) -> torch.Tensor:
         x_dim = x.shape[-1]
         if self.use_quantiles:
-            return (x - self.q01[..., :x_dim]) / (self.q99[..., :x_dim] - self.q01[..., :x_dim] + self.EPSILON) * 2.0 - 1.0
+            return (x - self.q01[..., :x_dim]) / (
+                self.q99[..., :x_dim] - self.q01[..., :x_dim] + self.EPSILON
+            ) * 2.0 - 1.0
         else:
             return (x - self.mean[..., :x_dim]) / (self.std[..., :x_dim] + self.EPSILON)
 
@@ -57,11 +72,11 @@ class Unnormalize:
         self.use_quantiles = use_quantiles
 
         if self.use_quantiles:
-            self.q01 = torch.tensor(stats['q01'], dtype=torch.float32)
-            self.q99 = torch.tensor(stats['q99'], dtype=torch.float32)
+            self.q01 = torch.tensor(stats["q01"], dtype=torch.float32)
+            self.q99 = torch.tensor(stats["q99"], dtype=torch.float32)
         else:
-            self.mean = torch.tensor(stats['mean'], dtype=torch.float32)
-            self.std = torch.tensor(stats['std'], dtype=torch.float32)
+            self.mean = torch.tensor(stats["mean"], dtype=torch.float32)
+            self.std = torch.tensor(stats["std"], dtype=torch.float32)
 
     def to(self, device: torch.device | str) -> None:
         if self.use_quantiles:
@@ -74,7 +89,9 @@ class Unnormalize:
     def __call__(self, x: torch.Tensor) -> torch.Tensor:
         x_dim = x.shape[-1]
         if self.use_quantiles:
-            return (x + 1.0) / 2.0 * (self.q99[..., :x_dim] - self.q01[..., :x_dim] + self.EPSILON) + self.q01[..., :x_dim]
+            return (x + 1.0) / 2.0 * (self.q99[..., :x_dim] - self.q01[..., :x_dim] + self.EPSILON) + self.q01[
+                ..., :x_dim
+            ]
         else:
             return x * (self.std[..., :x_dim] + self.EPSILON) + self.mean[..., :x_dim]
 
@@ -90,12 +107,14 @@ class DeltaActions:
         self.mask = self.mask.to(device)
 
     def __call__(self, data: dict[str, Any]) -> dict[str, Any]:
-        if 'action' not in data or 'observation.state' not in data:
+        if "action" not in data or "observation.state" not in data:
             return data
-        state, action = data['observation.state'], data['action']
+        state, action = data["observation.state"], data["action"]
         dims = self.mask.shape[-1]
-        action[..., :dims] -= torch.where(self.mask, state[..., :dims], torch.zeros_like(state[..., :dims])).unsqueeze(-2)
-        data['action'] = action
+        action[..., :dims] -= torch.where(self.mask, state[..., :dims], torch.zeros_like(state[..., :dims])).unsqueeze(
+            -2
+        )
+        data["action"] = action
         return data
 
 
@@ -110,12 +129,14 @@ class AbsoluteActions:
         self.mask = self.mask.to(device)
 
     def __call__(self, data: dict[str, Any]) -> dict[str, Any]:
-        if 'action' not in data or 'observation.state' not in data:
+        if "action" not in data or "observation.state" not in data:
             return data
-        state, action = data['observation.state'], data['action']
+        state, action = data["observation.state"], data["action"]
         dims = self.mask.shape[-1]
-        action[..., :dims] += torch.where(self.mask, state[..., :dims], torch.zeros_like(state[..., :dims])).unsqueeze(-2)
-        data['action'] = action
+        action[..., :dims] += torch.where(self.mask, state[..., :dims], torch.zeros_like(state[..., :dims])).unsqueeze(
+            -2
+        )
+        data["action"] = action
         return data
 
 
@@ -179,13 +200,13 @@ class AlohaInputs:
     def __call__(self, data: dict[str, Any]) -> dict[str, Any]:
         """Decode Aloha-specific input formats into the pi0 training/runtime
         format."""
-        state = self._decode_aloha(data['observation.state'])
-        data['observation.state'] = state
+        state = self._decode_aloha(data["observation.state"])
+        data["observation.state"] = state
         # Actions are only available during training.
-        if 'action' in data:
-            actions = data['action']
+        if "action" in data:
+            actions = data["action"]
             actions = self._encode_actions_inv(actions)
-            data['action'] = actions
+            data["action"] = actions
         return data
 
     # VeRL: Batch Inference
@@ -203,12 +224,12 @@ class AlohaInputs:
         return state
 
     def call_batch(self, data: dict[str, Any]) -> dict[str, Any]:
-        state = self._decode_state_batch(data['observation.state'])
-        data['observation.state'] = state
-        if 'action' in data:
-            actions = data['action']
+        state = self._decode_state_batch(data["observation.state"])
+        data["observation.state"] = state
+        if "action" in data:
+            actions = data["action"]
             actions = self._encode_actions_inv_batch(actions)
-            data['action'] = actions
+            data["action"] = actions
         return data
 
 
@@ -218,7 +239,8 @@ class AlohaOutputs:
     def __init__(self, original_action_dim: int, adapt_to_pi: bool = True):
         """
         Args:
-            original_action_dim: int. The original action dimension of the policy. dual-arm robot has 14 dims and mobile dual-arm robot has 16 dims.
+            original_action_dim: int. The original action dimension of the policy. dual-arm robot has 14 dims and mobile
+                                      dual-arm robot has 16 dims.
             adapt_to_pi: bool. If true, this will convert the joint and gripper values from the standard Aloha space to
             the space used by the pi internal runtime which was used to train the base model.
         """
@@ -249,8 +271,8 @@ class AlohaOutputs:
         return actions
 
     def __call__(self, data: dict[str, Any]) -> dict[str, Any]:
-        actions = data['action'][:, : self.original_action_dim]
-        return {'action': self._encode_actions(actions)}
+        actions = data["action"][:, : self.original_action_dim]
+        return {"action": self._encode_actions(actions)}
 
     # VeRL: Batch Inference
 
@@ -261,8 +283,8 @@ class AlohaOutputs:
         return actions
 
     def call_batch(self, data: dict[str, Any]) -> dict[str, Any]:
-        actions = data['action'][..., : self.original_action_dim]
-        return {'action': self._encode_actions_batch(actions)}
+        actions = data["action"][..., : self.original_action_dim]
+        return {"action": self._encode_actions_batch(actions)}
 
 
 class PadStatesAndActions:
@@ -284,9 +306,9 @@ class PadStatesAndActions:
         return x
 
     def __call__(self, data: dict[str, Any]) -> dict[str, Any]:
-        data['observation.state'] = self._pad_to_dim(data['observation.state'], self.action_dim, axis=-1)
-        if 'action' in data:
-            data['action'] = self._pad_to_dim(data['action'], self.action_dim, axis=-1)
+        data["observation.state"] = self._pad_to_dim(data["observation.state"], self.action_dim, axis=-1)
+        if "action" in data:
+            data["action"] = self._pad_to_dim(data["action"], self.action_dim, axis=-1)
         return data
 
 
@@ -314,14 +336,16 @@ def resize_with_pad(img: torch.Tensor, width: int, height: int, pad_value: float
     """
     # Validate input dimensions
     if img.ndim != 3:
-        raise ValueError(f'(C,H,W) expected, but got {img.shape}')
+        raise ValueError(f"(C,H,W) expected, but got {img.shape}")
 
     cur_height, cur_width = img.shape[1:]
 
     ratio = max(cur_width / width, cur_height / height)
     resized_height = int(cur_height / ratio)
     resized_width = int(cur_width / ratio)
-    resized_img = F.interpolate(img.unsqueeze(0), size=(resized_height, resized_width), mode='bilinear', align_corners=False).squeeze(0)
+    resized_img = F.interpolate(
+        img.unsqueeze(0), size=(resized_height, resized_width), mode="bilinear", align_corners=False
+    ).squeeze(0)
 
     pad_height = max(0, int(height - resized_height))
     pad_width = max(0, int(width - resized_width))
@@ -336,14 +360,19 @@ def resize_with_pad(img: torch.Tensor, width: int, height: int, pad_value: float
 
 
 class ImageTransform:
-    def __init__(self, resize_imgs_with_padding: tuple[int, int], present_img_keys: list[str] | None = None, enable_image_aug: bool = False) -> None:
+    def __init__(
+        self,
+        resize_imgs_with_padding: tuple[int, int],
+        present_img_keys: list[str] | None = None,
+        enable_image_aug: bool = False,
+    ) -> None:
         self.resize_imgs_with_padding = resize_imgs_with_padding
         self.present_img_keys = present_img_keys
         if self.present_img_keys is None:
             self.present_img_keys = [
-                'observation.images.cam_high',
-                'observation.images.cam_left_wrist',
-                'observation.images.cam_right_wrist',
+                "observation.images.cam_high",
+                "observation.images.cam_left_wrist",
+                "observation.images.cam_right_wrist",
             ]
         self.enable_image_aug = enable_image_aug
         self.width, self.height = resize_imgs_with_padding
@@ -374,7 +403,9 @@ class ImageTransform:
 
         for key in self.present_img_keys:
             if key not in data:
-                raise ValueError(f'{key} not found in data. Please check the present_img_keys in the config or the dataset.')
+                raise ValueError(
+                    f"{key} not found in data. Please check the present_img_keys in the config or the dataset."
+                )
 
             img = data[key]
             # [C, H, W] -> preprocess
@@ -385,7 +416,7 @@ class ImageTransform:
                     img = resize_with_pad(img, *self.resize_imgs_with_padding, pad_value=0)
 
             if self.enable_image_aug:
-                if 'wrist' not in key:
+                if "wrist" not in key:
                     img = self.pose_transform(img)
                 img = self.color_jitter_transform(img)
 
@@ -405,11 +436,13 @@ class ImageTransform:
 
         for key in self.present_img_keys:
             if key not in data:
-                raise ValueError(f'{key} not found in data. Please check the present_img_keys in the config or the dataset.')
+                raise ValueError(
+                    f"{key} not found in data. Please check the present_img_keys in the config or the dataset."
+                )
 
             img = data[key]
             if img.ndim != 4:
-                raise ValueError(f'(B,C,H,W) expected, but got {img.shape}')
+                raise ValueError(f"(B,C,H,W) expected, but got {img.shape}")
 
             if self.resize_imgs_with_padding is not None:
                 original_height, original_width = img.shape[2:]
@@ -418,7 +451,7 @@ class ImageTransform:
                     ratio = max(original_width / target_width, original_height / target_height)
                     resized_height = int(original_height / ratio)
                     resized_width = int(original_width / ratio)
-                    img = F.interpolate(img, size=(resized_height, resized_width), mode='bilinear', align_corners=False)
+                    img = F.interpolate(img, size=(resized_height, resized_width), mode="bilinear", align_corners=False)
                     pad_height = max(0, int(target_height - resized_height))
                     pad_width = max(0, int(target_width - resized_width))
                     pad_top = pad_height // 2
@@ -430,13 +463,13 @@ class ImageTransform:
             if self.enable_image_aug:
                 imgs = []
                 for sample in img:
-                    if 'wrist' not in key:
+                    if "wrist" not in key:
                         sample = self.pose_transform(sample)
                     sample = self.color_jitter_transform(sample)
                     imgs.append(sample)
                 img = torch.stack(imgs, dim=0)
 
-            img = img / 255.0 * 2.0 - 1.0 # pi05 libero
+            img = img / 255.0 * 2.0 - 1.0  # pi05 libero
             images.append(img)
             img_masks.append(torch.ones((img.shape[0],), dtype=torch.bool, device=img.device))
 
@@ -458,66 +491,66 @@ class PromptTokenizerTransform:
         Returns:
             A tuple of (lang_tokens, lang_masks), both as torch tensors on the inferred device.
         """
-        task = data['task'].strip().replace('_', ' ').replace('\n', ' ')
+        task = data["task"].strip().replace("_", " ").replace("\n", " ")
 
         # Infer device from observation.state if available
-        device = data['observation.state'].device if 'observation.state' in data else torch.device('cpu')
+        device = data["observation.state"].device if "observation.state" in data else torch.device("cpu")
 
         if self.discrete_state_input:
-            assert 'observation.state' in data, 'discrete_state_input is True, but observation.state is not found.'
-            discretized_state = torch.bucketize(data['observation.state'], torch.linspace(-1, 1, 256 + 1, device=device)[:-1]) - 1
-            state_values = ' '.join([str(int(x)) for x in discretized_state.tolist()])
-            task = f'Task: {task}, State: {state_values};\nAction: '
+            assert "observation.state" in data, "discrete_state_input is True, but observation.state is not found."
+            discretized_state = (
+                torch.bucketize(data["observation.state"], torch.linspace(-1, 1, 256 + 1, device=device)[:-1]) - 1
+            )
+            state_values = " ".join([str(int(x)) for x in discretized_state.tolist()])
+            task = f"Task: {task}, State: {state_values};\nAction: "
         else:
             # PaliGemma prompt has to end with a new line in Pi0
-            task = f'{task}\n'
+            task = f"{task}\n"
 
         tokenized_prompt = tokenizer(
             task,
-            padding='max_length',
-            padding_side='right',
+            padding="max_length",
+            padding_side="right",
             max_length=self.tokenizer_max_length,
-            return_tensors='pt',
+            return_tensors="pt",
         )
-        lang_tokens = tokenized_prompt['input_ids'][0].to(dtype=torch.int32, device=device)
-        lang_masks = tokenized_prompt['attention_mask'][0].to(dtype=torch.bool, device=device)
+        lang_tokens = tokenized_prompt["input_ids"][0].to(dtype=torch.int32, device=device)
+        lang_masks = tokenized_prompt["attention_mask"][0].to(dtype=torch.bool, device=device)
 
         return lang_tokens, lang_masks
 
     # VeRL: Batch Inference
 
     def call_batch(self, data: dict[str, Any], tokenizer) -> tuple[torch.Tensor, torch.Tensor]:
-        task = data['task']
+        task = data["task"]
         if hasattr(task, "tolist") and not isinstance(task, str):
             tasks = task.tolist()
         else:
             tasks = list(task)
-        tasks = [str(t).strip().replace('_', ' ').replace('\n', ' ') for t in tasks]
+        tasks = [str(t).strip().replace("_", " ").replace("\n", " ") for t in tasks]
 
-        device = data['observation.state'].device if 'observation.state' in data else torch.device('cpu')
+        device = data["observation.state"].device if "observation.state" in data else torch.device("cpu")
 
         if self.discrete_state_input:
-            assert 'observation.state' in data, 'discrete_state_input is True, but observation.state is not found.'
-            state = data['observation.state']
-            discretized_state = torch.bucketize(
-                state, torch.linspace(-1, 1, 256 + 1, device=device)[:-1]
-            ) - 1
-            state_values = [' '.join([str(int(x)) for x in row.tolist()]) for row in discretized_state]
+            assert "observation.state" in data, "discrete_state_input is True, but observation.state is not found."
+            state = data["observation.state"]
+            discretized_state = torch.bucketize(state, torch.linspace(-1, 1, 256 + 1, device=device)[:-1]) - 1
+            state_values = [" ".join([str(int(x)) for x in row.tolist()]) for row in discretized_state]
             tasks = [
-                f'Task: {task_item}, State: {state_value};\nAction: '
-                for task_item, state_value in zip(tasks, state_values)
+                f"Task: {task_item}, State: {state_value};\nAction: "
+                for task_item, state_value in zip(tasks, state_values, strict=False)
             ]
         else:
-            tasks = [f'{task_item}\n' for task_item in tasks]
+            tasks = [f"{task_item}\n" for task_item in tasks]
 
         tokenized_prompt = tokenizer(
             tasks,
-            padding='max_length',
-            padding_side='right',
+            padding="max_length",
+            padding_side="right",
             max_length=self.tokenizer_max_length,
-            return_tensors='pt',
+            return_tensors="pt",
         )
-        lang_tokens = tokenized_prompt['input_ids'].to(dtype=torch.int32, device=device)
-        lang_masks = tokenized_prompt['attention_mask'].to(dtype=torch.bool, device=device)
+        lang_tokens = tokenized_prompt["input_ids"].to(dtype=torch.int32, device=device)
+        lang_masks = tokenized_prompt["attention_mask"].to(dtype=torch.bool, device=device)
 
         return lang_tokens, lang_masks

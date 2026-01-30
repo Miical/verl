@@ -37,8 +37,8 @@ from verl.utils.model import check_exclude_modules, check_target_modules
 
 if version.parse(torch.__version__) >= version.parse("2.6"):
     from torch.distributed.fsdp import CPUOffloadPolicy, FSDPModule, MixedPrecisionPolicy, fully_shard
-    from torch.distributed.tensor import Shard
     from torch.distributed.fsdp._fully_shard._fsdp_init import _get_post_forward_mesh_info
+    from torch.distributed.tensor import Shard
 
     fully_shard_module = torch.distributed.fsdp._fully_shard._fully_shard
 elif version.parse(torch.__version__) >= version.parse("2.4"):
@@ -695,9 +695,8 @@ def replace_lora_wrapper(k, peft_config):
             return f"{module_k}.base_layer.bias"
     return k
 
-def set_reshard_after_forward(
-    module: FSDPModule, reshard_after_forward: bool, recurse: bool = True
-) -> None:
+
+def set_reshard_after_forward(module: FSDPModule, reshard_after_forward: bool, recurse: bool = True) -> None:
     """
     Sets if the module should reshard parameters after forward. This can be
     used to change the ``reshard_after_forward`` FSDP arg at runtime. For
@@ -718,9 +717,7 @@ def set_reshard_after_forward(
     """
 
     if not isinstance(reshard_after_forward, bool):
-        raise ValueError(
-            f"reshard_after_forward should be a bool, got {type(reshard_after_forward)}"
-        )
+        raise ValueError(f"reshard_after_forward should be a bool, got {type(reshard_after_forward)}")
     self_module = cast(nn.Module, module)
     modules = list(self_module.modules()) if recurse else [self_module]
     for module in modules:
@@ -728,8 +725,6 @@ def set_reshard_after_forward(
             state = module._get_fsdp_state()
             state._auto_reshard_after_forward = False
             if fsdp_param_group := state._fsdp_param_group:
-                fsdp_param_group.post_forward_mesh_info = (
-                    _get_post_forward_mesh_info(
-                        reshard_after_forward, fsdp_param_group.mesh_info
-                    )
+                fsdp_param_group.post_forward_mesh_info = _get_post_forward_mesh_info(
+                    reshard_after_forward, fsdp_param_group.mesh_info
                 )

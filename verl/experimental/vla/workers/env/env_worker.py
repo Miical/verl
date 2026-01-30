@@ -20,7 +20,6 @@ from omegaconf import DictConfig
 from torch.distributed.device_mesh import init_device_mesh
 
 from verl import DataProto
-from verl.experimental.vla.envs.action_utils import prepare_actions
 from verl.experimental.vla.workers.env.env_manager import EnvManager
 from verl.single_controller.base import Worker
 from verl.single_controller.base.decorator import Dispatch, make_nd_compute_dataproto_dispatch_fn, register

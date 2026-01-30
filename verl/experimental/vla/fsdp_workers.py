@@ -19,10 +19,10 @@ import asyncio
 import contextlib
 import logging
 import os
-from packaging import version
 
 import torch
 import torch.distributed
+from packaging import version
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.fsdp import FSDPModule
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
@@ -95,11 +95,14 @@ class RobActorRolloutRefWorker(ActorRolloutRefWorker):
 
         if self.config.get("algorithm", "grpo") == "sac":
             from verl.experimental.vla.sac.naive_rollout_pi05 import PI0RolloutRob
-            self.rollout = PI0RolloutRob(module=self.actor_module_fsdp, model_config=self.config.model, tokenizer=self.tokenizer)
+
+            self.rollout = PI0RolloutRob(
+                module=self.actor_module_fsdp, model_config=self.config.model, tokenizer=self.tokenizer
+            )
         else:
             from verl.experimental.vla.naive_rollout_rob import NaiveRolloutRob
+
             self.rollout = NaiveRolloutRob(module=self.actor_module_fsdp, model_config=self.config.model)
-            
 
         model_config: HFModelConfig = omega_conf_to_dataclass(self.config.model, dataclass_type=HFModelConfig)
         self.model_config = model_config
@@ -239,12 +242,15 @@ class RobActorRolloutRefWorker(ActorRolloutRefWorker):
         import_external_libs(self.config.model.get("external_lib", None))
 
         from omegaconf import OmegaConf
+
         override_model_config = OmegaConf.to_container(self.config.model.get("override_config", OmegaConf.create()))
 
         from verl.experimental.vla.models import register_vla_models
+
         register_vla_models()
 
         from transformers import AutoProcessor
+
         self.processor = AutoProcessor.from_pretrained(self.config.model.path, trust_remote_code=True)
 
         if self._is_actor or self._is_rollout:
@@ -274,20 +280,19 @@ class RobActorRolloutRefWorker(ActorRolloutRefWorker):
             OmegaConf.set_struct(self.config.actor, True)
             if self.config.get("algorithm", "grpo") == "sac":
                 from verl.experimental.vla.sac.sac_actor import RobDataParallelSACActor
+
                 self.actor = RobDataParallelSACActor(
-                    config=self.config.actor, 
-                    actor_module=self.actor_module_fsdp, 
+                    config=self.config.actor,
+                    actor_module=self.actor_module_fsdp,
                     actor_optimizer=self.actor_optimizer,
                     tokenizer=self.tokenizer,
                 )
             else:
                 from verl.experimental.vla.dp_rob import RobDataParallelPPOActor
-                self.actor = RobDataParallelPPOActor(
-                    config=self.config.actor, 
-                    actor_module=self.actor_module_fsdp, 
-                    actor_optimizer=self.actor_optimizer
-                )
 
+                self.actor = RobDataParallelPPOActor(
+                    config=self.config.actor, actor_module=self.actor_module_fsdp, actor_optimizer=self.actor_optimizer
+                )
 
         if self._is_rollout:
             self._build_rollout(trust_remote_code=self.config.model.get("trust_remote_code", False))

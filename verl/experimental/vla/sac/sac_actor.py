@@ -16,21 +16,19 @@ Single Process Actor
 """
 
 import logging
-import math
-import torch
+
 import numpy as np
-from typing import Union
-from typing_extensions import override
+import torch
+import torch.nn.functional as F
 from tensordict import TensorDict
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
-import torch.nn.functional as F
+from typing_extensions import override
 
 from verl.protocol import DataProto
 from verl.utils.device import get_device_id, get_device_name
-from verl.utils.py_functional import append_to_dict
-from verl.utils.profiler import simple_timer
 from verl.utils.replay_pool import SACReplayPool
-from .base import SupportSACTraining, BaseSACActor
+
+from .base import BaseSACActor, SupportSACTraining
 
 logger = logging.getLogger(__name__)
 
@@ -55,10 +53,8 @@ def get_dict_from_prefix(tensordict: TensorDict, prefix: str) -> dict:
             result[new_key] = tensordict[key]
     return result
 
-def merge_nested_dicts_or_tuples(
-    a: Union[dict, tuple],
-    b: Union[dict, tuple]
-) -> Union[dict, tuple]:
+
+def merge_nested_dicts_or_tuples(a: dict | tuple, b: dict | tuple) -> dict | tuple:
     """Merge two nested structures (dictionaries or tuples) by concatenating tensors
     along the first dimension.
     """
@@ -70,16 +66,14 @@ def merge_nested_dicts_or_tuples(
         return merged
     elif isinstance(a, tuple) and isinstance(b, tuple):
         merged = []
-        for item_a, item_b in zip(a, b):
+        for item_a, item_b in zip(a, b, strict=False):
             merged.append(merge_nested_dicts_or_tuples(item_a, item_b))
         return tuple(merged)
     else:
         return torch.cat([a, b], dim=0)
 
-def split_nested_dicts_or_tuples(
-    data: Union[dict, tuple],
-    split_num: int
-) -> list[Union[dict, tuple]]:
+
+def split_nested_dicts_or_tuples(data: dict | tuple, split_num: int) -> list[dict | tuple]:
     """Split a nested structure (dictionary or tuple) into smaller chunks along the first dimension."""
 
     if isinstance(data, torch.Tensor):
@@ -102,13 +96,14 @@ def split_nested_dicts_or_tuples(
     else:
         raise TypeError("Input data must be a torch.Tensor, dict, or tuple.")
 
+
 class RobDataParallelSACActor(BaseSACActor):
     def __init__(
         self,
         config,
         actor_module: SupportSACTraining,
         actor_optimizer: torch.optim.Optimizer,
-        tokenizer = None,
+        tokenizer=None,
     ):
         super().__init__()
         self.config = config
@@ -131,10 +126,7 @@ class RobDataParallelSACActor(BaseSACActor):
         self.auto_entropy = self.sac_config.get("auto_entropy", False)
 
         if self.auto_entropy:
-            self.target_entropy = torch.tensor(
-                float(self.sac_config.get("target_entropy", -32.0)),
-                device=self.device
-            )
+            self.target_entropy = torch.tensor(float(self.sac_config.get("target_entropy", -32.0)), device=self.device)
 
             # Initialize raw_alpha parameter
             self.alpha_type = self.sac_config.get("alpha_type", "softplus")
@@ -153,9 +145,7 @@ class RobDataParallelSACActor(BaseSACActor):
 
             # build alpha optimizer and scheduler
             self.alpha_optimizer = torch.optim.Adam([self.raw_alpha], lr=self.sac_config.get("alpha_lr", 3e-4))
-            self.alpha_scheduler = torch.optim.lr_scheduler.ConstantLR(
-                self.alpha_optimizer, factor=1.0
-            )
+            self.alpha_scheduler = torch.optim.lr_scheduler.ConstantLR(self.alpha_optimizer, factor=1.0)
 
     def _get_alpha(self) -> torch.Tensor:
         if self.auto_entropy:
@@ -186,7 +176,7 @@ class RobDataParallelSACActor(BaseSACActor):
         """
 
         alpha = self._get_alpha()
-        loss = (alpha * log_probs - q_values)
+        loss = alpha * log_probs - q_values
         actor_loss = (loss * valid).sum() / (valid.sum().clamp_min(1.0))
 
         return actor_loss
@@ -272,7 +262,7 @@ class RobDataParallelSACActor(BaseSACActor):
                 q_target=q_values_1,
                 rewards=micro_batch["rewards"].max(dim=-1).values,
                 valid=micro_batch["valid"],
-                next_log_prob=log_probs_1
+                next_log_prob=log_probs_1,
             )
         return critic_loss
 
@@ -300,19 +290,27 @@ class RobDataParallelSACActor(BaseSACActor):
 
     @override
     def update_policy(self, data: DataProto):
-        batch: TensorDict = data.select([
-            "a0.full_action", "a1.full_action",
-            "s0.states", "s1.states",
-            "s0.images", "s1.images",
-            "s0.image_masks", "s1.image_masks",
-            "s0.lang_tokens", "s1.lang_tokens",
-            "s0.lang_masks", "s1.lang_masks",
-            "rewards",
-            "response_mask"
-        ]).batch
+        batch: TensorDict = data.select(
+            [
+                "a0.full_action",
+                "a1.full_action",
+                "s0.states",
+                "s1.states",
+                "s0.images",
+                "s1.images",
+                "s0.image_masks",
+                "s1.image_masks",
+                "s0.lang_tokens",
+                "s1.lang_tokens",
+                "s0.lang_masks",
+                "s1.lang_masks",
+                "rewards",
+                "response_mask",
+            ]
+        ).batch
 
         batch = self.replay_pool.insert_and_resample(batch)
-        batch["valid"] = batch["response_mask"].any(dim=-1).float() # (B,)
+        batch["valid"] = batch["response_mask"].any(dim=-1).float()  # (B,)
         micro_batches = batch.split(self.config.ppo_micro_batch_size_per_gpu)
         global_steps = data.meta_info["global_steps"]
         grad_accum_steps = len(micro_batches) * torch.distributed.get_world_size()
@@ -323,7 +321,7 @@ class RobDataParallelSACActor(BaseSACActor):
         # Training critic
         self.actor_optimizer.zero_grad()
         for batch_idx, micro_batch in enumerate(micro_batches):
-            print(f"[{batch_idx+1}/{len(micro_batches)}] critic micro batch ")
+            print(f"[{batch_idx + 1}/{len(micro_batches)}] critic micro batch ")
 
             micro_batch = micro_batch.to(get_device_id())
             raw_critic_loss = self._forward_critic(micro_batch)
@@ -335,7 +333,7 @@ class RobDataParallelSACActor(BaseSACActor):
             # Training actor
             self.actor_optimizer.zero_grad()
             for batch_idx, micro_batch in enumerate(micro_batches):
-                print(f"[{batch_idx+1}/{len(micro_batches)}] actor micro batch ")
+                print(f"[{batch_idx + 1}/{len(micro_batches)}] actor micro batch ")
 
                 micro_batch = micro_batch.to(get_device_id())
                 raw_actor_loss, log_probs = self._forward_actor(micro_batch)
@@ -350,14 +348,12 @@ class RobDataParallelSACActor(BaseSACActor):
             # the actor after the policy update (saving compute).
             if self.auto_entropy:
                 self.alpha_optimizer.zero_grad()
-                for micro_batch, log_probs in zip(micro_batches, actor_logprobs_list):
+                for micro_batch, log_probs in zip(micro_batches, actor_logprobs_list, strict=False):
                     micro_batch = micro_batch.to(get_device_id())
                     raw_alpha_loss = self._calculate_alpha_loss(log_probs, micro_batch["valid"])
                     (raw_alpha_loss / grad_accum_steps).backward()
                     alpha_loss_list.append(raw_alpha_loss.detach().item())
-                torch.distributed.all_reduce(
-                    self.raw_alpha.grad, op=torch.distributed.ReduceOp.SUM
-                )
+                torch.distributed.all_reduce(self.raw_alpha.grad, op=torch.distributed.ReduceOp.SUM)
                 alpha_grad_norm = torch.nn.utils.clip_grad_norm_(self.raw_alpha, max_norm=self.config.grad_clip)
                 self.alpha_scheduler.step()
 
@@ -367,27 +363,25 @@ class RobDataParallelSACActor(BaseSACActor):
         # Save replay pool
         if global_steps % self.config.replay_pool_save_interval == 0:
             self.replay_pool.save(self.config.replay_pool_save_dir)
-        
+
         # Log metrics
         metrics = {
-            "data/reward_mean": (batch["rewards"].max(dim=-1).values * batch["valid"]).sum().item() / \
-                                batch["valid"].sum().clamp_min(1.0).item(),
+            "data/reward_mean": (batch["rewards"].max(dim=-1).values * batch["valid"]).sum().item()
+            / batch["valid"].sum().clamp_min(1.0).item(),
             "data/valid_ratio": batch["valid"].float().mean().item(),
-
             "sac/alpha": self._get_alpha().detach().item(),
-            "sac/alpha_lr": self.alpha_optimizer.param_groups[0]['lr'] if self.auto_entropy else 0.0,
+            "sac/alpha_lr": self.alpha_optimizer.param_groups[0]["lr"] if self.auto_entropy else 0.0,
             "sac/alpha_loss": sum(alpha_loss_list) / len(alpha_loss_list) if alpha_loss_list else 0.0,
-            "sac/alpha_grad_norm": alpha_grad_norm.detach().item() if self.auto_entropy \
-                                   and global_steps >= self.config.critic_warmup_steps else 0.0,
+            "sac/alpha_grad_norm": alpha_grad_norm.detach().item()
+            if self.auto_entropy and global_steps >= self.config.critic_warmup_steps
+            else 0.0,
             "sac/replay_pool_size": len(self.replay_pool),
-
             "actor/loss": sum(actor_loss_list) / len(actor_loss_list) if actor_loss_list else 0.0,
-            "actor/lr": self.actor_optimizer.param_groups[0]['lr'],
-            "actor/grad_norm": actor_grad_norm.detach().item() \
-                               if global_steps >= self.config.critic_warmup_steps else 0.0,
-            "actor/logprob_mean": torch.cat(actor_logprobs_list).mean().detach().item() \
-                                  if actor_logprobs_list else 0.0,
-
+            "actor/lr": self.actor_optimizer.param_groups[0]["lr"],
+            "actor/grad_norm": actor_grad_norm.detach().item()
+            if global_steps >= self.config.critic_warmup_steps
+            else 0.0,
+            "actor/logprob_mean": torch.cat(actor_logprobs_list).mean().detach().item() if actor_logprobs_list else 0.0,
             "critic/loss": sum(critic_loss_list) / len(critic_loss_list) if critic_loss_list else 0.0,
             "critic/grad_norm": critic_grad_norm.detach().item(),
         }

@@ -1,4 +1,4 @@
-# Copyright 2024 Bytedance Ltd. and/or its affiliates
+# Copyright 2025 Bytedance Ltd. and/or its affiliates
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -14,21 +14,21 @@
 
 
 import logging
+from pprint import pprint
+
 import datasets
 import hydra
 import ray
 import torch
-from pprint import pprint
 from omegaconf import OmegaConf
 
 from verl import DataProto
+from verl.experimental.vla.sac.sac_ray_trainer import RobRaySACTrainer
 from verl.trainer.constants_ppo import get_ppo_ray_runtime_env
 from verl.trainer.ppo.ray_trainer import ResourcePoolManager
 from verl.trainer.ppo.utils import Role
-from verl.utils.fs import copy_local_path_from_hdfs
 from verl.utils import hf_tokenizer
-
-from verl.experimental.vla.sac.sac_ray_trainer import RobRaySACTrainer 
+from verl.utils.fs import copy_local_path_from_hdfs
 
 logger = logging.getLogger(__name__)
 
@@ -41,6 +41,7 @@ def calculate_reward(data: DataProto, return_dict: bool = False) -> torch.Tensor
     else:
         return reward_per_step
 
+
 @hydra.main(config_path="config", config_name="rob_sac_trainer", version_base=None)
 def main(config):
     if not ray.is_initialized():
@@ -52,6 +53,7 @@ def main(config):
         logger.info(f"ray init kwargs: {ray_init_kwargs}")
         ray.init(**OmegaConf.to_container(ray_init_kwargs))
     ray.get(main_task.remote(config))
+
 
 @ray.remote
 def main_task(config):
@@ -70,6 +72,7 @@ def main_task(config):
         assert config.actor_rollout_ref.actor.strategy == config.critic.strategy
         from verl.experimental.vla.workers.env.env_worker import EnvWorker
         from verl.single_controller.ray import RayWorkerGroup
+
         from .fsdp_workers import RobActorRolloutRefWorker
 
         ray_worker_group_cls = RayWorkerGroup
@@ -89,7 +92,7 @@ def main_task(config):
 
     resource_pool_spec = {
         "train_rollout_pool": [train_rollout_gpu_num] * train_rollout_nodes_num,
-        "env_gpu_pool":       [env_gpu_num]           * env_nodes_num,
+        "env_gpu_pool": [env_gpu_num] * env_nodes_num,
     }
     mapping = {
         Role.ActorRollout: "train_rollout_pool",

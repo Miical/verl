@@ -7,7 +7,7 @@ test_files=$libero_test_path
 
 OUTPUT_DIR=${MLP_MODEL_OUTPUT:-"$HOME/models/vla_libero_grpo"}
 VIDEO_OUTPUT=${MLP_MODEL_OUTPUT:-"$HOME"}/video
-SFT_MODEL_PATH=${SFT_MODEL_PATH:-"/file_system/liujincheng/models/pi05_libero_torch"}
+SFT_MODEL_PATH=${SFT_MODEL_PATH:-"$HOME/data/pi05_libero_torch"}
 TOKENIZER_PATH="$SFT_MODEL_PATH"
 
 # Physical Node Config
@@ -26,7 +26,7 @@ NUM_STAGE=2                                    # number of pipeline stages
 NUM_ENV=8                                      # number of envs per env worker
 
 NUM_ACTION_CHUNKS=10                           # number of action chunks
-MAX_EPISODE_STEPS=30                           # max episode steps for each env
+MAX_EPISODE_STEPS=512                          # max episode steps for each env
                                                # max_interactions = MAX_EPISODE_STEPS / num_action_chunks
 
 # Training Config

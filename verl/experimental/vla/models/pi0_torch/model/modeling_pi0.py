@@ -1,3 +1,21 @@
+# Copyright 2025 Bytedance Ltd. and/or its affiliates
+# Copyright 2025 Giga Team. and/or its affiliates
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# from https://github.com/open-gigaai/giga-models
+
+
 import math
 
 import torch
@@ -13,22 +31,22 @@ def get_safe_dtype(dtype: torch.dtype, device: str | torch.device) -> torch.dtyp
     """Mps is currently not compatible with float64."""
     if isinstance(device, torch.device):
         device = device.type
-    if device == 'mps' and dtype == torch.float64:
+    if device == "mps" and dtype == torch.float64:
         return torch.float32
     else:
         return dtype
 
 
 def create_sinusoidal_pos_embedding(
-    time: torch.Tensor, dimension: int, min_period: float, max_period: float, device: str | torch.device = 'cpu'
+    time: torch.Tensor, dimension: int, min_period: float, max_period: float, device: str | torch.device = "cpu"
 ) -> Tensor:
     """Computes sine-cosine positional embedding vectors for scalar
     positions."""
     if dimension % 2 != 0:
-        raise ValueError(f'dimension ({dimension}) must be divisible by 2')
+        raise ValueError(f"dimension ({dimension}) must be divisible by 2")
 
     if time.ndim != 1:
-        raise ValueError('The time tensor is expected to be of shape `(batch_size, )`.')
+        raise ValueError("The time tensor is expected to be of shape `(batch_size, )`.")
 
     dtype = get_safe_dtype(torch.float64, device)
     fraction = torch.linspace(0.0, 1.0, dimension // 2, dtype=dtype, device=device)
@@ -208,7 +226,11 @@ class PI0Model(ModelMixin, ConfigMixin):
         return noise
 
     def embed_prefix(
-        self, images: list[torch.Tensor], img_masks: list[torch.Tensor], lang_tokens: torch.Tensor, lang_masks: torch.Tensor
+        self,
+        images: list[torch.Tensor],
+        img_masks: list[torch.Tensor],
+        lang_tokens: torch.Tensor,
+        lang_masks: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Embed visual and language inputs as the transformer prefix.
 
@@ -262,7 +284,9 @@ class PI0Model(ModelMixin, ConfigMixin):
         total_seq_len = num_images * num_img_embs + num_lang_embs
 
         # Pre-allocate final tensors
-        embs = torch.empty(bsize, total_seq_len, img_emb_dim, dtype=img_embs_concat.dtype, device=img_embs_concat.device)
+        embs = torch.empty(
+            bsize, total_seq_len, img_emb_dim, dtype=img_embs_concat.dtype, device=img_embs_concat.device
+        )
         pad_masks = torch.empty(bsize, total_seq_len, dtype=torch.bool, device=img_embs_concat.device)
 
         # Fill pre-allocated tensors
@@ -315,7 +339,9 @@ class PI0Model(ModelMixin, ConfigMixin):
             att_masks += [1]
 
         # Embed timestep using sine-cosine positional encoding with sensitivity in the range [0, 1]
-        time_emb = create_sinusoidal_pos_embedding(timestep, self.proj_width, min_period=4e-3, max_period=4.0, device=device)
+        time_emb = create_sinusoidal_pos_embedding(
+            timestep, self.proj_width, min_period=4e-3, max_period=4.0, device=device
+        )
         time_emb = time_emb.type(dtype=dtype)
 
         if self.pi05_enabled:

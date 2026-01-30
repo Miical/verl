@@ -1,6 +1,20 @@
-import torch
+# Copyright 2025 Bytedance Ltd. and/or its affiliates
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import torch.nn as nn
 import torch.nn.init as init
+
 
 class MLP(nn.Module):
     """
@@ -23,10 +37,10 @@ class MLP(nn.Module):
         input_dim: int,
         hidden_dims: list[int],
         output_dim: int,
-        activation: str = 'relu',
-        init_method: str ='kaiming'
+        activation: str = "relu",
+        init_method: str = "kaiming",
     ):
-        super(MLP, self).__init__()
+        super().__init__()
 
         self.input_dim = input_dim
         self.hidden_dims = hidden_dims
@@ -54,13 +68,13 @@ class MLP(nn.Module):
         Available options: 'relu', 'tanh', 'sigmoid', 'leaky_relu', 'elu', 'selu'.
         """
         activations = {
-            'relu': nn.ReLU(),
-            'tanh': nn.Tanh(),
-            'sigmoid': nn.Sigmoid(),
-            'leaky_relu': nn.LeakyReLU(0.2),
-            'elu': nn.ELU(),
-            'selu': nn.SELU(),
-            'none': None
+            "relu": nn.ReLU(),
+            "tanh": nn.Tanh(),
+            "sigmoid": nn.Sigmoid(),
+            "leaky_relu": nn.LeakyReLU(0.2),
+            "elu": nn.ELU(),
+            "selu": nn.SELU(),
+            "none": None,
         }
         return activations.get(name, nn.ReLU())
 
@@ -76,15 +90,15 @@ class MLP(nn.Module):
             - 'orthogonal': Good for preventing gradient explosion in deep networks.
         """
         if isinstance(m, nn.Linear):
-            if self.init_method == 'kaiming':
+            if self.init_method == "kaiming":
                 # Use 'relu' as default nonlinearity for Kaiming
-                nonlinearity = self.activation_name if self.activation_name in ['relu', 'leaky_relu'] else 'relu'
+                nonlinearity = self.activation_name if self.activation_name in ["relu", "leaky_relu"] else "relu"
                 init.kaiming_normal_(m.weight, nonlinearity=nonlinearity)
-            elif self.init_method == 'xavier':
+            elif self.init_method == "xavier":
                 init.xavier_normal_(m.weight)
-            elif self.init_method == 'normal':
+            elif self.init_method == "normal":
                 init.normal_(m.weight, mean=0.0, std=0.02)
-            elif self.init_method == 'orthogonal':
+            elif self.init_method == "orthogonal":
                 init.orthogonal_(m.weight)
 
             # Initialize bias to zero
@@ -94,19 +108,3 @@ class MLP(nn.Module):
     def forward(self, x):
         """Defines the computation performed at every call."""
         return self.network(x)
-
-# --- Usage Example ---
-if __name__ == "__main__":
-    mlp = MLP(
-        input_dim=128,
-        hidden_dims=[256, 512, 256],
-        output_dim=10,
-        activation='leaky_relu',
-        init_method='orthogonal'
-    )
-
-    print(mlp)
-
-    test_input = torch.randn(16, 128)
-    output = mlp(test_input)
-    print(f"Output shape: {output.shape}")

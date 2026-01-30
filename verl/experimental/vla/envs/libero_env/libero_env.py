@@ -33,9 +33,7 @@ from verl.experimental.vla.envs.action_utils import (
     tile_images,
     to_tensor,
 )
-from verl.experimental.vla.envs.libero_env.utils import (
-    get_libero_image, get_libero_wrist_image, quat2axisangle
-)
+from verl.experimental.vla.envs.libero_env.utils import get_libero_image, get_libero_wrist_image, quat2axisangle
 from verl.experimental.vla.envs.libero_env.venv import ReconfigureSubprocEnv
 
 logger = logging.getLogger(__name__)

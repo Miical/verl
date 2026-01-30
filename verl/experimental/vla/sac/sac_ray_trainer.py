@@ -22,34 +22,28 @@ import asyncio
 import uuid
 from collections import defaultdict
 from pprint import pprint
-import itertools
 
 import numpy as np
 import torch
 from omegaconf import OmegaConf
 from tqdm import tqdm
-from typing import Dict, Optional
-from torch.utils.data import Dataset, Sampler
-from torchdata.stateful_dataloader import StatefulDataLoader
 
 from verl import DataProto
 from verl.experimental.dataset.sampler import AbstractCurriculumSampler
 from verl.protocol import pad_dataproto_to_divisor, unpad_dataproto
-from verl.single_controller.ray import RayClassWithInitArgs, RayWorkerGroup
+from verl.single_controller.ray import RayClassWithInitArgs
 from verl.single_controller.ray.base import create_colocated_worker_cls
-from verl.trainer.ppo.core_algos import agg_loss
 from verl.trainer.ppo.metric_utils import (
-    compute_data_metrics,
     compute_throughout_metrics,
-    compute_timing_metrics,
     process_validation_metrics,
 )
-from verl.trainer.ppo.ray_trainer import RayPPOTrainer, ResourcePoolManager, ResourcePoolManager
+from verl.trainer.ppo.ray_trainer import RayPPOTrainer
 from verl.trainer.ppo.reward import compute_reward
-from verl.trainer.ppo.utils import Role, WorkerType
+from verl.trainer.ppo.utils import Role
 from verl.utils.checkpoint.checkpoint_manager import should_save_ckpt_esi
 from verl.utils.debug import marked_timer
 from verl.utils.metric import reduce_metrics
+
 
 def compute_response_mask(data: DataProto) -> torch.Tensor:
     """Compute the attention mask for the response part of the sequence.
@@ -140,7 +134,6 @@ def add_transition_prefixes(data: DataProto) -> DataProto:
 
 
 class RobRaySACTrainer(RayPPOTrainer):
-
     def _start_profiling(self, do_profile: bool) -> None:
         """Start profiling for all worker groups including env workers."""
         super()._start_profiling(do_profile)
@@ -398,7 +391,7 @@ class RobRaySACTrainer(RayPPOTrainer):
 
                             if "request_id" in batch.non_tensor_batch:
                                 reward_extra_infos_dict.setdefault(
-                                "request_id",
+                                    "request_id",
                                     batch.non_tensor_batch["request_id"].tolist(),
                                 )
 

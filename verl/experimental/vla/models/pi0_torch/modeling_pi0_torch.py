@@ -1,19 +1,34 @@
+# Copyright 2025 Bytedance Ltd. and/or its affiliates
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 from __future__ import annotations
 
-import numpy as np
-from onnx_ir import Tensor
 from typing import Literal
-from typing_extensions import override
 
 import torch
+from onnx_ir import Tensor
 from torch import nn
-from torch.distributions import Normal
 from torch.distributed.fsdp import register_fsdp_forward_method
-from tensordict import TensorDict
+from torch.distributions import Normal
 from transformers import PreTrainedModel
-from verl.utils.device import get_device_name
-from verl.protocol import DataProto
+from typing_extensions import override
 
+from verl.protocol import DataProto
+from verl.utils.device import get_device_name
+
+from ...sac.base import SupportSACTraining
+from ..modules.mlp import MLP
 from .configuration_pi0_torch import PI0TorchConfig
 from .model.modeling_pi0 import PI0Model, make_att_2d_masks
 from .pi0_utils import (
@@ -22,10 +37,7 @@ from .pi0_utils import (
     PromptTokenizerTransform,
     Unnormalize,
 )
-from .datasets.lerobot_dataset import LeRobotPi0DatasetInput
-from .policy.base import Pi0Input, Pi0Output
-from ..modules.mlp import MLP
-from ...sac.base import SupportSACTraining
+from .policy.base import Pi0Output
 
 
 class PI0ForActionPrediction(PreTrainedModel, SupportSACTraining):
@@ -60,27 +72,31 @@ class PI0ForActionPrediction(PreTrainedModel, SupportSACTraining):
         if getattr(self.config, "sac_enable", False):
             head_num = 2 if getattr(self.config, "double_q", True) else 1
 
-            self.critic_heads = nn.ModuleList([
-                MLP(
-                    input_dim=2150,  # 2048(prefix mean) + 32(state) + 10*7(action flat)
-                    hidden_dims=[1024, 512, 256],
-                    output_dim=1,
-                    activation='relu',
-                    init_method='normal'
-                )
-                for _ in range(head_num)
-            ])
+            self.critic_heads = nn.ModuleList(
+                [
+                    MLP(
+                        input_dim=2150,  # 2048(prefix mean) + 32(state) + 10*7(action flat)
+                        hidden_dims=[1024, 512, 256],
+                        output_dim=1,
+                        activation="relu",
+                        init_method="normal",
+                    )
+                    for _ in range(head_num)
+                ]
+            )
 
-            self.target_network_heads = nn.ModuleList([
-                MLP(
-                    input_dim=2150,
-                    hidden_dims=[1024, 512, 256],
-                    output_dim=1,
-                    activation='relu',
-                    init_method='normal'
-                )
-                for _ in range(head_num)
-            ])
+            self.target_network_heads = nn.ModuleList(
+                [
+                    MLP(
+                        input_dim=2150,
+                        hidden_dims=[1024, 512, 256],
+                        output_dim=1,
+                        activation="relu",
+                        init_method="normal",
+                    )
+                    for _ in range(head_num)
+                ]
+            )
 
     def _to(self, device: torch.device | str):
         self.state_normalize_transform.to(device)
@@ -143,14 +159,14 @@ class PI0ForActionPrediction(PreTrainedModel, SupportSACTraining):
         """
 
         from .policy.libero_policy import LiberoPi0Input
+
         pi0_input = LiberoPi0Input.from_env_obs(env_obs)
 
         # Input transforms
         state = self.state_normalize_transform(pi0_input.state)
         images, _ = self.image_transform.call_batch(pi0_input.images)
         lang_tokens, lang_masks = self.prompt_tokenizer_transform.call_batch(
-            { 'task': pi0_input.task, 'observation.state': state },
-            tokenizer
+            {"task": pi0_input.task, "observation.state": state}, tokenizer
         )
 
         # Inference
@@ -160,18 +176,18 @@ class PI0ForActionPrediction(PreTrainedModel, SupportSACTraining):
         # state = self.state_unnormalize_transform(state)
         pred_action = self.action_unnormalize_transform(pred_action)
 
-
         from .policy.libero_policy import LiberoPi0Output
-        pi0_output = LiberoPi0Output.from_model_output({'full_action': pred_action})
+
+        pi0_output = LiberoPi0Output.from_model_output({"full_action": pred_action})
         s = {
-            'states': state,
-            'images': torch.stack(images, dim=1),
-            'image_masks': torch.stack(pi0_input.img_masks, dim=1),
-            'lang_tokens': lang_tokens,
-            'lang_masks': lang_masks,
+            "states": state,
+            "images": torch.stack(images, dim=1),
+            "image_masks": torch.stack(pi0_input.img_masks, dim=1),
+            "lang_tokens": lang_tokens,
+            "lang_masks": lang_masks,
         }
         a = {
-            'full_action': pred_action,
+            "full_action": pred_action,
         }
 
         return pi0_output, s, a
@@ -196,70 +212,11 @@ class PI0ForActionPrediction(PreTrainedModel, SupportSACTraining):
         vision_tower.requires_grad_(False)
         vision_tower.eval()
 
-    def process_dataset_batch(
-        self, 
-        dataset_batch: DataProto,
-        tokenizer,
-    ) -> dict[str, torch.Tensor]:
-        # TODO: abstract this function
-
-        batch = LeRobotPi0DatasetInput.from_dataset_batch(dataset_batch)
-
-        out = {}
-
-        # Process images
-        # s0
-        images, _ = self.image_transform.call_batch(batch.s0['images'])
-        out['s0.images'] = torch.stack(images, dim=1)
-        out['s0.image_masks'] = torch.stack(batch.s0['img_masks'], dim=1)
-        # s1
-        images, _ = self.image_transform.call_batch(batch.s1['images'])
-        out['s1.images'] = torch.stack(images, dim=1)
-        out['s1.image_masks'] = torch.stack(batch.s1['img_masks'], dim=1)
-
-        # Process language
-        # s0
-        lang_tokens, lang_masks = self.prompt_tokenizer_transform.call_batch(
-            {'task': batch.s0['task'], 'observation.state': batch.s0['state']},
-            tokenizer=tokenizer
-        )
-        out['s0.lang_tokens'] = lang_tokens
-        out['s0.lang_masks'] = lang_masks
-
-        # s1
-        lang_tokens, lang_masks = self.prompt_tokenizer_transform.call_batch(
-            {'task': batch.s1['task'], 'observation.state': batch.s1['state']},
-            tokenizer=tokenizer
-        )
-        out['s1.lang_tokens'] = lang_tokens
-        out['s1.lang_masks'] = lang_masks
-
-        # Process states
-        out['s0.states'] = self.state_normalize_transform(batch.s0['state'])
-        out['s1.states'] = self.state_normalize_transform(batch.s1['state'])
-
-        # Process actions
-        out['a0.full_action'] = self.action_normalize_transform(batch.a0['action'])
-        out['a1.full_action'] = self.action_normalize_transform(batch.a1['action'])
-
-        # Process rewards
-        out['rewards'] = batch.reward
-
-        # Process response masks
-        out['response_mask'] = batch.valid
-
-        return out
-
-
     # --- SAC Algorithm Support ---
 
     def _multi_heads_value(
-        self,
-        value_heads: nn.ModuleList,
-        input_tensor: torch.Tensor,
-        method: Literal["cat", "min"] = "cat"
+        self, value_heads: nn.ModuleList, input_tensor: torch.Tensor, method: Literal["cat", "min"] = "cat"
     ) -> torch.Tensor:
-
         q_values = [head(input_tensor) for head in value_heads]
         if method == "cat":
             q_values = torch.cat(q_values, dim=-1)
@@ -296,14 +253,13 @@ class PI0ForActionPrediction(PreTrainedModel, SupportSACTraining):
         s: dict[str, torch.Tensor],
         prefix_features: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
         *,
-        x_t: torch.Tensor | None = None,     # (B, T, A)
+        x_t: torch.Tensor | None = None,  # (B, T, A)
         x_next: torch.Tensor | None = None,  # (B, T, A)
-        v_t: torch.Tensor | None = None,     # (B, T, A)
-        t: torch.Tensor | None = None,       # (B,)
-        step_idx: torch.Tensor | None = None # (B,)
+        v_t: torch.Tensor | None = None,  # (B, T, A)
+        t: torch.Tensor | None = None,  # (B,)
+        step_idx: torch.Tensor | None = None,  # (B,)
     ) -> torch.Tensor:
-
-        prefix_embs, prefix_pad_masks, _  = prefix_features
+        prefix_embs, prefix_pad_masks, _ = prefix_features
         states = s["states"]
         B = prefix_embs.shape[0]
         device = prefix_embs.device
@@ -358,7 +314,7 @@ class PI0ForActionPrediction(PreTrainedModel, SupportSACTraining):
         sigma_i = sigmas[step_idx][:, None, None].clamp_min(1e-6)  # (B,1,1)
 
         x0_weight = torch.ones_like(t_b) - (t_b - dt_b)
-        x1_weight = t_b - dt_b - (sigma_i ** 2) * dt_b / (2.0 * t_b.clamp_min(1e-6))
+        x1_weight = t_b - dt_b - (sigma_i**2) * dt_b / (2.0 * t_b.clamp_min(1e-6))
 
         x_next_mean = x0_pred * x0_weight + x1_pred * x1_weight
         x_next_std = (dt_b.sqrt() * sigma_i).clamp_min(1e-6)
@@ -441,7 +397,6 @@ class PI0ForActionPrediction(PreTrainedModel, SupportSACTraining):
         self,
         state_features: tuple[tuple[torch.Tensor, torch.Tensor, torch.Tensor], torch.Tensor],
     ) -> tuple[torch.Tensor, torch.Tensor]:
-
         prefix_features, states = state_features
         actions, log_probs = self._sample_actions_and_logprobs_from_prefix(states, prefix_features)
         return actions, log_probs
@@ -462,10 +417,10 @@ class PI0ForActionPrediction(PreTrainedModel, SupportSACTraining):
 
         prefix_features, states = state_features
         prefix_embs, _, _ = prefix_features
-        mean_prefix_embs = prefix_embs.mean(dim=1, keepdim=False)                        # (B, 2048)
-        actions = self.action_normalize_transform(a["full_action"])                      # (B, 50, 32)
-        actions = actions[:, :10, :7]                                                    # (B, 10, 7)
-        flattened_actions = actions.reshape(actions.shape[0], -1)                        # (B, 70)
+        mean_prefix_embs = prefix_embs.mean(dim=1, keepdim=False)  # (B, 2048)
+        actions = self.action_normalize_transform(a["full_action"])  # (B, 50, 32)
+        actions = actions[:, :10, :7]  # (B, 10, 7)
+        flattened_actions = actions.reshape(actions.shape[0], -1)  # (B, 70)
         critic_input = torch.cat([mean_prefix_embs, states, flattened_actions], dim=-1)  # (B, 2150)
 
         q_values = self._multi_heads_value(critic_head, critic_input, method=method)
@@ -474,8 +429,7 @@ class PI0ForActionPrediction(PreTrainedModel, SupportSACTraining):
 
     @override
     def sac_forward_state_features(
-        self,
-        s: dict[str, torch.Tensor]
+        self, s: dict[str, torch.Tensor]
     ) -> tuple[tuple[torch.Tensor, torch.Tensor, torch.Tensor], torch.Tensor]:
         with torch.no_grad():
             prefix_features = self.model.embed_prefix(
@@ -489,6 +443,6 @@ class PI0ForActionPrediction(PreTrainedModel, SupportSACTraining):
     @override
     @torch.no_grad()
     def sac_update_target_network(self, tau: float):
-        for target_head, head in zip(self.target_network_heads, self.critic_heads):
-            for target_param, param in zip(target_head.parameters(), head.parameters()):
+        for target_head, head in zip(self.target_network_heads, self.critic_heads, strict=False):
+            for target_param, param in zip(target_head.parameters(), head.parameters(), strict=False):
                 target_param.data.mul_(1.0 - tau).add_(param.data, alpha=tau)
