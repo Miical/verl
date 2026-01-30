@@ -119,7 +119,7 @@ $PYTHON -m verl.experimental.vla.main_sac \
     +trainer.n_env_gpus_per_node=$NUM_ENV_GPUS \
     +trainer.n_rollout_gpus_per_node=$NUM_ROLLOUT_GPUS \
     trainer.nnodes=$NUM_NODES \
-    trainer.save_freq=60 \
+    trainer.save_freq=30 \
     trainer.test_freq=-1 \
     trainer.total_epochs=100 \
     trainer.val_only=False \

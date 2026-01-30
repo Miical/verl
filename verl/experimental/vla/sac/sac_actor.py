@@ -367,10 +367,11 @@ class RobDataParallelSACActor(BaseSACActor):
         # Save replay pool
         if global_steps % self.config.replay_pool_save_interval == 0:
             self.replay_pool.save(self.config.replay_pool_save_dir)
-
+        
         # Log metrics
         metrics = {
-            "data/reward_mean": batch["rewards"].mean().item(),
+            "data/reward_mean": (batch["rewards"].max(dim=-1).values * batch["valid"]).sum().item() / \
+                                batch["valid"].sum().clamp_min(1.0).item(),
             "data/valid_ratio": batch["valid"].float().mean().item(),
 
             "sac/alpha": self._get_alpha().detach().item(),

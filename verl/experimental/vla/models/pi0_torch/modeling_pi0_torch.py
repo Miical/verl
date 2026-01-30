@@ -66,7 +66,7 @@ class PI0ForActionPrediction(PreTrainedModel, SupportSACTraining):
                     hidden_dims=[1024, 512, 256],
                     output_dim=1,
                     activation='relu',
-                    init_method='kaiming'
+                    init_method='normal'
                 )
                 for _ in range(head_num)
             ])
@@ -77,7 +77,7 @@ class PI0ForActionPrediction(PreTrainedModel, SupportSACTraining):
                     hidden_dims=[1024, 512, 256],
                     output_dim=1,
                     activation='relu',
-                    init_method='kaiming'
+                    init_method='normal'
                 )
                 for _ in range(head_num)
             ])
