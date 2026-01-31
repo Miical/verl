@@ -357,6 +357,7 @@ class RobDataParallelSACActor(BaseSACActor):
                     alpha_loss_list.append(raw_alpha_loss.detach().item())
                 torch.distributed.all_reduce(self.raw_alpha.grad, op=torch.distributed.ReduceOp.SUM)
                 alpha_grad_norm = torch.nn.utils.clip_grad_norm_(self.raw_alpha, max_norm=self.config.grad_clip)
+                self.alpha_optimizer.step()
                 self.alpha_scheduler.step()
 
         # Update target networks
