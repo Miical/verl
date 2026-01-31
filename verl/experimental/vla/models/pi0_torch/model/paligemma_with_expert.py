@@ -32,6 +32,8 @@ from transformers.models.siglip.modeling_siglip import (
 )
 from transformers.utils import can_return_tuple
 
+from verl.utils.device import get_device_name
+
 
 def get_transformers_siglip_vision_config() -> SiglipVisionConfig:
     return CONFIG_MAPPING["siglip_vision_model"](
@@ -125,7 +127,7 @@ class SiglipVisionTransformer(nn.Module):
 
         hidden_states = self.embeddings(pixel_values, interpolate_pos_encoding=interpolate_pos_encoding)
         hidden_states = hidden_states.to(dtype=torch.bfloat16)
-        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+        with torch.autocast(device_type=get_device_name(), dtype=torch.bfloat16):
             encoder_outputs: BaseModelOutput = self.encoder(
                 inputs_embeds=hidden_states,
                 output_attentions=output_attentions,
@@ -689,7 +691,7 @@ class PaliGemmaWithExpertModel(nn.Module):
             input_embed.to(dtype=torch.bfloat16) if input_embed is not None else None for input_embed in inputs_embeds
         ]
 
-        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+        with torch.autocast(device_type=get_device_name(), dtype=torch.bfloat16):
             if use_cache and past_key_values is None:
                 past_key_values = {}
 
