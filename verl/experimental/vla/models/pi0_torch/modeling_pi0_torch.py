@@ -39,6 +39,8 @@ from .pi0_utils import (
 )
 from .policy.base import Pi0Output
 
+from .datasets.lerobot_dataset import LeRobotPi0DatasetInput
+
 
 class PI0ForActionPrediction(PreTrainedModel, SupportSACTraining):
     config_class = PI0TorchConfig
@@ -222,6 +224,61 @@ class PI0ForActionPrediction(PreTrainedModel, SupportSACTraining):
         vision_tower = self.model.paligemma_with_expert.vision_tower
         vision_tower.requires_grad_(False)
         vision_tower.eval()
+
+
+    def process_dataset_batch(
+        self, 
+        dataset_batch: DataProto,
+        tokenizer,
+    ) -> dict[str, torch.Tensor]:
+
+        batch = LeRobotPi0DatasetInput.from_dataset_batch(dataset_batch)
+
+        out = {}
+
+        # Process images
+        # s0
+        images, _ = self.image_transform.call_batch(batch.s0['images'])
+        out['s0.images'] = torch.stack(images, dim=1)
+        out['s0.image_masks'] = torch.stack(batch.s0['img_masks'], dim=1)
+        # s1
+        images, _ = self.image_transform.call_batch(batch.s1['images'])
+        out['s1.images'] = torch.stack(images, dim=1)
+        out['s1.image_masks'] = torch.stack(batch.s1['img_masks'], dim=1)
+
+        # Process language
+        # s0
+        lang_tokens, lang_masks = self.prompt_tokenizer_transform.call_batch(
+            {'task': batch.s0['task'], 'observation.state': batch.s0['state']},
+            tokenizer=tokenizer
+        )
+        out['s0.lang_tokens'] = lang_tokens
+        out['s0.lang_masks'] = lang_masks
+
+        # s1
+        lang_tokens, lang_masks = self.prompt_tokenizer_transform.call_batch(
+            {'task': batch.s1['task'], 'observation.state': batch.s1['state']},
+            tokenizer=tokenizer
+        )
+        out['s1.lang_tokens'] = lang_tokens
+        out['s1.lang_masks'] = lang_masks
+
+        # Process states
+        out['s0.states'] = self.state_normalize_transform(batch.s0['state'])
+        out['s1.states'] = self.state_normalize_transform(batch.s1['state'])
+
+        # Process actions
+        out['a0.full_action'] = self.action_normalize_transform(batch.a0['action'])
+        out['a1.full_action'] = self.action_normalize_transform(batch.a1['action'])
+
+        # Process rewards
+        out['rewards'] = batch.reward
+
+        # Process response masks
+        out['response_mask'] = batch.valid
+
+        return out
+
 
     # --- SAC Algorithm Support ---
 

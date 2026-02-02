@@ -196,6 +196,27 @@ class RobActorRolloutRefWorker(ActorRolloutRefWorker):
 
         logger.info("trainer mode")
 
+
+    @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"), blocking=False)
+    @DistProfiler.annotate(color="blue", role="process_dataset_batch")
+    def process_dataset_batch(self, batch: DataProto) -> DataProto:
+        """Process dataset batch for SAC training.
+
+        Args:
+            batch: DataProto containing the dataset batch.
+        """
+
+        batch = batch.to(get_device_id())
+
+        batch = self.actor_module_fsdp.process_dataset_batch(
+            dataset_batch = batch,
+            tokenizer = self.tokenizer
+        )
+
+        batch = DataProto.from_single_dict(batch)
+        return batch.to("cpu")
+
+
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="rollout"), blocking=False)
     @DistProfiler.annotate(color="red", role="rollout_generate")
     def generate_sequences(self, prompts: DataProto):

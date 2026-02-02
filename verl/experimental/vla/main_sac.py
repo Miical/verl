@@ -103,6 +103,11 @@ def main_task(config):
     # create datasets
     train_dataset = datasets.load_dataset("parquet", data_files=config.data.train_files)["train"]
     val_dataset = datasets.load_dataset("parquet", data_files=config.data.val_files)["train"]
+    if config.trainer.rlpd_enable:
+        from verl.experimental.vla.dataloader.lerobot import make_dataset, make_sampler, make_collator
+        rlpd_dataset = make_dataset("parquet", config.data.rlpd_files)
+        rlpd_sampler = make_sampler(rlpd_dataset)
+        rlpd_collate_fn = make_collator()
 
     # instantiate trainer and start training
     trainer = RobRaySACTrainer(
@@ -115,11 +120,13 @@ def main_task(config):
         val_reward_fn=calculate_reward,
         train_dataset=train_dataset,
         val_dataset=val_dataset,
+        rlpd_dataset=rlpd_dataset if config.trainer.rlpd_enable else None,
+        rlpd_sampler=rlpd_sampler if config.trainer.rlpd_enable else None,
+        rlpd_collate_fn=rlpd_collate_fn if config.trainer.rlpd_enable else None,
     )
 
     trainer.init_workers()
     trainer.fit()
-
 
 if __name__ == "__main__":
     main()

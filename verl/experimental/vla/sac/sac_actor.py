@@ -322,24 +322,7 @@ class RobDataParallelSACActor(BaseSACActor):
     @override
     def update_policy(self, data: DataProto):
         if "empty_batch" not in data.meta_info:
-            self.replay_pool.add_batch(data.select([
-                "a0.full_action",
-                "a1.full_action",
-                "s0.states",
-                "s1.states",
-                "s0.images",
-                "s1.images",
-                "s0.image_masks",
-                "s1.image_masks",
-                "s0.lang_tokens",
-                "s1.lang_tokens",
-                "s0.lang_masks",
-                "s1.lang_masks",
-                "rewards",
-                "dones",
-                "valids",
-                "positive_sample_mask"
-            ]).batch)
+            self.replay_pool.add_batch(data.batch)
 
         batch = self.replay_pool.sample_batch(self.config.ppo_mini_batch_size)
         micro_batches = batch.split(self.config.ppo_micro_batch_size_per_gpu)
