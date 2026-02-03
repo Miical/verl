@@ -4,7 +4,8 @@ libero_test_path=$HOME/data/libero_rl/test.parquet
 
 train_files=$libero_train_path
 test_files=$libero_test_path
-rlpd_files="/file_system/liujincheng/datasets/20251027T005_install_belt_cyt001_01"
+# rlpd_files="/file_system/liujincheng/datasets/20251027T005_install_belt_cyt001_01"
+rlpd_files="/file_system/vla-datasets/datasets--yifengzhu-hf--LIBERO-datasets/snapshots/f13aa24a3da8c43c7225569f28c562979fa0e35a/libero_10"
 
 OUTPUT_DIR=${MLP_MODEL_OUTPUT:-"$HOME/models/vla_libero_grpo"}
 VIDEO_OUTPUT=${MLP_MODEL_OUTPUT:-"$HOME"}/video
@@ -103,6 +104,7 @@ $PYTHON -m verl.experimental.vla.main_sac \
     actor_rollout_ref.model.enable_gradient_checkpointing=False \
     actor_rollout_ref.model.use_remove_padding=False \
     actor_rollout_ref.model.trust_remote_code=False \
+    actor_rollout_ref.model.override_config.dataset_type=libero \
     +actor_rollout_ref.model.override_config.attn_implementation=eager \
     actor_rollout_ref.actor.entropy_coeff=0. \
     actor_rollout_ref.rollout.temperature=1.6 \

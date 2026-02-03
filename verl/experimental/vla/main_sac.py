@@ -24,6 +24,7 @@ from omegaconf import OmegaConf
 
 from verl import DataProto
 from verl.experimental.vla.sac.sac_ray_trainer import RobRaySACTrainer
+from verl.experimental.vla.dataloader import build_dataloader_components 
 from verl.trainer.constants_ppo import get_ppo_ray_runtime_env
 from verl.trainer.ppo.ray_trainer import ResourcePoolManager
 from verl.trainer.ppo.utils import Role
@@ -104,10 +105,11 @@ def main_task(config):
     train_dataset = datasets.load_dataset("parquet", data_files=config.data.train_files)["train"]
     val_dataset = datasets.load_dataset("parquet", data_files=config.data.val_files)["train"]
     if config.trainer.rlpd_enable:
-        from verl.experimental.vla.dataloader.lerobot import make_dataset, make_sampler, make_collator
-        rlpd_dataset = make_dataset("parquet", config.data.rlpd_files)
-        rlpd_sampler = make_sampler(rlpd_dataset)
-        rlpd_collate_fn = make_collator()
+        rlpd_dataset, rlpd_sampler, rlpd_collate_fn = build_dataloader_components(
+            dataset_type=config.actor_rollout_ref.model.override_config.dataset_type,
+            repo_id="parquet",
+            root=config.data.rlpd_files,
+        )
 
     # instantiate trainer and start training
     trainer = RobRaySACTrainer(

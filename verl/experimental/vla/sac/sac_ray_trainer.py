@@ -183,7 +183,6 @@ class RobRaySACTrainer(RayPPOTrainer):
 
         if self.config.trainer.rlpd_enable:
             assert rlpd_dataset is not None, "rlpd_dataset must be provided when rlpd_enable is True"
-            assert rlpd_sampler is not None, "rlpd_sampler must be provided when rlpd_enable is True"
             self.rlpd_dataloader = StatefulDataLoader(
                 rlpd_dataset,
                 batch_size=self.config.data.rlpd_batch_size,

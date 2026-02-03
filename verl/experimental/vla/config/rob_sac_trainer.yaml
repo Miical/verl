@@ -43,6 +43,7 @@ actor_rollout_ref:
     override_config:
       sac_enable: True
       double_q: True
+      dataset_type: lerobot 
   actor:
     sac:
       gamma: 0.95
