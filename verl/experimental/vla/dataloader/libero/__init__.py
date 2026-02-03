@@ -34,7 +34,7 @@ class LiberoTrajDataset(Dataset):
         return self.samples[idx]
 
 
-class LiberoStepDataset(Dataset):
+class LiberoTwoStepDataset(Dataset):
     """
     dataset_keys = ['obs', 'actions', 'dones', 'rewards', 'robot_states', 'states']
     """
@@ -60,13 +60,13 @@ class LiberoStepDataset(Dataset):
                 for t0 in range(0, max_t0 + 1, self.step):
                     self.index.append((hdf5_path, demo_key, t0))
 
-        print(f"[LiberoStepDataset] Built step index: {len(self.index)} samples "
+        print(f"[LiberoTwoStepDataset] Built step index: {len(self.index)} samples "
               f"(stride={self.step}, horizon={self.step}).")
 
     def __len__(self):
-        return len(self.index)
+        return len(self.index) - 1
 
-    def __getitem__(self, idx):
+    def _read_one(self, idx, prefix=""):
         hdf5_path, demo_key, t0 = self.index[idx]
 
         out = {"t0": t0, "hdf5_path": hdf5_path, "demo_key": demo_key}
@@ -86,20 +86,31 @@ class LiberoStepDataset(Dataset):
             out["actions"] = actions
 
             # others: only take t0
+            T = demo["actions"].shape[0]
+            out["chunk_dones"] = int(t0 + 2 * self.step - 1 >= T)
             for key in ["dones", "rewards", "robot_states", "states"]:
                 if key in demo:
                     out[key] = demo[key][t0]
                 else:
                     out[key] = None
+        
+        for k in list(out.keys()):
+            out[prefix + k] = out.pop(k)
 
+        return out
+    
+    def __getitem__(self, idx):
+        out = {}
+        out.update(self._read_one(idx, prefix="t0."))
+        out.update(self._read_one(idx + 1, prefix="t1."))
         return out
 
     
-def make_dataset(repo_id: str, root: str) -> LiberoStepDataset:
-    dataset = LiberoStepDataset(root)
+def make_dataset(repo_id: str, root: str) -> LiberoTwoStepDataset:
+    dataset = LiberoTwoStepDataset(root)
     return dataset
 
-def make_sampler(dataset: LiberoStepDataset):
+def make_sampler(dataset: LiberoTwoStepDataset):
     return None
 
 def make_collator() -> callable:

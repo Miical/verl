@@ -39,9 +39,6 @@ from .pi0_utils import (
 )
 from .policy.base import Pi0Output
 
-from .datasets.lerobot_dataset import LeRobotPi0DatasetInput
-
-
 class PI0ForActionPrediction(PreTrainedModel, SupportSACTraining):
     config_class = PI0TorchConfig
     base_model_prefix = "pi0_torch"
@@ -232,7 +229,14 @@ class PI0ForActionPrediction(PreTrainedModel, SupportSACTraining):
         tokenizer,
     ) -> dict[str, torch.Tensor]:
 
-        batch = LeRobotPi0DatasetInput.from_dataset_batch(dataset_batch)
+        if self.config.dataset_type == "lerobot":
+            from .datasets.lerobot_dataset import LeRobotPi0DatasetInput
+            batch = LeRobotPi0DatasetInput.from_dataset_batch(dataset_batch)
+        elif self.config.dataset_type == "libero":
+            from .datasets.libero_dataset import LiberoPi0DatasetInput
+            batch = LiberoPi0DatasetInput.from_dataset_batch(dataset_batch)
+        else:
+            raise ValueError(f"Unknown dataset_type: {self.config.dataset_type}")
 
         out = {}
 

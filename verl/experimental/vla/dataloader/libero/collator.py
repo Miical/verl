@@ -42,32 +42,33 @@ import numpy as np
 def libero_collate_fn(batch):
     out = {}
 
-    # obs
-    obs_keys = batch[0]["obs"].keys()
-    for k in sorted(obs_keys):
-        vals = [b["obs"].get(k, None) for b in batch]
+    for prefix in ["t0.", "t1."]:
+        # obs
+        obs_keys = batch[0][prefix + "obs"].keys()
+        for k in sorted(obs_keys):
+            vals = [b[prefix + "obs"].get(k, None) for b in batch]
 
-        v0 = vals[0]
-        kind = "byte" if isinstance(v0, np.ndarray) and v0.dtype == np.uint8 else "float"
-        out["obs." + k] = torch.stack([_to_tensor(v, kind=kind) for v in vals], dim=0)
+            v0 = vals[0]
+            kind = "byte" if isinstance(v0, np.ndarray) and v0.dtype == np.uint8 else "float"
+            out[prefix + "obs." + k] = torch.stack([_to_tensor(v, kind=kind) for v in vals], dim=0)
 
-    # actions (B, N_ACTIONS_STEPS, A)
-    out["actions"] = torch.stack([_to_tensor(b["actions"], kind="float") for b in batch], dim=0)
+        # actions (B, N_ACTIONS_STEPS, A)
+        out[prefix + "actions"] = torch.stack([_to_tensor(b[prefix + "actions"], kind="float") for b in batch], dim=0)
 
-    # rewards/dones
-    for key in ["dones", "rewards"]:
-        vals = [b[key] for b in batch]
-        out[key] = torch.stack([_to_tensor(v, kind="int") for v in vals], dim=0)
-        out[key] = out[key].squeeze(-1)
+        # rewards/dones
+        for key in ["dones", "chunk_dones", "rewards"]:
+            vals = [b[prefix + key] for b in batch]
+            out[prefix + key] = torch.stack([_to_tensor(v, kind="int") for v in vals], dim=0)
+            out[prefix + key] = out[prefix + key].squeeze(-1)
 
-    # robot_states, ignore states
-    for key in ["robot_states"]:
-        vals = [b[key] for b in batch]
-        out[key] = torch.stack([_to_tensor(v, kind="float") for v in vals], dim=0)
+        # robot_states, ignore states
+        for key in ["robot_states"]:
+            vals = [b[prefix + key] for b in batch]
+            out[prefix + key] = torch.stack([_to_tensor(v, kind="float") for v in vals], dim=0)
 
-    # metadata
-    out["t0"] = np.array([b["t0"] for b in batch])
-    out["hdf5_path"] = np.array([b["hdf5_path"] for b in batch])
-    out["demo_key"] = np.array([b["demo_key"] for b in batch])
+        # metadata
+        out[prefix + "t0"] = np.array([b[prefix + "t0"] for b in batch])
+        out[prefix + "hdf5_path"] = np.array([b[prefix + "hdf5_path"] for b in batch])
+        out[prefix + "demo_key"] = np.array([b[prefix + "demo_key"] for b in batch])
 
     return out
