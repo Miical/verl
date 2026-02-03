@@ -183,12 +183,11 @@ class PI0ForActionPrediction(PreTrainedModel, SupportSACTraining):
         pred_action = self.model.sample_actions(images, pi0_input.img_masks, lang_tokens, lang_masks, state=state)
 
         # Output transforms
-        # state = self.state_unnormalize_transform(state)
-        pred_action = self.action_unnormalize_transform(pred_action)
-
         from .policy.libero_policy import LiberoPi0Output
 
-        pi0_output = LiberoPi0Output.from_model_output({"full_action": pred_action})
+        pi0_output = LiberoPi0Output.from_model_output({
+            "full_action": self.action_unnormalize_transform(pred_action)
+        })
         s = {
             "states": state,
             "images": torch.stack(images, dim=1),
@@ -433,8 +432,7 @@ class PI0ForActionPrediction(PreTrainedModel, SupportSACTraining):
         prefix_features, states = state_features
         prefix_embs, _, _ = prefix_features
         mean_prefix_embs = prefix_embs.mean(dim=1, keepdim=False)  # (B, 2048)
-        actions = self.action_normalize_transform(a["full_action"])  # (B, 50, 32)
-        actions = actions[:, :10, :7]  # (B, 10, 7)
+        actions = a["full_action"][:, :10, :7]  # (B, 10, 7)
         flattened_actions = actions.reshape(actions.shape[0], -1)  # (B, 70)
         critic_input = torch.cat([mean_prefix_embs, states, flattened_actions], dim=-1)  # (B, 2150)
 
