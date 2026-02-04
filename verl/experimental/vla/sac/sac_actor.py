@@ -98,6 +98,21 @@ def split_nested_dicts_or_tuples(data: dict | tuple, split_num: int) -> list[dic
     else:
         raise TypeError("Input data must be a torch.Tensor, dict, or tuple.")
 
+def valid_mean(x: torch.Tensor, valid: torch.Tensor) -> torch.Tensor:
+    """Compute the mean of tensor `x` over valid entries indicated by `valid` mask.
+
+    Args:
+        x: Tensor of shape (B, ...) containing values to average.
+        valid: Tensor of shape (B,) indicating valid entries (1 for valid, 0 for invalid).
+
+    Returns:
+        Scalar tensor (mean over valid samples only)
+    """
+    x = x.squeeze(-1)
+    valid_f = valid.float().to(x.device)
+    denom = valid_f.sum().clamp_min(1.0)
+    return (x * valid_f).sum() / denom
+
 
 class RobDataParallelSACActor(BaseSACActor):
     def __init__(
@@ -232,7 +247,7 @@ class RobDataParallelSACActor(BaseSACActor):
         critic_loss = per_critic.sum()
         return critic_loss
 
-    def _forward_critic(self, micro_batch: TensorDict) -> torch.Tensor:
+    def _forward_critic(self, micro_batch: TensorDict) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         s0 = get_dict_from_prefix(micro_batch, "s0.")
         s1 = get_dict_from_prefix(micro_batch, "s1.")
         a0 = get_dict_from_prefix(micro_batch, "a0.")
@@ -266,7 +281,7 @@ class RobDataParallelSACActor(BaseSACActor):
                 valid=micro_batch["valid"],
                 next_log_prob=log_probs_1,
             )
-        return critic_loss
+        return critic_loss, q_values_0, q_values_1
 
     def _forward_actor(self, micro_batch: TensorDict) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         micro_batch = micro_batch.to(get_device_id())
@@ -288,7 +303,7 @@ class RobDataParallelSACActor(BaseSACActor):
                 q_values=q_values_0,
                 valid=micro_batch["valid"],
             )
-        return actor_loss, log_probs_0
+        return actor_loss, log_probs_0, q_values_0
 
     @override
     def update_policy(self, data: DataProto):
@@ -308,6 +323,7 @@ class RobDataParallelSACActor(BaseSACActor):
                 "s1.lang_masks",
                 "rewards",
                 "response_mask",
+                "positive_sample_mask"
             ]
         ).batch
 
@@ -317,7 +333,8 @@ class RobDataParallelSACActor(BaseSACActor):
         global_steps = data.meta_info["global_steps"]
         grad_accum_steps = len(micro_batches) * torch.distributed.get_world_size()
 
-        actor_logprobs_list = []
+        actor_logprobs_list, actor_qvalues_list = [], []
+        critic_qvalues_0_list, critic_qvalues_1_list = [], []
         actor_loss_list, critic_loss_list, alpha_loss_list = [], [], []
 
         # Training critic
@@ -326,9 +343,11 @@ class RobDataParallelSACActor(BaseSACActor):
             logger.info(f"[{batch_idx + 1}/{len(micro_batches)}] critic micro batch ")
 
             micro_batch = micro_batch.to(get_device_id())
-            raw_critic_loss = self._forward_critic(micro_batch)
+            raw_critic_loss, q_values_0, q_values_1 = self._forward_critic(micro_batch)
             (raw_critic_loss / grad_accum_steps).backward()
             critic_loss_list.append(raw_critic_loss.detach().item())
+            critic_qvalues_0_list.append(q_values_0.mean(dim=-1).detach())
+            critic_qvalues_1_list.append(q_values_1.detach())
         critic_grad_norm = self._optimizer_step()
 
         if global_steps >= self.config.critic_warmup_steps:
@@ -338,10 +357,11 @@ class RobDataParallelSACActor(BaseSACActor):
                 logger.info(f"[{batch_idx + 1}/{len(micro_batches)}] actor micro batch ")
 
                 micro_batch = micro_batch.to(get_device_id())
-                raw_actor_loss, log_probs = self._forward_actor(micro_batch)
+                raw_actor_loss, log_probs, q_values = self._forward_actor(micro_batch)
                 (raw_actor_loss / grad_accum_steps).backward()
                 actor_loss_list.append(raw_actor_loss.detach().item())
                 actor_logprobs_list.append(log_probs.detach())
+                actor_qvalues_list.append(q_values.detach())
             actor_grad_norm = self._optimizer_step()
 
             # Training alpha
@@ -369,9 +389,10 @@ class RobDataParallelSACActor(BaseSACActor):
 
         # Log metrics
         metrics = {
-            "data/reward_mean": (batch["rewards"].max(dim=-1).values * batch["valid"]).sum().item()
-            / batch["valid"].sum().clamp_min(1.0).item(),
+            "data/reward_mean": valid_mean(batch["rewards"].max(dim=-1).values, batch["valid"]).detach().item(),
             "data/valid_ratio": batch["valid"].float().mean().item(),
+            "data/positive_sample_ratio": valid_mean(batch["positive_sample_mask"].float(), batch["valid"]).detach().item(),
+
             "sac/alpha": self._get_alpha().detach().item(),
             "sac/alpha_lr": self.alpha_optimizer.param_groups[0]["lr"] if self.auto_entropy else 0.0,
             "sac/alpha_loss": sum(alpha_loss_list) / len(alpha_loss_list) if alpha_loss_list else 0.0,
@@ -379,14 +400,51 @@ class RobDataParallelSACActor(BaseSACActor):
             if self.auto_entropy and global_steps >= self.config.critic_warmup_steps
             else 0.0,
             "sac/replay_pool_size": len(self.replay_pool),
+
             "actor/loss": sum(actor_loss_list) / len(actor_loss_list) if actor_loss_list else 0.0,
             "actor/lr": self.actor_optimizer.param_groups[0]["lr"],
             "actor/grad_norm": actor_grad_norm.detach().item()
             if global_steps >= self.config.critic_warmup_steps
             else 0.0,
-            "actor/logprob_mean": torch.cat(actor_logprobs_list).mean().detach().item() if actor_logprobs_list else 0.0,
+
+            "actor/logprob_mean": (
+                valid_mean(torch.cat(actor_logprobs_list), batch["valid"]).detach().item()
+                if actor_logprobs_list else 0.0
+            ),
+            "actor/qvalue_mean": (
+                valid_mean(torch.cat(actor_qvalues_list), batch["valid"]).detach().item()
+                if actor_qvalues_list else 0.0
+            ),
+
             "critic/loss": sum(critic_loss_list) / len(critic_loss_list) if critic_loss_list else 0.0,
             "critic/grad_norm": critic_grad_norm.detach().item(),
+            "critic/qvalue0_mean": (
+                valid_mean(torch.cat(critic_qvalues_0_list), batch["valid"]).detach().item()
+                if critic_qvalues_0_list else 0.0
+            ),
+            "critic/qvalue1_mean": (
+                valid_mean(torch.cat(critic_qvalues_1_list), batch["valid"]).detach().item()
+                if critic_qvalues_1_list else 0.0
+            ),
+
+            "critic/positive_qvalue_mean": (
+                torch.cat(critic_qvalues_0_list)[
+                    (batch["positive_sample_mask"].to(torch.bool) & batch["valid"].to(torch.bool))
+                    .to(torch.cat(critic_qvalues_0_list).device)
+                ].mean().detach().item()
+                if critic_qvalues_0_list
+                and (batch["positive_sample_mask"].to(torch.bool) & batch["valid"].to(torch.bool)).any()
+                else 0.0
+            ),
+            "critic/negative_qvalue_mean": (
+                torch.cat(critic_qvalues_0_list)[
+                    (~batch["positive_sample_mask"].to(torch.bool) & batch["valid"].to(torch.bool))
+                    .to(torch.cat(critic_qvalues_0_list).device)
+                ].mean().detach().item()
+                if critic_qvalues_0_list
+                and (~batch["positive_sample_mask"].to(torch.bool) & batch["valid"].to(torch.bool)).any()
+                else 0.0
+            ),
         }
 
         return metrics
