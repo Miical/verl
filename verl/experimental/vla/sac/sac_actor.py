@@ -179,14 +179,14 @@ class RobDataParallelSACActor(BaseSACActor):
         self,
         log_probs: torch.Tensor,
         q_values: torch.Tensor,
-        valid: torch.Tensor,
+        valids: torch.Tensor,
     ) -> torch.Tensor:
         """Calculate actor loss using the SAC loss function.
 
         Args:
             log_probs: Tensor of shape (B,) representing the log probabilities of actions.
             q_values: Tensor of shape (B,) representing the Q-values for the actions.
-            valid: Tensor of shape (B,) indicating valid samples (1 for valid, 0 for invalid).
+            valids: Tensor of shape (B,) indicating valid samples (1 for valid, 0 for invalid).
 
         Returns:
             Tensor of shape (1,) representing the actor loss.
@@ -194,23 +194,23 @@ class RobDataParallelSACActor(BaseSACActor):
 
         alpha = self._get_alpha()
         loss = alpha * log_probs - q_values
-        actor_loss = (loss * valid).sum() / (valid.sum().clamp_min(1.0))
+        actor_loss = (loss * valids).sum() / (valids.sum().clamp_min(1.0))
 
         return actor_loss
 
-    def _calculate_alpha_loss(self, log_probs: torch.Tensor, valid: torch.Tensor) -> torch.Tensor:
+    def _calculate_alpha_loss(self, log_probs: torch.Tensor, valids: torch.Tensor) -> torch.Tensor:
         """Calculate alpha loss for automatic entropy tuning.
 
         Args:
             log_probs: Tensor of shape (B,) representing the log probabilities of actions.
-            valid: Tensor of shape (B,) indicating valid samples (1 for valid, 0 for invalid).
+            valids: Tensor of shape (B,) indicating valid samples (1 for valid, 0 for invalid).
 
         Returns:
             Tensor of shape (1,) representing the alpha loss.
         """
 
         alpha_loss = -self._get_alpha() * (log_probs.detach() + self.target_entropy)
-        alpha_loss = (alpha_loss * valid).sum() / (valid.sum().clamp_min(1.0))
+        alpha_loss = (alpha_loss * valids).sum() / (valids.sum().clamp_min(1.0))
         return alpha_loss
 
     def _calculate_critic_loss(
@@ -218,8 +218,9 @@ class RobDataParallelSACActor(BaseSACActor):
         q_predict: torch.Tensor,
         q_target: torch.Tensor,
         rewards: torch.Tensor,
-        valid: torch.Tensor,
+        dones: torch.Tensor,
         next_log_prob: torch.Tensor,
+        valids: torch.Tensor,
     ) -> torch.Tensor:
         """Calculate critic loss using the SAC loss function.
 
@@ -227,8 +228,9 @@ class RobDataParallelSACActor(BaseSACActor):
             q_predict: Tensor of shape (B, critic_num) representing predicted Q-values.
             q_target: Tensor of shape (B,) representing target Q-values.
             rewards: Tensor of shape (B,) representing rewards.
-            valid: Tensor of shape (B,) indicating valid samples (1 for valid, 0 for invalid).
+            dones: Tensor of shape (B,) representing done flags.
             next_log_prob: Tensor of shape (B,) representing log probabilities of next actions.
+            valids: Tensor of shape (B,) indicating valid samples (1 for valid, 0 for invalid).
 
         Returns:
             Tensor of shape (1,) representing the critic loss.
@@ -238,10 +240,10 @@ class RobDataParallelSACActor(BaseSACActor):
         alpha = self._get_alpha()
 
         with torch.no_grad():
-            y = rewards + valid * gamma * (q_target - alpha * next_log_prob)
+            y = rewards + gamma * (1.0 - dones) * (q_target - alpha * next_log_prob)
 
         y = y.unsqueeze(1).expand_as(q_predict)  # (B, critic_num)
-        valid_mask = valid.unsqueeze(1)
+        valid_mask = valids.unsqueeze(1)
         mse = F.mse_loss(q_predict, y, reduction="none")
         per_critic = (mse * valid_mask).sum(dim=0) / valid_mask.sum().clamp_min(1.0)
         critic_loss = per_critic.sum()
@@ -277,9 +279,10 @@ class RobDataParallelSACActor(BaseSACActor):
             critic_loss = self._calculate_critic_loss(
                 q_predict=q_values_0,
                 q_target=q_values_1,
-                rewards=micro_batch["rewards"].max(dim=-1).values,
-                valid=micro_batch["valid"],
+                rewards=micro_batch["rewards"],
+                dones=micro_batch["dones"],
                 next_log_prob=log_probs_1,
+                valids=micro_batch["valids"],
             )
         return critic_loss, q_values_0, q_values_1
 
@@ -301,7 +304,7 @@ class RobDataParallelSACActor(BaseSACActor):
             actor_loss = self._calculate_actor_loss(
                 log_probs=log_probs_0,
                 q_values=q_values_0,
-                valid=micro_batch["valid"],
+                valids=micro_batch["valids"],
             )
         return actor_loss, log_probs_0, q_values_0
 
@@ -322,13 +325,13 @@ class RobDataParallelSACActor(BaseSACActor):
                 "s0.lang_masks",
                 "s1.lang_masks",
                 "rewards",
-                "response_mask",
+                "dones",
+                "valids",
                 "positive_sample_mask"
             ]).batch)
 
         batch = self.replay_pool.sample_batch(self.config.ppo_mini_batch_size)
-        batch["valid"] = batch["response_mask"].any(dim=-1).float()  # (B,)
-        batch["rewards"].mul_(100)
+        batch["rewards"] = batch["rewards"] * 100.0  # scale rewards
         micro_batches = batch.split(self.config.ppo_micro_batch_size_per_gpu)
         global_steps = data.meta_info["global_steps"]
         grad_accum_steps = len(micro_batches) * torch.distributed.get_world_size()
@@ -372,7 +375,7 @@ class RobDataParallelSACActor(BaseSACActor):
                 self.alpha_optimizer.zero_grad()
                 for micro_batch, log_probs in zip(micro_batches, actor_logprobs_list, strict=False):
                     micro_batch = micro_batch.to(get_device_id())
-                    raw_alpha_loss = self._calculate_alpha_loss(log_probs, micro_batch["valid"])
+                    raw_alpha_loss = self._calculate_alpha_loss(log_probs, micro_batch["valids"])
                     (raw_alpha_loss / grad_accum_steps).backward()
                     alpha_loss_list.append(raw_alpha_loss.detach().item())
                 torch.distributed.all_reduce(self.raw_alpha.grad, op=torch.distributed.ReduceOp.SUM)
@@ -389,9 +392,9 @@ class RobDataParallelSACActor(BaseSACActor):
 
         # Log metrics
         metrics = {
-            "data/reward_mean": valid_mean(batch["rewards"].max(dim=-1).values, batch["valid"]).detach().item(),
-            "data/valid_ratio": batch["valid"].float().mean().item(),
-            "data/positive_sample_ratio": valid_mean(batch["positive_sample_mask"].float(), batch["valid"]).detach().item(),
+            "data/reward_mean": valid_mean(batch["rewards"], batch["valids"]).detach().item(),
+            "data/valid_ratio": batch["valids"].float().mean().item(),
+            "data/positive_sample_ratio": valid_mean(batch["positive_sample_mask"].float(), batch["valids"]).detach().item(),
 
             "sac/alpha": self._get_alpha().detach().item(),
             "sac/alpha_lr": self.alpha_optimizer.param_groups[0]["lr"] if self.auto_entropy else 0.0,
@@ -408,41 +411,41 @@ class RobDataParallelSACActor(BaseSACActor):
             else 0.0,
 
             "actor/logprob_mean": (
-                valid_mean(torch.cat(actor_logprobs_list), batch["valid"]).detach().item()
+                valid_mean(torch.cat(actor_logprobs_list), batch["valids"]).detach().item()
                 if actor_logprobs_list else 0.0
             ),
             "actor/qvalue_mean": (
-                valid_mean(torch.cat(actor_qvalues_list), batch["valid"]).detach().item()
+                valid_mean(torch.cat(actor_qvalues_list), batch["valids"]).detach().item()
                 if actor_qvalues_list else 0.0
             ),
 
             "critic/loss": sum(critic_loss_list) / len(critic_loss_list) if critic_loss_list else 0.0,
             "critic/grad_norm": critic_grad_norm.detach().item(),
             "critic/qvalue0_mean": (
-                valid_mean(torch.cat(critic_qvalues_0_list), batch["valid"]).detach().item()
+                valid_mean(torch.cat(critic_qvalues_0_list), batch["valids"]).detach().item()
                 if critic_qvalues_0_list else 0.0
             ),
             "critic/qvalue1_mean": (
-                valid_mean(torch.cat(critic_qvalues_1_list), batch["valid"]).detach().item()
+                valid_mean(torch.cat(critic_qvalues_1_list), batch["valids"]).detach().item()
                 if critic_qvalues_1_list else 0.0
             ),
 
             "critic/positive_qvalue_mean": (
                 torch.cat(critic_qvalues_0_list)[
-                    (batch["positive_sample_mask"].to(torch.bool) & batch["valid"].to(torch.bool))
+                    (batch["positive_sample_mask"].to(torch.bool) & batch["valids"].to(torch.bool))
                     .to(torch.cat(critic_qvalues_0_list).device)
                 ].mean().detach().item()
                 if critic_qvalues_0_list
-                and (batch["positive_sample_mask"].to(torch.bool) & batch["valid"].to(torch.bool)).any()
+                and (batch["positive_sample_mask"].to(torch.bool) & batch["valids"].to(torch.bool)).any()
                 else 0.0
             ),
             "critic/negative_qvalue_mean": (
                 torch.cat(critic_qvalues_0_list)[
-                    (~batch["positive_sample_mask"].to(torch.bool) & batch["valid"].to(torch.bool))
+                    (~batch["positive_sample_mask"].to(torch.bool) & batch["valids"].to(torch.bool))
                     .to(torch.cat(critic_qvalues_0_list).device)
                 ].mean().detach().item()
                 if critic_qvalues_0_list
-                and (~batch["positive_sample_mask"].to(torch.bool) & batch["valid"].to(torch.bool)).any()
+                and (~batch["positive_sample_mask"].to(torch.bool) & batch["valids"].to(torch.bool)).any()
                 else 0.0
             ),
         }
