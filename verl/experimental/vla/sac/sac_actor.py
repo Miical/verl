@@ -307,8 +307,8 @@ class RobDataParallelSACActor(BaseSACActor):
 
     @override
     def update_policy(self, data: DataProto):
-        batch: TensorDict = data.select(
-            [
+        if "empty_batch" not in data.meta_info:
+            self.replay_pool.add_batch(data.select([
                 "a0.full_action",
                 "a1.full_action",
                 "s0.states",
@@ -324,11 +324,11 @@ class RobDataParallelSACActor(BaseSACActor):
                 "rewards",
                 "response_mask",
                 "positive_sample_mask"
-            ]
-        ).batch
+            ]).batch)
 
-        batch = self.replay_pool.insert_and_resample(batch)
+        batch = self.replay_pool.sample_batch(self.config.ppo_mini_batch_size)
         batch["valid"] = batch["response_mask"].any(dim=-1).float()  # (B,)
+        batch["rewards"].mul_(100)
         micro_batches = batch.split(self.config.ppo_micro_batch_size_per_gpu)
         global_steps = data.meta_info["global_steps"]
         grad_accum_steps = len(micro_batches) * torch.distributed.get_world_size()
