@@ -71,7 +71,16 @@ def compute_response_mask(config, data: DataProto) -> torch.Tensor:
     mask = mask_traj.view(complete.shape)  # shape: [batch_size, num_steps, chunk_size]
     mask = mask.repeat_interleave(config.env.actor.model.action_dim, dim=-1)  # eapand to action dim
     return mask
+                    
+def compute_positive_sample_mask(data: DataProto, reward_tensor: torch.Tensor) -> torch.Tensor:
+    """Compute the mask for positive samples in the data."""
 
+    positive_sample = reward_tensor.any(dim=(1, 2)) # shape: (batch_size, )
+    positive_sample_mask = positive_sample.unsqueeze(-1).repeat_interleave(
+        data.batch["action"].shape[1], dim=-1
+    )  # shape: (batch_size, num_steps)
+
+    return positive_sample_mask
 
 def flatten_trajectories(data: DataProto) -> DataProto:
     batch_size, num_steps = data.batch["action"].shape[:2]
@@ -354,7 +363,8 @@ class RobRaySACTrainer(RayPPOTrainer):
                         # compute reward model score
                         reward_tensor, reward_extra_infos_dict = compute_reward(batch, self.reward_fn)
                     batch.batch["rewards"] = reward_tensor
-                    average_reward = reward_tensor.any(-1).mean(dtype=torch.float32).item()
+                    batch.batch["positive_sample_mask"] = compute_positive_sample_mask(batch, reward_tensor)
+                    average_reward = reward_tensor.any((1, 2)).mean(dtype=torch.float32).item()
                     metrics["data/trajectory_avg_reward"] = average_reward
 
                     batch = add_transition_prefixes(batch)
