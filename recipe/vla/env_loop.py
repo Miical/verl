@@ -56,7 +56,7 @@ def estimate_dataproto_size(data_proto: DataProto) -> int:
     
     return total_size
 
-
+#监控数据传输延时和推理延迟
 class PerformanceMonitor:
     """性能监控器，记录各个步骤的耗时"""
     def __init__(self):
