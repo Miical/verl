@@ -652,7 +652,9 @@ class RealRobotEnv(gym.Env):
             chunk_actions: [num_envs, chunk_size, action_dim]
             
         Returns:
-            obs: Final observations
+            obs: Observations dict
+                - 如果没有人工介入: 最后一步的完整观测（images + state）和所有步骤的 state
+                - 如果有人工介入: 所有步骤的完整观测（images + state）
             chunk_rewards: [num_envs, chunk_steps]
             chunk_terminations: [num_envs, chunk_steps]
             chunk_truncations: [num_envs, chunk_steps]
@@ -665,6 +667,9 @@ class RealRobotEnv(gym.Env):
         raw_chunk_truncations = []
         raw_chunk_intervene_actions = []
         raw_chunk_intervene_flag = []
+        chunk_obs_list = []  # 收集所有步骤的观测
+        
+        has_intervention = False
         
         for i in range(chunk_size):
             actions = chunk_actions[:, i]
@@ -672,6 +677,19 @@ class RealRobotEnv(gym.Env):
                 actions, auto_reset=False
             )
             
+            # 收集每一步的观测
+            chunk_obs_list.append(extracted_obs)
+            
+            # 检查是否有介入
+            if "intervene_flag" in infos:
+                intervene_flag = infos["intervene_flag"]
+                if isinstance(intervene_flag, torch.Tensor):
+                    intervene_flag = intervene_flag.cpu().numpy()
+                if isinstance(intervene_flag, np.ndarray):
+                    if intervene_flag.any():
+                        has_intervention = True
+                elif intervene_flag:
+                    has_intervention = True
             
             if "intervene_action" in infos:
                 raw_chunk_intervene_actions.append(infos["intervene_action"])
@@ -698,9 +716,125 @@ class RealRobotEnv(gym.Env):
         
         # Handle auto reset
         if past_dones.any() and self.auto_reset:
-            extracted_obs, infos = self._handle_auto_reset(
-                past_dones.cpu().numpy(), extracted_obs, infos
+            final_obs, infos = self._handle_auto_reset(
+                past_dones.cpu().numpy(), chunk_obs_list[-1], infos
             )
+            # 更新最后一步的观测
+            chunk_obs_list[-1] = final_obs
+        else:
+            final_obs = chunk_obs_list[-1]
+        
+        # 根据是否有介入来决定返回格式
+        if has_intervention:
+            # 有人工介入：返回所有步骤的完整观测（images + state）
+            # 提取所有步骤的 images 和 states
+            all_images_dict = {
+                "head_image": [],
+                "left_wrist_image": [],
+                "right_wrist_image": [],
+            }
+            all_states = []
+            all_task_descriptions = []
+            
+            for obs in chunk_obs_list:
+                # obs 是 _wrap_obs 返回的格式，包含 "images_and_states" 和 "task_descriptions"
+                if "images_and_states" in obs:
+                    images_and_states = obs["images_and_states"]
+                    # 提取每张图像（每个都是 [num_envs, max_len]）
+                    for img_key in all_images_dict.keys():
+                        if img_key in images_and_states:
+                            all_images_dict[img_key].append(images_and_states[img_key])
+                        else:
+                            # 如果没有该图像，使用零填充
+                            if all_images_dict[img_key]:
+                                # 使用前一步的形状
+                                prev_shape = all_images_dict[img_key][-1].shape
+                                all_images_dict[img_key].append(torch.zeros(prev_shape, dtype=torch.uint8))
+                            else:
+                                # 第一次，创建占位符
+                                all_images_dict[img_key].append(torch.zeros((self.num_envs, 1), dtype=torch.uint8))
+                    
+                    # 提取 state ([num_envs, state_dim])
+                    state = images_and_states.get("state")
+                    if state is not None:
+                        all_states.append(state if isinstance(state, torch.Tensor) else to_tensor(state))
+                    else:
+                        # 如果没有 state，使用零填充
+                        if all_states:
+                            prev_shape = all_states[-1].shape
+                            all_states.append(torch.zeros(prev_shape, dtype=torch.float32))
+                        else:
+                            all_states.append(torch.zeros((self.num_envs, 14), dtype=torch.float32))
+                else:
+                    # 兼容旧格式（不应该出现，但为了安全）
+                    logger.warning("[chunk_step] Obs format without images_and_states, using fallback")
+                    for img_key in all_images_dict.keys():
+                        all_images_dict[img_key].append(torch.zeros((self.num_envs, 1), dtype=torch.uint8))
+                    all_states.append(torch.zeros((self.num_envs, 14), dtype=torch.float32))
+                
+                # 提取任务描述
+                if "task_descriptions" in obs:
+                    task_desc = obs["task_descriptions"][0] if isinstance(obs["task_descriptions"], list) and len(obs["task_descriptions"]) > 0 else (obs["task_descriptions"] if isinstance(obs["task_descriptions"], str) else "")
+                    all_task_descriptions.append(task_desc)
+                elif "task_description" in obs:
+                    all_task_descriptions.append(obs["task_description"])
+                else:
+                    all_task_descriptions.append("")
+            
+            # 堆叠所有步骤的 images: [num_envs, chunk_steps, max_len]
+            chunk_images_and_states = {}
+            for img_key, img_list in all_images_dict.items():
+                if img_list:
+                    # 找到最大长度
+                    max_len = max(img.shape[-1] for img in img_list)
+                    # 填充并堆叠
+                    padded_imgs = []
+                    for img in img_list:
+                        if img.shape[-1] < max_len:
+                            padding = torch.zeros((*img.shape[:-1], max_len - img.shape[-1]), dtype=img.dtype, device=img.device)
+                            img = torch.cat([img, padding], dim=-1)
+                        padded_imgs.append(img)
+                    # 堆叠: [num_envs, chunk_steps, max_len]
+                    chunk_images_and_states[img_key] = torch.stack(padded_imgs, dim=1)
+            
+            # 堆叠所有步骤的 states: [num_envs, chunk_steps, state_dim]
+            if all_states:
+                chunk_images_and_states["state"] = torch.stack(all_states, dim=1)
+            
+            # 构建返回的观测格式
+            chunk_obs = {
+                "images_and_states": chunk_images_and_states,
+                "task_descriptions": all_task_descriptions[0] if all_task_descriptions else "",
+            }
+        else:
+            # 没有人工介入：返回最后一步的完整观测（images + state）和所有步骤的 state
+            final_obs_dict = chunk_obs_list[-1]
+            
+            # 提取所有步骤的 state
+            all_states = []
+            for obs in chunk_obs_list:
+                if "images_and_states" in obs:
+                    state = obs["images_and_states"].get("state")
+                    if state is not None:
+                        all_states.append(state if isinstance(state, torch.Tensor) else to_tensor(state))
+                    else:
+                        all_states.append(torch.zeros((self.num_envs, 14), dtype=torch.float32))
+                else:
+                    all_states.append(torch.zeros((self.num_envs, 14), dtype=torch.float32))
+            
+            # 构建返回的观测格式：最后一步的完整观测 + 所有步骤的 state
+            final_images_and_states = final_obs_dict.get("images_and_states", {})
+            chunk_images_and_states = {
+                "head_image": final_images_and_states.get("head_image"),
+                "left_wrist_image": final_images_and_states.get("left_wrist_image"),
+                "right_wrist_image": final_images_and_states.get("right_wrist_image"),
+                "state": torch.stack(all_states, dim=1) if all_states else None,  # [num_envs, chunk_steps, state_dim]
+            }
+            
+            chunk_obs = {
+                "images_and_states": chunk_images_and_states,
+                "task_descriptions": final_obs_dict.get("task_descriptions", [""] * self.num_envs),
+            }
         
         # Handle termination logic based on auto_reset and ignore_terminations
         if self.auto_reset or self.ignore_terminations:
@@ -714,7 +848,7 @@ class RealRobotEnv(gym.Env):
             chunk_truncations = raw_chunk_truncations.clone()
         
         return (
-            extracted_obs,
+            chunk_obs,
             chunk_rewards,
             chunk_terminations,
             chunk_truncations,

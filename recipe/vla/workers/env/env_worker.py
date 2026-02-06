@@ -228,11 +228,21 @@ class EnvWorker(Worker):
 
         # 【性能监控】 环境step执行
         t_sim_start = time.perf_counter()
-        extracted_obs, chunk_rewards, chunk_terminations, chunk_truncations, infos = self.simulator_list[
+        chunk_obs, chunk_rewards, chunk_terminations, chunk_truncations, infos = self.simulator_list[
             stage_id
         ].chunk_step(chunk_actions)
         sim_time = time.perf_counter() - t_sim_start
         print(f"[EnvWorker] Stage {stage_id} 环境step耗时: {sim_time:.4f}s", flush=True)
+        
+        # 【调试信息】 打印 chunk_step 返回的观测格式
+        print(f"[EnvWorker] Stage {stage_id} chunk_step 返回的观测格式:", flush=True)
+        if "images_and_states" in chunk_obs:
+            images_and_states = chunk_obs["images_and_states"]
+            for key, value in images_and_states.items():
+                if value is not None and hasattr(value, 'shape'):
+                    print(f"[EnvWorker]   images_and_states[{key}]: shape={value.shape}, dtype={value.dtype}", flush=True)
+                else:
+                    print(f"[EnvWorker]   images_and_states[{key}]: None", flush=True)
         
         chunk_dones = torch.logical_or(chunk_terminations, chunk_truncations)
 
@@ -245,7 +255,7 @@ class EnvWorker(Worker):
         # 【性能监控】 数据打包
         t_pack_start = time.perf_counter()
         env_batch = create_env_batch_dataproto(
-            obs=extracted_obs,
+            obs=chunk_obs,
             rews=chunk_rewards,
             terminations=chunk_terminations,
             truncations=chunk_truncations,

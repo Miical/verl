@@ -17,7 +17,7 @@ conda activate raytest2
 ray stop --force
 rm -rf /tmp/ray
 export CUDA_VISIBLE_DEVICES=0 
-ray start --address='192.168.18.238:6379' --resources='{"node:B": 1, "sim": 1}'
+ray start --address='192.168.1.63:6379' --resources='{"node:B": 1, "sim": 1}'
 
 <!-- 机器人测试 -->
 bash recipe/vla/run_pi05_robot_test.sh
@@ -28,3 +28,18 @@ PIPER_ROOT=/shared_disk/users/weijie.ke/verl/recipe/vla/envs/test_env/robot/cont
 export PYTHONPATH=$PIPER_ROOT:$PYTHONPATH
 cd $PIPER_ROOT
 
+
+bash /home/agilex/jeff/kill_ros.sh
+~/cobot_magic/Piper_ros_private-ros-noetic/can_config.sh
+conda activate aloha
+roslaunch piper start_ms_piper.launch mode:=1 auto_enable:=true
+
+
+conda activate pico_env
+
+/opt/apps/roboticsservice/runService.sh
+
+cd /home/agilex-home/agilex/dengqiuping/code/XRoboToolkit-Teleop-Sample-Python
+
+
+python scripts/hardware/teleop_dual_agilex_hardware.py

@@ -9,4 +9,6 @@ class PI0TorchConfig(PretrainedConfig):
         self.state_norm_stats = kwargs.get("state_norm_stats", {})
         self.action_norm_stats = kwargs.get("action_norm_stats", {})
         self.pi05_enabled = kwargs.get("pi05_enabled", False)
+        self.use_endpose = kwargs.get("use_endpose", False)
+        self.no_state = kwargs.get("no_state", False)
 

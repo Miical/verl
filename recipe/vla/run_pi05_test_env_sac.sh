@@ -13,7 +13,7 @@ TEST_DATA_PATH=${TEST_DATA_PATH:-"$DATA_PATH"}
 libero_train_path=/shared_disk/users/yejun.zeng/datasets/huggingface/lerobot/catch_bowl/
 libero_test_path=/shared_disk/users/yejun.zeng/datasets/huggingface/lerobot/catch_bowl/
 
-export CUDA_VISIBLE_DEVICES=0,1,2,3
+export CUDA_VISIBLE_DEVICES=0
 train_files=$libero_train_path
 test_files=$libero_test_path
 
@@ -36,7 +36,7 @@ NUM_ENV_GPUS=1      # Use 1 GPU on node B for environment
 # rollout.n should equal to num_envs for test env
 ROLLOUT_N=1
 # test means test_env using LeRobot dataset replay
-SIM_TYPE="test"
+SIM_TYPE="robot"
 PROJECT_NAME="vla_test_env_RL"
 EXPERIMENT_NAME="${SIM_TYPE}_reinforce_plus_plus_disagg"
 

@@ -40,37 +40,6 @@ class RobotKinematics:
                 "Please install the optional dependencies of `kinematics` in the package."
             ) from e
 
-        # placo.RobotWrapper 期望传入目录路径，会自动在后面加上 /robot.urdf
-        # 如果传入的是 .urdf 文件路径，需要转换为目录结构
-        import os
-        import shutil
-        
-        if urdf_path.endswith('.urdf') and os.path.isfile(urdf_path):
-            # 传入的是 URDF 文件路径，需要创建目录结构
-            urdf_dir = urdf_path  # 使用相同的名称作为目录
-            robot_urdf_path = os.path.join(urdf_dir, 'robot.urdf')
-            
-            # 如果目录不存在或 robot.urdf 不存在，创建它
-            if not os.path.isdir(urdf_dir):
-                # 先备份原文件
-                urdf_file_backup = urdf_path + '.bak'
-                if not os.path.exists(urdf_file_backup):
-                    shutil.copy2(urdf_path, urdf_file_backup)
-                
-                # 删除原文件，创建目录
-                os.remove(urdf_path)
-                os.makedirs(urdf_dir, exist_ok=True)
-                
-                # 将备份文件复制为 robot.urdf
-                shutil.copy2(urdf_file_backup, robot_urdf_path)
-            elif not os.path.exists(robot_urdf_path):
-                # 目录存在但 robot.urdf 不存在
-                urdf_file_backup = urdf_path + '.bak'
-                if os.path.exists(urdf_file_backup):
-                    shutil.copy2(urdf_file_backup, robot_urdf_path)
-            
-            urdf_path = urdf_dir
-        
         self.robot = placo.RobotWrapper(urdf_path)
         self.solver = placo.KinematicsSolver(self.robot)
         self.solver.mask_fbase(True)  # Fix the base

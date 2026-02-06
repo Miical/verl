@@ -84,8 +84,6 @@ try:
         replay_trajectory,
     )
 except ImportError as e:
-    force_print(f"[robot_env.py] 警告: 无法从 gym_manipulator_bipiper 导入: {e}")
-    force_print(f"[robot_env.py] 尝试直接导入模块...")
     # 尝试直接导入模块然后访问
     import lerobot.rl.gym_manipulator_bipiper as gym_manipulator_bipiper_module
     RobotEnv = gym_manipulator_bipiper_module.RobotEnv
@@ -95,9 +93,7 @@ except ImportError as e:
     reset_follower_position = gym_manipulator_bipiper_module.reset_follower_position
     control_loop = gym_manipulator_bipiper_module.control_loop
     replay_trajectory = gym_manipulator_bipiper_module.replay_trajectory
-    force_print(f"[robot_env.py] ✓ 成功通过模块直接导入")
-
-# 仅导入 robot_env.py 实际使用的 processor 类
+# 导入processor 类
 from lerobot.processor import (
     AddBatchDimensionProcessorStep,
     DataProcessorPipeline,
@@ -288,7 +284,7 @@ class HDF5DataLoader:
             
         Returns:
             包含 'state', 'image', 'action' 的字典，或None（episode结束）
-        """
+        """ 
         if self.ptr >= self.episode_length:
             return None
         
@@ -572,11 +568,12 @@ class TestRobotEnv(gym.Env):
         info = {"is_success": False}
         return result_obs, info
     
-    def step(self, action: np.ndarray) -> tuple[dict[str, Any], float, bool, bool, dict[str, Any]]:
+    def step(self, action: np.ndarray, transition_info: dict[str, Any] | None = None) -> tuple[dict[str, Any], float, bool, bool, dict[str, Any]]:
         """执行一步动作。
         
         Args:
             action: 动作数组 [14] (末端位姿目标)
+            transition_info: 过渡信息字典 (为了与RobotEnv接口兼容,TestRobotEnv中不使用)
             
         Returns:
             (observation, reward, terminated, truncated, info) 元组
@@ -584,6 +581,7 @@ class TestRobotEnv(gym.Env):
         Note:
             - 数据回放模式：action 被记录但不影响环境（回放历史数据）
             - 随机模式：action 可以用于简单的状态更新（可选）
+            - transition_info 参数在 TestRobotEnv 中被忽略,仅用于接口兼容
         """
         # 验证 action 格式
         if action is not None:
@@ -896,7 +894,7 @@ class RealRobotEnvWrapper:
         })
         
         # 任务描述
-        self.task_description = getattr(cfg, 'task_description', 'manipulation task')
+        self.task_description = getattr(cfg, 'task_description', 'catch_bowl')
         
         force_print(f"[RealRobotEnvWrapper] Initialized: rank={rank}, num_envs={self.num_envs}")
     
@@ -911,33 +909,35 @@ class RealRobotEnvWrapper:
             current_file = Path(__file__).resolve()
             piper_dir = current_file.parent  # .../robot/controller/piper/
             
-            urdf_path = piper_dir / "local_assets" / "piper.urdf" / "robot.urdf"
-            mesh_dir = piper_dir / "local_assets"
+            # 🔧 关键修复：使用 local_assets/ 目录下的 robot.urdf
+            # 这样 placo 会在 local_assets/ 下查找 robot.urdf，
+            # 并且 mesh 文件的相对路径也是相对于 local_assets/ 的
+            # mesh_dir = piper_dir / "local_assets"
+
+            # urdf_path = mesh_dir  # 传入目录,让 placo 自动查找 robot.urdf
+            urdf_path = "/home/agilex-home/agilex/keweijie/verl/recipe/vla/envs/robot_env/robot/controller/piper/local_assets/robot.urdf"
             
-            force_print(f"[RealRobotEnvWrapper] Current file: {current_file}")
-            force_print(f"[RealRobotEnvWrapper] Computed URDF path: {urdf_path}")
-            force_print(f"[RealRobotEnvWrapper] Computed mesh dir: {mesh_dir}")
+            # force_print(f"[RealRobotEnvWrapper] Current file: {current_file}")
+            # force_print(f"[RealRobotEnvWrapper] Computed URDF path: {urdf_path}")
+            # force_print(f"[RealRobotEnvWrapper] URDF exists: {urdf_path.exists()}")
+            # force_print(f"[RealRobotEnvWrapper] Computed mesh dir: {mesh_dir}")
+            # force_print(f"[RealRobotEnvWrapper] Mesh dir exists: {mesh_dir.exists()}")
+            # force_print(f"[RealRobotEnvWrapper] Meshes subdir exists: {(mesh_dir / 'meshes').exists()}")
             
-            # 保存当前工作目录,切换到mesh目录(以便placo能找到mesh文件)
-            original_cwd = os.getcwd()
-            os.chdir(str(mesh_dir)) 
-            
-            try:
-                force_print(f"[RealRobotEnvWrapper] Initializing RobotKinematics...")
-                self.left_kin = RobotKinematics(
-                    urdf_path=str(urdf_path),
-                    target_frame_name="link6",
-                    joint_names=[f"joint{i+1}" for i in range(6)],
-                )
-                self.right_kin = RobotKinematics(
-                    urdf_path=str(urdf_path),
-                    target_frame_name="link6",
-                    joint_names=[f"joint{i+1}" for i in range(6)],
-                )
-                force_print(f"[RealRobotEnvWrapper] RobotKinematics initialized successfully!")
-            finally:
-                # 恢复原来的工作目录
-                os.chdir(original_cwd)
+            # 🔧 不需要切换工作目录，直接传入 local_assets 目录
+            # placo 会在该目录下查找 robot.urdf 和 meshes/
+            force_print(f"[RealRobotEnvWrapper] Initializing RobotKinematics...")
+            self.left_kin = RobotKinematics(
+                urdf_path=str(urdf_path),
+                target_frame_name="joint6",
+                joint_names=[f"joint{i+1}" for i in range(6)],
+            )
+            self.right_kin = RobotKinematics(
+                urdf_path=str(urdf_path),
+                target_frame_name="joint6",
+                joint_names=[f"joint{i+1}" for i in range(6)],
+            )
+            force_print(f"[RealRobotEnvWrapper] RobotKinematics initialized successfully!")
         except Exception as e:
             import traceback
             force_print(f"[RealRobotEnvWrapper] WARNING: Failed to initialize kinematics: {e}")

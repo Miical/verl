@@ -49,7 +49,7 @@ fi
 
 # Real robot config file path
 # 注意: 端侧机器路径与主机不同，使用端侧的路径
-ROBOT_CONFIG_PATH=${ROBOT_CONFIG_PATH:-"/home/agilex-home/agilex/keweijie/verl/recipe/vla/envs/test_env/robot/controller/piper/config/bipiper_gym_pico.json"}
+ROBOT_CONFIG_PATH=${ROBOT_CONFIG_PATH:-"/home/agilex-home/agilex/keweijie/verl/recipe/vla/envs/robot_env/robot/controller/piper/config/bipiper_gym_pico.json"}
 
 # Test env specific config (for backward compatibility)
 TEST_STEP_SIZE=${TEST_STEP_SIZE:-1}
@@ -89,9 +89,9 @@ $PYTHON -m recipe.vla.main_sac \
     +env.train.env.processor.observation.display_cameras=False \
     +env.train.env.device="cpu" \
     env.actor.model.num_action_chunks=30 \
-    env.actor.model.action_dim=16 \
+    env.actor.model.action_dim=14 \
     env.train.only_eval=True \
-    env.train.max_episode_steps=300 \
+    env.train.max_episode_steps=600 \
     env.train.video_cfg.save_video=False \
     env.train.video_cfg.video_base_dir=${VIDEO_OUTPUT} \
     env.train.seed=42 \
@@ -116,6 +116,7 @@ $PYTHON -m recipe.vla.main_sac \
     actor_rollout_ref.model.use_remove_padding=False \
     actor_rollout_ref.model.trust_remote_code=False \
     +actor_rollout_ref.model.override_config.attn_implementation=eager \
+    +actor_rollout_ref.model.override_config.use_cache=True \
     actor_rollout_ref.actor.entropy_coeff=0. \
     actor_rollout_ref.rollout.temperature=1.6 \
     actor_rollout_ref.rollout.prompt_length=512 \

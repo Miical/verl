@@ -211,6 +211,7 @@ def reset_follower_position(robot_arm: Robot, target_position: np.ndarray,end_po
         robot_arm.bus_right.sync_write("Goal_Position", action_dict_right)
         busy_wait(0.015)
     
+
     robot_arm.bus_left.interface.ModeCtrl(ctrl_mode=0x01, move_mode=0x00,move_spd_rate_ctrl=50, is_mit_mode=0x00)
     robot_arm.bus_right.interface.ModeCtrl(ctrl_mode=0x01, move_mode=0x00,move_spd_rate_ctrl=50, is_mit_mode=0x00)
     action_zero=[0.056127, 0.0, 0.213266,0.0, 1.48351241090266,0.0,0.05957,0.056127, 0.0, 0.213266,0.0, 1.48351241090266,0.0,0.05957]
@@ -223,6 +224,7 @@ def reset_follower_position(robot_arm: Robot, target_position: np.ndarray,end_po
         robot_arm.send_action(end_pose_targets_dict)
         busy_wait(0.12)
     busy_wait(0.1)
+    
     # pdb.set_trace()    
 
 
@@ -384,16 +386,27 @@ class RobotEnv(gym.Env):
 
         return obs, {TeleopEvents.IS_INTERVENTION: False}
 
-    def step(self, action) -> tuple[dict[str, np.ndarray], float, bool, bool, dict[str, Any]]:
+    def step(self, action, transition_info) -> tuple[dict[str, np.ndarray], float, bool, bool, dict[str, Any]]:
         """Execute one environment step with given action."""
         # joint_targets_dict = {f"{key}.pos": action[i] for i, key in enumerate(self.robot.bus.motors)}
         #盲改
         end_pose_targets_dict = {f"{key}.value": action[i] for i, key in enumerate(self._end_pose_name)}
-        self.robot.send_action(end_pose_targets_dict)
+        is_intervention = False
 
+        if TeleopEvents.IS_INTERVENTION in transition_info:
+            is_intervention = transition_info[TeleopEvents.IS_INTERVENTION]
+        #print(f"is_intervention: {is_intervention}")
+        #当不进行干预时，发送动作
+        if not is_intervention:
+            self.robot.bus_left.interface.ModeCtrl(ctrl_mode=0x01, move_mode=0x00,move_spd_rate_ctrl=50, is_mit_mode=0x00)
+            self.robot.bus_right.interface.ModeCtrl(ctrl_mode=0x01, move_mode=0x00,move_spd_rate_ctrl=50, is_mit_mode=0x00)
+            print("不在干预")
+            self.robot.send_action(end_pose_targets_dict)
+
+        # print("在干预")
         obs = self._get_observation()
         self._raw_end_pose_value = {f"{key}.value": obs[f"{key}.value"] for key in self._end_pose_name}
-
+        # print("self._raw_end_pose_value:",self._raw_end_pose_value)
         # self._raw_joint_positions = {f"{key}.pos": obs[f"{key}.pos"] for key in self._joint_names}
 
         if self.display_cameras:
@@ -747,7 +760,8 @@ def step_env_and_process_transition(
     except Exception:
         print("[step_env_and_process_transition] processed_action (non-numpy printable):", processed_action)
 
-    obs, reward, terminated, truncated, info = env.step(processed_action)
+    transition_info = processed_action_transition[TransitionKey.INFO]
+    obs, reward, terminated, truncated, info = env.step(processed_action, transition_info)
 
     reward = reward + processed_action_transition[TransitionKey.REWARD]
     terminated = terminated or processed_action_transition[TransitionKey.DONE]

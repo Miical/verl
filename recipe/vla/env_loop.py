@@ -157,21 +157,9 @@ class EnvLoop:
         force_print(f"[EnvLoop.generate_sequences] Starting...")
         
         loop = asyncio.get_event_loop()
-        
-        force_print(f"[EnvLoop.generate_sequences] Calling switch_to_rollout()...")
-        t_start = time.perf_counter()
         self.rollout_wg.switch_to_rollout()
-        force_print(f"[EnvLoop.generate_sequences] switch_to_rollout() completed in {time.perf_counter() - t_start:.3f}s")
-        
-        force_print(f"[EnvLoop.generate_sequences] Calling run()...")
-        t_start = time.perf_counter()
         output = loop.run_until_complete(self.run(prompts))
-        force_print(f"[EnvLoop.generate_sequences] run() completed in {time.perf_counter() - t_start:.3f}s")
-        
-        force_print(f"[EnvLoop.generate_sequences] Calling switch_to_train()...")
-        t_start = time.perf_counter()
         self.rollout_wg.switch_to_train()
-        force_print(f"[EnvLoop.generate_sequences] switch_to_train() completed in {time.perf_counter() - t_start:.3f}s")
         
         force_print(f"[EnvLoop.generate_sequences] Completed!")
         return output
@@ -322,6 +310,7 @@ class EnvLoop:
 
                 # Prepare next observation
                 # 使用模型需要的三张图像: head_image, left_wrist_image, right_wrist_image
+                # 注意：state 的维度可能是 [num_envs, chunk_steps, state_dim]，直接传递给模型
                 next_obs = DataProto(
                     batch=env_result.batch.select("head_image", "left_wrist_image", "right_wrist_image", "state"),
                     non_tensor_batch={"task_descriptions": env_result.non_tensor_batch["task_descriptions"]},

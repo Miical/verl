@@ -106,83 +106,9 @@ class RobotActionToPolicyActionProcessorStep(ActionProcessorStep):
         obs_vals = [float(obs_dict[k]) for k in obs_keys]
         obs_tensor = torch.tensor(obs_vals, dtype=action.dtype, device=action.device)
         
-        process_action = obs_tensor
-
-        '''
-        if self.prev_obs_tensor is None:
-            self.prev_obs_tensor = obs_tensor
-        
-        transition_info = self.transition[TransitionKey.INFO]
-        if TeleopEvents.IS_INTERVENTION in transition_info:
-            is_intervention = transition_info[TeleopEvents.IS_INTERVENTION]
-            
-            if is_intervention:
-                #process_action = action + obs_tensor
-                print(f"[RobotActionToPolicyActionProcessorStep]: intervention")
-                # Start from previous observation pose
-                process_action = self.prev_obs_tensor.clone()
-                
-                # Apply translation deltas (x, y, z) - these can be added directly
-                # Left arm: indices 0, 1, 2
-                process_action[0] = self.prev_obs_tensor[0] + action[0]
-                process_action[1] = self.prev_obs_tensor[1] + action[1]
-                process_action[2] = self.prev_obs_tensor[2] + action[2]
-                # Right arm: indices 7, 8, 9
-                process_action[7] = self.prev_obs_tensor[7] + action[7]
-                process_action[8] = self.prev_obs_tensor[8] + action[8]
-                process_action[9] = self.prev_obs_tensor[9] + action[9]
-                
-                # Apply rotation deltas (rx, ry, rz) - need proper rotation composition
-                # Left arm rotation: indices 3, 4, 5
-                left_euler = self.prev_obs_tensor[3:6]
-                left_delta = action[3:6]
-                process_action[3:6] = self._apply_rotation_delta(left_euler, left_delta)
-                
-                # Right arm rotation: indices 10, 11, 12
-                right_euler = self.prev_obs_tensor[10:13]
-                right_delta = action[10:13]
-                process_action[10:13] = self._apply_rotation_delta(right_euler, right_delta)
-                
-                # Gripper deltas are absolute, not relative
-                process_action[6] = action[6]  # Left gripper
-                process_action[13] = action[13]  # Right gripper
-            if is_intervention and not self.prev_is_intervention:
-                self.prev_obs_tensor = obs_tensor
-            self.prev_is_intervention = is_intervention
-
-            # if not is_intervention:
-            #     """
-            #     限位:
-            #     - 左臂: 0–5 → dx, dy, dz, drx, dry, drz
-            #     - 右臂: 7–12 → dx, dy, dz, drx, dry, drz
-            #     - 夹爪: 6, 13 不限位
-            #     位移 ±0.3 米, 姿态 ±30 度(π/6 弧度)
-            #     """
-            #     # === 限位 ===
-            #     pos_limit = 0.01
-            #     rot_limit = math.pi / 180
-
-            #     # 位移索引（左右臂）
-            #     pos_idx = [0, 1, 2, 7, 8, 9]
-            #     # 姿态索引（左右臂）
-            #     rot_idx = [3, 4, 5, 10, 11, 12]
-
-            #     # clamp 限幅
-            #     action[pos_idx] = torch.clamp(action[pos_idx], -pos_limit, pos_limit)
-            #     action[rot_idx] = torch.clamp(action[rot_idx], -rot_limit, rot_limit)
-            #     process_action = action + obs_tensor
-                # print("触发限位")
-        '''
-        # origin_obs_tensor_action = torch.tensor([5.6127e-02, 0.0000e+00, 2.1327e-01, 0.0000e+00, 1.4835e+00, 0.0000e+00,
-        # 1.4700e-03, 5.6127e-02, 0.0000e+00, 2.1327e-01, 0.0000e+00, 1.4835e+00,
-        # 0.0000e+00, 2.3100e-03], dtype=action.dtype, device=action.device)
-        # process_action = action + origin_obs_tensor_action
-        
-        # 在 policy_robot_bridge.py 的 action() 方法中添加
-        # print(f"[单位检查] delta_rot 范围: [{action[3]:.6f}, {action[4]:.6f}, {action[5]:.6f}] rad")
-        # print(f"[单位检查] obs_rot 范围: [{obs_tensor[3]:.6f}, {obs_tensor[4]:.6f}, {obs_tensor[5]:.6f}] rad")
-        # print(f"[单位检查] 结果范围: [{process_action[3]:.6f}, {process_action[4]:.6f}, {process_action[5]:.6f}] rad")
-        #print(f"[RobotActionToPolicyActionProcessorStep]: delta action: {action}, total action: {process_action}")
+        # process_action = obs_tensor
+        process_action = action
+        print(f"process action:{process_action},action:{action}")
         return process_action
 
     def get_config(self) -> dict[str, Any]:

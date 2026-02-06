@@ -97,7 +97,75 @@ class DeltaActions:
         action[..., :dims] -= torch.where(self.mask, state[..., :dims], torch.zeros_like(state[..., :dims])).unsqueeze(-2)
         data['action'] = action
         return data
+    
+class DeltaActions_Endpose:
 
+    def __init__(self):
+        # If the robot has mobile base, masks of base action are False and it doesn't need to be specified explicitly.
+        self.mask = torch.tensor([True, True, True, True, True, True, False, True, True, True, True, True, True, False])
+
+    def to(self, device: torch.device | str) -> None:
+        self.mask = self.mask.to(device)
+
+    def __call__(self, data: dict[str, Any]) -> dict[str, Any]:
+        if 'action' not in data or 'observation.state' not in data:
+            assert False, "DeltaActions_Endpose requires both 'action' and 'observation.state' in data."
+            return data
+        state, action = data['observation.state'], data['action']
+        device = action.device
+        # print(">>> DeltaActions_Endpose ", type(state), state.shape, type(action), action.shape, device)
+        if len(state.shape) == 1:
+            state = state[np.newaxis, :]
+
+        state = ik.transform_state_to_end_pose(state)
+        action = ik.transform_state_to_end_pose(action)
+        
+        for t in range(action.shape[0]):
+            # Left arm: indices 0-6 (x, y, z, roll, pitch, yaw, gripper)
+            # Right arm: indices 7-13 (x, y, z, roll, pitch, yaw, gripper)
+            # Extract current state poses for both arms
+            state_left_pos = state[..., :3]    # x, y, z
+            state_left_rpy = state[..., 3:6]   # roll, pitch, yaw
+            state_right_pos = state[..., 7:10] # x, y, z
+            state_right_rpy = state[..., 10:13] # roll, pitch, yaw
+
+            # Extract action for both arms at time t
+            action_left_pos = action[..., t, :3]     # x, y, z
+            action_left_rpy = action[..., t, 3:6]    # roll, pitch, yaw
+            action_right_pos = action[..., t, 7:10]  # x, y, z
+            action_right_rpy = action[..., t, 10:13] # roll, pitch, yaw
+
+            # Convert Euler angles to rotation matrices
+            state_left_rot = R.from_euler('xyz', state_left_rpy, degrees=True)
+            state_right_rot = R.from_euler('xyz', state_right_rpy, degrees=True)
+            action_left_rot = R.from_euler('xyz', action_left_rpy, degrees=True)
+            action_right_rot = R.from_euler('xyz', action_right_rpy, degrees=True)
+            
+            # Calculate relative rotation: state_rot^-1 * action_rot
+            rel_rot_left = state_left_rot.inv() * action_left_rot
+            rel_rot_right = state_right_rot.inv() * action_right_rot
+
+            # Calculate position deltas
+            delta_left_pos = action_left_pos - state_left_pos
+            delta_right_pos = action_right_pos - state_right_pos
+
+            # Convert relative rotations back to Euler angles
+            rel_euler_left = rel_rot_left.as_euler('xyz', degrees=True)
+            rel_euler_right = rel_rot_right.as_euler('xyz', degrees=True)
+
+            # Update actions with calculated deltas
+            action[..., t, :3] = delta_left_pos
+            action[..., t, 3:6] = rel_euler_left
+            action[..., t, 7:10] = delta_right_pos
+            action[..., t, 10:13] = rel_euler_right
+            # Gripper values are already deltas or should be handled separately if needed
+        
+        data['action'] = torch.from_numpy(action).to(device)
+        data['observation.state'] = torch.from_numpy(state[0]).to(device)
+        # print("<<< ", type(data['observation.state']), data['observation.state'].shape, device, type(data['action']), data['action'].shape, device)
+        # data['observation.state'] = torch.from_numpy(state).to(device)
+        
+        return data
 
 class AbsoluteActions:
     """Repacks delta actions into absolute action space."""
@@ -118,6 +186,69 @@ class AbsoluteActions:
         data['action'] = action
         return data
 
+class AbsoluteActions_Endpose:
+    """Repacks delta actions into absolute action space."""
+
+    def __init__(self):
+        # If the robot has mobile base, masks of base action are False and it doesn't need to be specified explicitly.
+        self.mask = torch.tensor([True, True, True, True, True, True, False, True, True, True, True, True, True, False])
+
+    def to(self, device: torch.device | str) -> None:
+        self.mask = self.mask.to(device)
+
+    def __call__(self, data: dict[str, Any]) -> dict[str, Any]:
+        if 'action' not in data or 'observation.ee_state' not in data:
+            raise ValueError("Data must contain 'action' and 'observation.state' keys.")
+            return data
+        
+        state, action = data["observation.ee_state"], data["action"]
+
+        for t in range(action.shape[0]):
+            # Left arm: indices 0-6 (x, y, z, roll, pitch, yaw, gripper)
+            # Right arm: indices 7-13 (x, y, z, roll, pitch, yaw, gripper)
+            
+            # Extract current state poses for both arms
+            state_left_pos = state[..., :3]    # x, y, z
+            state_left_rpy = state[..., 3:6]   # roll, pitch, yaw
+            state_right_pos = state[..., 7:10] # x, y, z
+            state_right_rpy = state[..., 10:13] # roll, pitch, yaw
+            
+            # Extract action deltas for both arms at time t
+            delta_left_pos = action[..., t, :3]     # x, y, z
+            delta_left_rpy = action[..., t, 3:6]    # roll, pitch, yaw
+            delta_right_pos = action[..., t, 7:10]  # x, y, z
+            delta_right_rpy = action[..., t, 10:13] # roll, pitch, yaw
+
+            
+            # Convert state Euler angles to rotation matrices
+            state_left_rot = R.from_euler('xyz', state_left_rpy, degrees=True)
+            state_right_rot = R.from_euler('xyz', state_right_rpy, degrees=True)
+            
+            # Convert delta Euler angles to rotation matrices
+            delta_left_rot = R.from_euler('xyz', delta_left_rpy, degrees=True)
+            delta_right_rot = R.from_euler('xyz', delta_right_rpy, degrees=True)
+            
+            # Calculate absolute rotation: state_rot * delta_rot
+            abs_rot_left = state_left_rot * delta_left_rot
+            abs_rot_right = state_right_rot * delta_right_rot
+            
+            # Calculate absolute positions
+            abs_left_pos = state_left_pos + delta_left_pos
+            abs_right_pos = state_right_pos + delta_right_pos
+            print("Delta right pos is ", delta_right_pos, state_right_pos)
+            # Convert absolute rotations back to Euler angles
+            abs_euler_left = abs_rot_left.as_euler('xyz', degrees=True)
+            abs_euler_right = abs_rot_right.as_euler('xyz', degrees=True)
+            
+            # Update actions with calculated absolute values
+            action[..., t, :3] = abs_left_pos
+            action[..., t, 3:6] = abs_euler_left
+            action[..., t, 7:10] = abs_right_pos
+            action[..., t, 10:13] = abs_euler_right
+            # Gripper values are already absolute or should be handled separately if needed
+        data["action"] = action
+
+        return data
 
 class AlohaInputs:
     """Inputs for the Aloha policy."""

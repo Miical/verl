@@ -59,32 +59,31 @@ class PiperFollowerEndEffector(PiperFollower):
         if not hasattr(self.config, "orientation_activation_eps"):
             self.config.orientation_activation_eps = 1e-9
 
-        # 🔧 硬编码绝对路径，避免路径查找问题
+        # 🔧 使用绝对路径，基于当前文件位置计算
         import os
         from pathlib import Path
         
-        # 硬编码的绝对路径
-        HARDCODED_URDF_PATH = "/home/agilex-home/agilex/keweijie/verl/recipe/vla/envs/test_env/robot/controller/piper/local_assets/piper.urdf/robot.urdf"
-        HARDCODED_MESH_DIR = "/home/agilex-home/agilex/keweijie/verl/recipe/vla/envs/test_env/robot/controller/piper/local_assets"
+        # 基于当前文件位置计算 local_assets 目录的绝对路径
+        # piper_follower_end_effector.py 位于 .../lerobot/robots/piper_follower/
+        # local_assets 位于 .../local_assets/
+        current_file = Path(__file__).resolve()
+        piper_follower_dir = current_file.parent  # .../lerobot/robots/piper_follower/
+        lerobot_dir = piper_follower_dir.parent.parent  # .../lerobot/
+        piper_dir = lerobot_dir.parent  # .../piper/
+        local_assets_dir = piper_dir / "local_assets"
         
-        # 使用硬编码路径
-        urdf_abs_path = Path(HARDCODED_URDF_PATH)
-        mesh_dir = Path(HARDCODED_MESH_DIR)
+        logger.info(f"[PiperFollowerEndEffector] Current file: {current_file}")
+        logger.info(f"[PiperFollowerEndEffector] local_assets dir (absolute): {local_assets_dir}")
+        logger.info(f"[PiperFollowerEndEffector] Directory exists: {local_assets_dir.exists()}")
+        logger.info(f"[PiperFollowerEndEffector] robot.urdf exists: {(local_assets_dir / 'robot.urdf').exists()}")
+        logger.info(f"[PiperFollowerEndEffector] meshes/ exists: {(local_assets_dir / 'meshes').exists()}")
         
-        original_cwd = os.getcwd()
+        # 🔧 RobotKinematics 内部会自动处理工作目录切换
+        # 只需传入 local_assets 目录的绝对路径
+        kinL = RobotKinematics(urdf_path=str(local_assets_dir), target_frame_name=self.config.target_frame_name)
+        kinR = RobotKinematics(urdf_path=str(local_assets_dir), target_frame_name=self.config.target_frame_name)
         
-        # 切换到包含 meshes/ 的目录
-        logger.info(f"[PiperFollowerEndEffector] Switching to mesh directory: {mesh_dir}")
-        logger.info(f"[PiperFollowerEndEffector] URDF file: {urdf_abs_path}")
-        os.chdir(str(mesh_dir))
-        
-        # 创建运动学求解器（placo 会基于当前工作目录查找 mesh 文件）
-        kinL = RobotKinematics(urdf_path=str(urdf_abs_path), target_frame_name=self.config.target_frame_name)
-        kinR = RobotKinematics(urdf_path=str(urdf_abs_path), target_frame_name=self.config.target_frame_name)
-        
-        # 创建完成后恢复工作目录
-        os.chdir(original_cwd)
-        logger.info(f"[PiperFollowerEndEffector] Restored working directory: {original_cwd}")
+        logger.info(f"[PiperFollowerEndEffector] RobotKinematics initialized successfully!")
 
         model_joint_order = ["joint1","joint2","joint3","joint4","joint5","joint6","joint7","joint8"]
         for kin in (kinL, kinR):
@@ -227,6 +226,7 @@ class PiperFollowerEndEffector(PiperFollower):
         use_mode = mode if mode is not None else self.ctrl_mode
         # Read arm position from both arms
         start = time.perf_counter()
+
         if use_mode == "Present_Position":
             # 左臂位置
             left_positions = self.bus_left.sync_read(use_mode)
@@ -236,11 +236,52 @@ class PiperFollowerEndEffector(PiperFollower):
             right_positions = self.bus_right.sync_read(use_mode)
             obs_dict.update({f"{motor}.pos": val for motor, val in right_positions.items()})
         elif use_mode == "End_Pose":
-            # pdb.set_trace()
-            left_end_pos = self.bus_left.sync_read(use_mode)
-            right_end_pos = self.bus_right.sync_read(use_mode)
-            obs_dict = ({f"{left_end_pos}.value": val for left_end_pos, val in left_end_pos.items()})
-            obs_dict.update({f"{right_end_pos}.value": val for right_end_pos, val in right_end_pos.items()})
+            tmp_use_mode = "Present_Position"
+
+            left_joint_pos = self.bus_left.sync_read(tmp_use_mode)
+            right_joint_pos = self.bus_right.sync_read(tmp_use_mode)
+
+            print("left_joint_pos:", left_joint_pos)
+            print("right_joint_pos:", right_joint_pos)
+
+            obs_dict = {}
+
+            # ===== left arm: joint -> fake end pose =====
+            if left_joint_pos is not None:
+                obs_dict.update({
+                    "left_end_x.value":  left_joint_pos.get("left_joint_1", 0.0),
+                    "left_end_y.value":  left_joint_pos.get("left_joint_2", 0.0),
+                    "left_end_z.value":  left_joint_pos.get("left_joint_3", 0.0),
+                    "left_end_rx.value": left_joint_pos.get("left_joint_4", 0.0),
+                    "left_end_ry.value": left_joint_pos.get("left_joint_5", 0.0),
+                    "left_end_rz.value": left_joint_pos.get("left_joint_6", 0.0),
+                    "left_end_gripper.value": left_joint_pos.get("left_gripper", 0.0),
+                })
+
+            # ===== right arm: joint -> fake end pose =====
+            if right_joint_pos is not None:
+                obs_dict.update({
+                    "right_end_x.value":  right_joint_pos.get("right_joint_1", 0.0),
+                    "right_end_y.value":  right_joint_pos.get("right_joint_2", 0.0),
+                    "right_end_z.value":  right_joint_pos.get("right_joint_3", 0.0),
+                    "right_end_rx.value": right_joint_pos.get("right_joint_4", 0.0),
+                    "right_end_ry.value": right_joint_pos.get("right_joint_5", 0.0),
+                    "right_end_rz.value": right_joint_pos.get("right_joint_6", 0.0),
+                    "right_end_gripper.value": right_joint_pos.get("right_gripper", 0.0),
+                })
+
+            # ===== optional debug flag =====
+            obs_dict["_end_pose_is_fake"] = True
+
+        # elif use_mode == "End_Pose":
+        #     tmp_use_mode = "Present_Position"
+        #     left_end_pos = self.bus_left.sync_read(tmp_use_mode)
+        #     right_end_pos = self.bus_right.sync_read(tmp_use_mode)
+        #     # pdb.set_trace()
+        #     # left_end_pos = self.bus_left.sync_read(use_mode)
+        #     # right_end_pos = self.bus_right.sync_read(use_mode)
+        #     obs_dict = ({f"{left_end_pos}.value": val for left_end_pos, val in left_end_pos.items()})
+        #     obs_dict.update({f"{right_end_pos}.value": val for right_end_pos, val in right_end_pos.items()})
 
         dt_ms = (time.perf_counter() - start) * 1e3
         logger.debug(f"{self} read dual-arm state: {dt_ms:.1f}ms")
