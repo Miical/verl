@@ -113,10 +113,13 @@ class EnvLoop:
                 action_result: DataProto = await asyncio.to_thread(rollout_futures[stage_id].get)
 
                 trajectories[stage_id][-1]["action"] = action_result
-                action_data = DataProto.from_dict(
-                    non_tensors={"actions": action_result.batch["action"].cpu().numpy()},
-                    meta_info={"stage_id": stage_id},
-                )
+
+                action_non_tensors = {"actions": action_result.batch["action"].cpu().numpy()}
+                if "critic_values" in action_result.batch:
+                    critic_values = action_result.batch["critic_values"].detach().float().cpu().numpy()
+                    action_non_tensors["critic_values"] = critic_values.reshape(critic_values.shape[0], -1)
+
+                action_data = DataProto.from_dict(non_tensors=action_non_tensors, meta_info={"stage_id": stage_id})
 
                 env_ref = self.env_wg.env_interact_step(action_data)
                 env_result: DataProto = await asyncio.to_thread(env_ref.get)

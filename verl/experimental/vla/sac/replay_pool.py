@@ -50,8 +50,41 @@ class SACReplayPool:
 
         if self.pool is None:
             self._lazy_init_pool(batch)
+        elif not self._is_schema_compatible(batch):
+            logger.warning(
+                "Replay pool schema mismatch detected. "
+                "Discarding loaded replay pool and reinitializing with current batch schema."
+            )
+            self._lazy_init_pool(batch)
+            self.size = 0
+            self.position = 0
 
         self._insert_block_to_pool(batch)
+
+    def _is_schema_compatible(self, sample: TensorDict) -> bool:
+        """Check if incoming sample tensor shapes are compatible with existing pool schema."""
+
+        if self.pool is None:
+            return True
+
+        for key, value in sample.items():
+            if key not in self.pool:
+                return False
+
+            src_shape = tuple(value.shape[1:])
+            dst_shape = tuple(self.pool[key].shape[1:])
+            if src_shape == dst_shape:
+                continue
+
+            # Allow singleton last-dim drift, e.g. [B] <-> [B, 1].
+            if len(src_shape) + 1 == len(dst_shape) and dst_shape[-1] == 1 and src_shape == dst_shape[:-1]:
+                continue
+            if len(dst_shape) + 1 == len(src_shape) and src_shape[-1] == 1 and dst_shape == src_shape[:-1]:
+                continue
+
+            return False
+
+        return True
 
     def sample_batch(self, batch_size: int) -> TensorDict:
         """Sample a batch of experiences from the replay pool.
@@ -200,7 +233,29 @@ class SACReplayPool:
         length = min(source.size(0), self.capacity)
         idx = (self.position + torch.arange(length)) % self.capacity
         for key in source.keys():
-            self.pool[key].index_copy_(0, idx, source[key][:length].to(self.pool_device))
+            dst = self.pool[key]
+            src = source[key][:length].to(self.pool_device)
+
+            # Backward compatibility for replay pools saved with older tensor shapes
+            # (e.g. [B, 1] vs [B]).
+            if src.ndim != dst.ndim:
+                if src.ndim == dst.ndim - 1 and dst.shape[-1] == 1:
+                    src = src.unsqueeze(-1)
+                elif src.ndim == dst.ndim + 1 and src.shape[-1] == 1:
+                    src = src.squeeze(-1)
+
+            if src.ndim == dst.ndim and src.shape[1:] != dst.shape[1:]:
+                if src.shape[1:] == dst.shape[1:-1] and dst.shape[-1] == 1:
+                    src = src.unsqueeze(-1)
+                elif dst.shape[1:] == src.shape[1:-1] and src.shape[-1] == 1:
+                    src = src.squeeze(-1)
+
+            if src.ndim != dst.ndim or src.shape[1:] != dst.shape[1:]:
+                raise RuntimeError(
+                    f"Replay pool shape mismatch for key '{key}': src={tuple(src.shape)}, dst={tuple(dst.shape)}"
+                )
+
+            dst.index_copy_(0, idx, src)
 
         self.position = (self.position + length) % self.capacity
         self.size = min(self.size + length, self.capacity)

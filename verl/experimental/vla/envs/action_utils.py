@@ -190,7 +190,8 @@ def put_text_on_image(image: np.ndarray, lines: list[str], max_width: int = 200)
         textheight = bbox[3] - bbox[1]
         y += textheight + 10
         x = 10
-        draw.text((x, y), text=line, fill=(0, 0, 0))
+        # white text with black stroke improves visibility on dark and bright backgrounds.
+        draw.text((x, y), text=line, fill=(255, 255, 255), stroke_width=1, stroke_fill=(0, 0, 0))
     return np.array(image)
 
 

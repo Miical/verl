@@ -5,9 +5,9 @@ libero_test_path=$HOME/data/libero_rl/test.parquet
 train_files=$libero_train_path
 test_files=$libero_test_path
 
-OUTPUT_DIR=${MLP_MODEL_OUTPUT:-"$HOME/models/vla_libero_grpo"}
-VIDEO_OUTPUT=${MLP_MODEL_OUTPUT:-"$HOME"}/video
-SFT_MODEL_PATH=${SFT_MODEL_PATH:-"$HOME/data/pi05_libero_torch"}
+OUTPUT_DIR=${OUTPUT_DIR:-"/shared_disk/users/angen.ye/code/hil-serl/model/verl_fintune_model/test209"}
+VIDEO_OUTPUT=${VIDEO_OUTPUT:-"${OUTPUT_DIR}/video"}
+SFT_MODEL_PATH=${SFT_MODEL_PATH:-"/shared_disk/users/angen.ye/code/hil-serl/model/pi05_libero_torch"}
 TOKENIZER_PATH="$SFT_MODEL_PATH"
 
 # Physical Node Config
@@ -34,6 +34,9 @@ MINI_BATCH_SIZE=128                            # mini batch size (batch size per
                                                # invalid in SAC, currently
                                                # In SAC, it equal to (max_interactions - 1) * TRAIN_BATCH_SIZE * ROLLOUT_N / NUM_ROLLOUT_GPUS
 MICRO_BATCH_SIZE=8                             # micro batch size (per GPU, for gradient accumulation, should divide MINI_BATCH_SIZE)
+CRITIC_WARMUP_STEPS=500                        # first 500 global steps: update critic only
+ACTOR_UPDATE_INTERVAL=1                        # after warmup, update actor every step
+ROLLOUT_INTERVAL=100                           # rollout once, then do 100 training updates
 
 
 
@@ -51,7 +54,7 @@ if [ -f "$ISSC_PYTHON" ]; then
 fi
 
 # avoiding warnings
-mkdir /root/LIBERO/libero/libero/../datasets
+mkdir -p /root/LIBERO/libero/libero/../datasets
 gpu_name=$(nvidia-smi --query-gpu=name --format=csv,noheader,nounits | head -n 1)
 
 # force osmesa in Hopper
@@ -111,6 +114,8 @@ $PYTHON -m verl.experimental.vla.main_sac \
     actor_rollout_ref.ref.log_prob_micro_batch_size=16 \
     actor_rollout_ref.ref.fsdp_config.param_offload=True \
     +actor_rollout_ref.algorithm='sac' \
+    actor_rollout_ref.actor.critic_warmup_steps=$CRITIC_WARMUP_STEPS \
+    actor_rollout_ref.actor.actor_update_interval=$ACTOR_UPDATE_INTERVAL \
     algorithm.kl_ctrl.kl_coef=0.00 \
     trainer.logger=['console'] \
     trainer.project_name=$PROJECT_NAME \
@@ -123,5 +128,6 @@ $PYTHON -m verl.experimental.vla.main_sac \
     trainer.save_freq=30 \
     trainer.test_freq=-1 \
     trainer.total_epochs=100 \
+    +trainer.rollout_interval=$ROLLOUT_INTERVAL \
     trainer.val_only=False \
     trainer.val_before_train=False

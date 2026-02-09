@@ -143,6 +143,13 @@ def add_transition_prefixes(data: DataProto) -> DataProto:
 
 
 class RobRaySACTrainer(RayPPOTrainer):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+
+        # SAC critic lives inside actor module, there is no standalone critic worker group.
+        # Disable PPO RayTrainer external-critic checkpoint logic to avoid accessing self.critic_wg.
+        self.use_critic = False
+
     def _start_profiling(self, do_profile: bool) -> None:
         """Start profiling for all worker groups including env workers."""
         super()._start_profiling(do_profile)
@@ -270,8 +277,10 @@ class RobRaySACTrainer(RayPPOTrainer):
             if self.config.trainer.get("val_only", False):
                 return
 
+        rollout_interval = self.config.trainer.get("rollout_interval", 1)
+
         # add tqdm
-        self.total_training_steps = self.config.trainer.total_epochs * len(self.train_dataloader) * self.config.trainer.rollout_interval
+        self.total_training_steps = self.config.trainer.total_epochs * len(self.train_dataloader) * rollout_interval
         progress_bar = tqdm(total=self.total_training_steps, initial=self.global_steps, desc="Training Progress")
 
         # we start from step 1
@@ -289,12 +298,16 @@ class RobRaySACTrainer(RayPPOTrainer):
 
         for epoch in range(self.config.trainer.total_epochs):
             train_iter = iter(self.train_dataloader)
-            next_batch_dict = next(train_iter)
             dataloader_len = len(self.train_dataloader)
+            try:
+                next_batch_dict = next(train_iter)
+            except StopIteration:
+                print(f"Skipping epoch {epoch}: dataloader yielded no batch.")
+                continue
             print(f"Starting epoch {epoch}, dataloader length: {dataloader_len}")
 
             for dataloader_step in range(dataloader_len):
-                for training_step in range(self.config.trainer.rollout_interval):
+                for training_step in range(rollout_interval):
                     metrics = {}
                     timing_raw = {}
 
@@ -313,6 +326,8 @@ class RobRaySACTrainer(RayPPOTrainer):
                     # prepare rollout batch
                     if need_rollout:
                         batch_dict = next_batch_dict
+                        if batch_dict is None:
+                            break
                         try:
                             next_batch_dict = next(train_iter)
                         except StopIteration:
