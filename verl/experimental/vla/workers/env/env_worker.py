@@ -15,6 +15,7 @@
 
 import itertools
 
+import numpy as np
 import torch
 from omegaconf import DictConfig
 from torch.distributed.device_mesh import init_device_mesh
@@ -159,6 +160,8 @@ class EnvWorker(Worker, DistProfilerExtension):
         env_info_list = {}
 
         chunk_critic_values = data.non_tensor_batch.get("critic_values", None)
+        if chunk_critic_values is not None:
+            chunk_critic_values = np.asarray(chunk_critic_values, dtype=np.float32)
         extracted_obs, chunk_rewards, chunk_terminations, chunk_truncations, infos = self.simulator_list[
             stage_id
         ].chunk_step(chunk_actions, chunk_critic_values=chunk_critic_values)

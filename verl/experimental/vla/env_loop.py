@@ -116,7 +116,8 @@ class EnvLoop:
 
                 action_non_tensors = {"actions": action_result.batch["action"].cpu().numpy()}
                 if "critic_values" in action_result.batch:
-                    action_non_tensors["critic_values"] = action_result.batch["critic_values"].detach().cpu().numpy()
+                    critic_values = action_result.batch["critic_values"].detach().float().cpu().numpy()
+                    action_non_tensors["critic_values"] = critic_values.reshape(critic_values.shape[0], -1)
 
                 action_data = DataProto.from_dict(non_tensors=action_non_tensors, meta_info={"stage_id": stage_id})
 
