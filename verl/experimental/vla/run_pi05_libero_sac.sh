@@ -36,6 +36,7 @@ MINI_BATCH_SIZE=128                            # mini batch size (batch size per
 MICRO_BATCH_SIZE=8                             # micro batch size (per GPU, for gradient accumulation, should divide MINI_BATCH_SIZE)
 CRITIC_WARMUP_STEPS=500                        # first 500 global steps: update critic only
 ACTOR_UPDATE_INTERVAL=1                        # after warmup, update actor every step
+ROLLOUT_INTERVAL=100                           # rollout once, then do 100 training updates
 
 
 
@@ -127,5 +128,6 @@ $PYTHON -m verl.experimental.vla.main_sac \
     trainer.save_freq=30 \
     trainer.test_freq=-1 \
     trainer.total_epochs=100 \
+    trainer.rollout_interval=$ROLLOUT_INTERVAL \
     trainer.val_only=False \
     trainer.val_before_train=False

@@ -46,6 +46,7 @@ MICRO_BATCH_SIZE=${MICRO_BATCH_SIZE:-8}
 # ---- Training horizon ----
 TOTAL_EPOCHS=${TOTAL_EPOCHS:-15}
 SAVE_FREQ=${SAVE_FREQ:-5}
+ROLLOUT_INTERVAL=${ROLLOUT_INTERVAL:-100}
 
 # Key trick for critic diagnosis:
 # 1) warmup critic for first 500 global steps
@@ -137,5 +138,6 @@ $PYTHON -m verl.experimental.vla.main_sac \
     trainer.save_freq=$SAVE_FREQ \
     trainer.test_freq=-1 \
     trainer.total_epochs=$TOTAL_EPOCHS \
+    trainer.rollout_interval=$ROLLOUT_INTERVAL \
     trainer.val_only=False \
     trainer.val_before_train=False
