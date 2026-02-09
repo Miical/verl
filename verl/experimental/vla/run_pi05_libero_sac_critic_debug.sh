@@ -138,6 +138,6 @@ $PYTHON -m verl.experimental.vla.main_sac \
     trainer.save_freq=$SAVE_FREQ \
     trainer.test_freq=-1 \
     trainer.total_epochs=$TOTAL_EPOCHS \
-    trainer.rollout_interval=$ROLLOUT_INTERVAL \
+    +trainer.rollout_interval=$ROLLOUT_INTERVAL \
     trainer.val_only=False \
     trainer.val_before_train=False

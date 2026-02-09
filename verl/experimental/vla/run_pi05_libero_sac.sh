@@ -54,7 +54,7 @@ if [ -f "$ISSC_PYTHON" ]; then
 fi
 
 # avoiding warnings
-mkdir /root/LIBERO/libero/libero/../datasets
+mkdir -p /root/LIBERO/libero/libero/../datasets
 gpu_name=$(nvidia-smi --query-gpu=name --format=csv,noheader,nounits | head -n 1)
 
 # force osmesa in Hopper
@@ -128,6 +128,6 @@ $PYTHON -m verl.experimental.vla.main_sac \
     trainer.save_freq=30 \
     trainer.test_freq=-1 \
     trainer.total_epochs=100 \
-    trainer.rollout_interval=$ROLLOUT_INTERVAL \
+    +trainer.rollout_interval=$ROLLOUT_INTERVAL \
     trainer.val_only=False \
     trainer.val_before_train=False
