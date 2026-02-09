@@ -57,6 +57,7 @@ class IsaacEnv(gym.Env):
         self.render_images = []
         self.video_cnt = 0
         self.camera_name = cfg.init_params.camera_names
+        self.critic_values = np.zeros(self.num_envs, dtype=np.float32)
 
         # sys env must be set before import isaaclab
         from isaaclab.app import AppLauncher
@@ -184,6 +185,7 @@ class IsaacEnv(gym.Env):
         if self.video_cfg.save_video:
             plot_infos = {
                 "rewards": step_reward,
+                "critic_values": self.critic_values,
                 "terminations": terminations,
                 "task": self.task_descriptions,
             }
@@ -199,7 +201,7 @@ class IsaacEnv(gym.Env):
             infos,
         )
 
-    def chunk_step(self, chunk_actions):
+    def chunk_step(self, chunk_actions, chunk_critic_values=None):
         # chunk_actions: [num_envs, chunk_step, action_dim]
         chunk_size = chunk_actions.shape[1]
 
@@ -209,6 +211,13 @@ class IsaacEnv(gym.Env):
         raw_chunk_truncations = []
         for i in range(chunk_size):
             actions = chunk_actions[:, i]
+            if chunk_critic_values is not None:
+                if chunk_critic_values.ndim == 1:
+                    self.critic_values = chunk_critic_values
+                else:
+                    self.critic_values = chunk_critic_values[:, i]
+            else:
+                self.critic_values.fill(0.0)
             extracted_obs, step_reward, terminations, truncations, infos = self.step(actions)
 
             chunk_rewards.append(step_reward)

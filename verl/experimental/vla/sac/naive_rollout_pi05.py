@@ -56,10 +56,13 @@ class PI0RolloutRob(NaiveRolloutRob):
         with torch.autocast(device_type=get_device_name(), dtype=torch.bfloat16):
             prompts.to(get_device_id())
             output, s, a = self.module.sample_actions(prompts, tokenizer=self.tokenizer)
+            state_features = self.module.sac_forward_state_features(s)
+            critic_values = self.module.sac_forward_critic(a, state_features, method="min")
 
         ret = DataProto.from_dict(
             {
                 "action": output.action,
+                "critic_values": critic_values,
                 "full_action": a["full_action"],
                 "images": s["images"],
                 "image_masks": s["image_masks"],

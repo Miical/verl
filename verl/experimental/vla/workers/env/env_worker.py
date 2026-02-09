@@ -158,9 +158,10 @@ class EnvWorker(Worker, DistProfilerExtension):
 
         env_info_list = {}
 
+        chunk_critic_values = data.non_tensor_batch.get("critic_values", None)
         extracted_obs, chunk_rewards, chunk_terminations, chunk_truncations, infos = self.simulator_list[
             stage_id
-        ].chunk_step(chunk_actions)
+        ].chunk_step(chunk_actions, chunk_critic_values=chunk_critic_values)
         chunk_dones = torch.logical_or(chunk_terminations, chunk_truncations)
 
         if chunk_dones.any():
