@@ -34,6 +34,8 @@ MINI_BATCH_SIZE=128                            # mini batch size (batch size per
                                                # invalid in SAC, currently
                                                # In SAC, it equal to (max_interactions - 1) * TRAIN_BATCH_SIZE * ROLLOUT_N / NUM_ROLLOUT_GPUS
 MICRO_BATCH_SIZE=8                             # micro batch size (per GPU, for gradient accumulation, should divide MINI_BATCH_SIZE)
+CRITIC_WARMUP_STEPS=500                        # first 500 global steps: update critic only
+ACTOR_UPDATE_INTERVAL=1                        # after warmup, update actor every step
 
 
 
@@ -111,6 +113,8 @@ $PYTHON -m verl.experimental.vla.main_sac \
     actor_rollout_ref.ref.log_prob_micro_batch_size=16 \
     actor_rollout_ref.ref.fsdp_config.param_offload=True \
     +actor_rollout_ref.algorithm='sac' \
+    actor_rollout_ref.actor.critic_warmup_steps=$CRITIC_WARMUP_STEPS \
+    actor_rollout_ref.actor.actor_update_interval=$ACTOR_UPDATE_INTERVAL \
     algorithm.kl_ctrl.kl_coef=0.00 \
     trainer.logger=['console'] \
     trainer.project_name=$PROJECT_NAME \

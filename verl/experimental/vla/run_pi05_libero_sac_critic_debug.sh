@@ -48,11 +48,11 @@ TOTAL_EPOCHS=${TOTAL_EPOCHS:-15}
 SAVE_FREQ=${SAVE_FREQ:-5}
 
 # Key trick for critic diagnosis:
-# 1) make actor update interval huge, effectively suppress actor updates
-# 2) keep critic lr explicit and warmup short
-ACTOR_UPDATE_INTERVAL=${ACTOR_UPDATE_INTERVAL:-1000000}
+# 1) warmup critic for first 500 global steps
+# 2) then update actor every step by default
+ACTOR_UPDATE_INTERVAL=${ACTOR_UPDATE_INTERVAL:-1}
 CRITIC_LR=${CRITIC_LR:-1e-4}
-CRITIC_WARMUP_STEPS=${CRITIC_WARMUP_STEPS:-0}
+CRITIC_WARMUP_STEPS=${CRITIC_WARMUP_STEPS:-500}
 
 PROJECT_NAME=${PROJECT_NAME:-"vla_libero_critic_debug"}
 EXPERIMENT_NAME=${EXPERIMENT_NAME:-"${SIM_TYPE}_sac_critic_focus"}
