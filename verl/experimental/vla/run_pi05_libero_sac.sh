@@ -5,7 +5,7 @@ libero_test_path=$HOME/data/libero_rl/test.parquet
 train_files=$libero_train_path
 test_files=$libero_test_path
 
-OUTPUT_DIR=${OUTPUT_DIR:-"/shared_disk/users/angen.ye/code/hil-serl/model/verl_fintune_model/test204"}
+OUTPUT_DIR=${OUTPUT_DIR:-"/shared_disk/users/angen.ye/code/hil-serl/model/verl_fintune_model/test209"}
 VIDEO_OUTPUT=${VIDEO_OUTPUT:-"${OUTPUT_DIR}/video"}
 SFT_MODEL_PATH=${SFT_MODEL_PATH:-"/shared_disk/users/angen.ye/code/hil-serl/model/pi05_libero_torch"}
 TOKENIZER_PATH="$SFT_MODEL_PATH"
