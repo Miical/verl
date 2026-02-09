@@ -15,7 +15,7 @@
 import asyncio
 import logging
 import os
-
+import sys 
 import numpy as np
 import torch
 from omegaconf import DictConfig
@@ -26,6 +26,11 @@ from verl.single_controller.ray import RayWorkerGroup
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
+def force_print(*args, **kwargs):
+    """强制输出并刷新的 print 函数"""
+    print(*args, **kwargs, flush=True)
+    sys.stdout.flush()
+    sys.stderr.flush()
 
 class EnvLoop:
     """An env loop manages interactions between models and vectorized environments. It's designed for computationally
@@ -49,12 +54,24 @@ class EnvLoop:
         self.num_envs_per_worker = config.env.train.num_envs
         self.action_dim = config.env.actor.model.action_dim
         self.num_action_chunks = config.env.actor.model.num_action_chunks
+        self.simulator_type = config.env.train.simulator_type
+        
         # Derived properties
         self.total_envs = self.env_wg.world_size * self.num_envs_per_worker
         if self.total_envs % self.stage_num != 0:
             raise ValueError(f"Total envs ({self.total_envs}) must be divisible by stage_num ({self.stage_num})")
         self.envs_per_stage = self.total_envs // self.stage_num
+        
+        # 根据环境类型动态设置图像键值
+        if self.simulator_type == "robot":
+            # 真实机器人使用三摄像头
+            self.image_keys = ["head_image", "left_wrist_image", "right_wrist_image"]
+        else:
+            # 仿真环境使用通用图像键值
+            self.image_keys = ["full_image", "wrist_image"]
+        logger.info(f"EnvLoop.__init__: Using image keys: {self.image_keys}")
 
+        logger.info(f"EnvLoop.__init__: Calling env_wg.init_worker() with simulator_type={self.simulator_type}...")
         self.env_wg.init_worker()
         self.env_wg.init_simulator()
 
@@ -63,6 +80,7 @@ class EnvLoop:
 
         Args:
             prompts (DataProto): Input batch.
+            reset_future (asyncio.Future): Future for reset operation.
 
         Returns:
             DataProto: Output batch.
@@ -88,11 +106,13 @@ class EnvLoop:
         Args:
             prompts (DataProto): Contains initial state IDs and other settings.
                                  - 'non_tensor_batch.state_ids': A numpy array of state IDs to reset envs.
+            reset_results (DataProto): Pre-computed reset results from environment.
         Returns:
             DataProto: A batch containing the complete trajectories.
         """
         initial_state_ids = prompts.non_tensor_batch["state_ids"]
-
+        # task_ids = prompts.non_tensor_batch["task_ids"]
+        # reset_prompts = DataProto.from_dict(non_tensors={"state_ids": initial_state_ids, "task_ids": task_ids})
         staged_obs = self._restructure_obs_data(reset_results)
         # --- Pipeline state ---
         trajectories = {i: [] for i in range(self.stage_num)}  # To store (obs, action, rew, done) tuples
@@ -124,8 +144,10 @@ class EnvLoop:
                 trajectories[stage_id][-1]["rew"] = env_result.batch["rews"]
                 trajectories[stage_id][-1]["done"] = env_result.batch["terminations"]
 
+                # 动态构建 next_obs，根据环境类型选择图像键值
+                batch_select_keys = self.image_keys + ["state"]
                 next_obs = DataProto(
-                    batch=env_result.batch.select("full_image", "wrist_image", "state"),
+                    batch=env_result.batch.select(*batch_select_keys),
                     non_tensor_batch={"task_descriptions": env_result.non_tensor_batch["task_descriptions"]},
                 )
 

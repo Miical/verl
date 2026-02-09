@@ -75,9 +75,37 @@ def to_tensor(array: dict | torch.Tensor | np.ndarray | list | Any, device: str 
         elif array.dtype == np.uint32:
             array = array.astype(np.int64)
         ret = torch.tensor(array).to(device)
-    else:
-        if isinstance(array, list) and isinstance(array[0], np.ndarray):
+    elif isinstance(array, bytes):
+        # 处理bytes类型（JPEG编码的图像）：转换为uint8 numpy array
+        ret = torch.from_numpy(np.frombuffer(array, dtype=np.uint8)).to(device)
+    elif isinstance(array, list):
+        # 检查是否是bytes列表
+        if len(array) > 0 and isinstance(array[0], bytes):
+            # bytes列表：每个bytes是一个JPEG编码的图像
+            # 找到最大长度并填充
+            max_len = max(len(b) for b in array)
+            padded_arrays = []
+            for b in array:
+                # 将bytes转换为numpy array并填充
+                arr = np.frombuffer(b, dtype=np.uint8)
+                if len(arr) < max_len:
+                    arr = np.pad(arr, (0, max_len - len(arr)), 'constant', constant_values=0)
+                padded_arrays.append(arr)
+            # 堆叠为2D tensor: (num_images, max_len)
+            ret = torch.from_numpy(np.stack(padded_arrays)).to(device)
+        elif len(array) > 0 and isinstance(array[0], torch.Tensor):
+            # tensor列表：直接使用torch.cat或torch.stack
+            # 如果tensor已经有batch维度，使用cat；否则使用stack
+            if array[0].ndim >= 1:
+                ret = torch.cat(array, dim=0).to(device)
+            else:
+                ret = torch.stack(array).to(device)
+        elif len(array) > 0 and isinstance(array[0], np.ndarray):
             array = np.array(array)
+            ret = torch.tensor(array, device=device)
+        else:
+            ret = torch.tensor(array, device=device)
+    else:
         ret = torch.tensor(array, device=device)
     if ret.dtype == torch.float64:
         ret = ret.to(torch.float32)

@@ -80,24 +80,38 @@ def main_task(config):
         raise NotImplementedError
 
     role_worker_mapping = {
-        Role.ActorRollout: ray.remote(RobActorRolloutRefWorker),
-        Role.Env: ray.remote(EnvWorker),
+        # Role.ActorRollout: ray.remote(RobActorRolloutRefWorker),
+        Role.ActorRollout: ray.remote(resources={"node:A": 0.1})(RobActorRolloutRefWorker),
+        # Role.Env: ray.remote(EnvWorker),
+        Role.Env: ray.remote(resources={"node:B": 0.1})(EnvWorker),
     }
 
     # setup resource pool manager
     train_rollout_gpu_num = config.trainer.n_rollout_gpus_per_node
     train_rollout_nodes_num = config.trainer.nnodes
     env_gpu_num = config.trainer.n_env_gpus_per_node
-    env_nodes_num = config.env.disagg_sim.nnodes if config.env.disagg_sim.enable else config.trainer.nnodes
+    
+    # Calculate number of simulation nodes based on disaggregation config
+    if config.env.disagg_sim.enable:
+        # disaggregated sim and actor rollout
+        num_nodes_sim = config.env.disagg_sim.nnodes
+    else:
+        # colocated sim and actor rollout
+        num_nodes_sim = config.trainer.nnodes
 
     resource_pool_spec = {
         "train_rollout_pool": [train_rollout_gpu_num] * train_rollout_nodes_num,
-        "env_gpu_pool": [env_gpu_num] * env_nodes_num,
     }
     mapping = {
         Role.ActorRollout: "train_rollout_pool",
-        Role.Env: "env_gpu_pool",
     }
+    
+    # Always create separate env_gpu_pool for Env workers
+    # This ensures Env workers are scheduled to the correct node (nodeB with robot hardware)
+    # even when they don't need GPUs
+    resource_pool_spec["env_gpu_pool"] = [max(env_gpu_num, 1)] * num_nodes_sim
+    mapping[Role.Env] = "env_gpu_pool"
+    
     resource_pool_manager = ResourcePoolManager(resource_pool_spec=resource_pool_spec, mapping=mapping)
 
     # create datasets
