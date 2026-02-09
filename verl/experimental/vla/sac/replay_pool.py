@@ -50,8 +50,41 @@ class SACReplayPool:
 
         if self.pool is None:
             self._lazy_init_pool(batch)
+        elif not self._is_schema_compatible(batch):
+            logger.warning(
+                "Replay pool schema mismatch detected. "
+                "Discarding loaded replay pool and reinitializing with current batch schema."
+            )
+            self._lazy_init_pool(batch)
+            self.size = 0
+            self.position = 0
 
         self._insert_block_to_pool(batch)
+
+    def _is_schema_compatible(self, sample: TensorDict) -> bool:
+        """Check if incoming sample tensor shapes are compatible with existing pool schema."""
+
+        if self.pool is None:
+            return True
+
+        for key, value in sample.items():
+            if key not in self.pool:
+                return False
+
+            src_shape = tuple(value.shape[1:])
+            dst_shape = tuple(self.pool[key].shape[1:])
+            if src_shape == dst_shape:
+                continue
+
+            # Allow singleton last-dim drift, e.g. [B] <-> [B, 1].
+            if len(src_shape) + 1 == len(dst_shape) and dst_shape[-1] == 1 and src_shape == dst_shape[:-1]:
+                continue
+            if len(dst_shape) + 1 == len(src_shape) and src_shape[-1] == 1 and dst_shape == src_shape[:-1]:
+                continue
+
+            return False
+
+        return True
 
     def sample_batch(self, batch_size: int) -> TensorDict:
         """Sample a batch of experiences from the replay pool.
