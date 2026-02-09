@@ -5,9 +5,9 @@ libero_test_path=$HOME/data/libero_rl/test.parquet
 train_files=$libero_train_path
 test_files=$libero_test_path
 
-OUTPUT_DIR=${MLP_MODEL_OUTPUT:-"$HOME/models/vla_libero_grpo"}
-VIDEO_OUTPUT=${MLP_MODEL_OUTPUT:-"$HOME"}/video
-SFT_MODEL_PATH=${SFT_MODEL_PATH:-"$HOME/data/pi05_libero_torch"}
+OUTPUT_DIR=${OUTPUT_DIR:-"/shared_disk/users/angen.ye/code/hil-serl/model/verl_fintune_model/test204"}
+VIDEO_OUTPUT=${VIDEO_OUTPUT:-"${OUTPUT_DIR}/video"}
+SFT_MODEL_PATH=${SFT_MODEL_PATH:-"/shared_disk/users/angen.ye/code/hil-serl/model/pi05_libero_torch"}
 TOKENIZER_PATH="$SFT_MODEL_PATH"
 
 # Physical Node Config

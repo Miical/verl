@@ -143,6 +143,13 @@ def add_transition_prefixes(data: DataProto) -> DataProto:
 
 
 class RobRaySACTrainer(RayPPOTrainer):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+
+        # SAC critic lives inside actor module, there is no standalone critic worker group.
+        # Disable PPO RayTrainer external-critic checkpoint logic to avoid accessing self.critic_wg.
+        self.use_critic = False
+
     def _start_profiling(self, do_profile: bool) -> None:
         """Start profiling for all worker groups including env workers."""
         super()._start_profiling(do_profile)
@@ -291,8 +298,12 @@ class RobRaySACTrainer(RayPPOTrainer):
 
         for epoch in range(self.config.trainer.total_epochs):
             train_iter = iter(self.train_dataloader)
-            next_batch_dict = next(train_iter)
             dataloader_len = len(self.train_dataloader)
+            try:
+                next_batch_dict = next(train_iter)
+            except StopIteration:
+                print(f"Skipping epoch {epoch}: dataloader yielded no batch.")
+                continue
             print(f"Starting epoch {epoch}, dataloader length: {dataloader_len}")
 
             for dataloader_step in range(dataloader_len):
@@ -315,6 +326,8 @@ class RobRaySACTrainer(RayPPOTrainer):
                     # prepare rollout batch
                     if need_rollout:
                         batch_dict = next_batch_dict
+                        if batch_dict is None:
+                            break
                         try:
                             next_batch_dict = next(train_iter)
                         except StopIteration:
