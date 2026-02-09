@@ -270,8 +270,10 @@ class RobRaySACTrainer(RayPPOTrainer):
             if self.config.trainer.get("val_only", False):
                 return
 
+        rollout_interval = self.config.trainer.get("rollout_interval", 1)
+
         # add tqdm
-        self.total_training_steps = self.config.trainer.total_epochs * len(self.train_dataloader) * self.config.trainer.rollout_interval
+        self.total_training_steps = self.config.trainer.total_epochs * len(self.train_dataloader) * rollout_interval
         progress_bar = tqdm(total=self.total_training_steps, initial=self.global_steps, desc="Training Progress")
 
         # we start from step 1
@@ -294,7 +296,7 @@ class RobRaySACTrainer(RayPPOTrainer):
             print(f"Starting epoch {epoch}, dataloader length: {dataloader_len}")
 
             for dataloader_step in range(dataloader_len):
-                for training_step in range(self.config.trainer.rollout_interval):
+                for training_step in range(rollout_interval):
                     metrics = {}
                     timing_raw = {}
 
