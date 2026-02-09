@@ -162,6 +162,16 @@ class EnvWorker(Worker, DistProfilerExtension):
         chunk_critic_values = data.non_tensor_batch.get("critic_values", None)
         if chunk_critic_values is not None:
             chunk_critic_values = np.asarray(chunk_critic_values, dtype=np.float32)
+            if chunk_critic_values.ndim == 1:
+                chunk_critic_values = chunk_critic_values[:, None]
+
+            chunk_steps = chunk_actions.shape[1]
+            if chunk_critic_values.shape[1] == 1 and chunk_steps > 1:
+                # rollout currently may return one critic estimate per env.
+                # broadcast it to per-step values for video/debug overlays.
+                chunk_critic_values = np.repeat(chunk_critic_values, chunk_steps, axis=1)
+            elif chunk_critic_values.shape[1] > chunk_steps:
+                chunk_critic_values = chunk_critic_values[:, :chunk_steps]
         extracted_obs, chunk_rewards, chunk_terminations, chunk_truncations, infos = self.simulator_list[
             stage_id
         ].chunk_step(chunk_actions, chunk_critic_values=chunk_critic_values)
