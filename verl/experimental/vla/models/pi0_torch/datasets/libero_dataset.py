@@ -18,6 +18,7 @@ class LiberoPi0DatasetInput(Pi0DatasetInput):
     @classmethod
     def from_dataset_batch(cls, batch: DataProto) -> "LiberoPi0DatasetInput":
         input = cls()
+        device = batch.batch["t0.actions"].device
         batch_size = batch.batch["t0.actions"].shape[0]
 
         state = {}
@@ -39,7 +40,9 @@ class LiberoPi0DatasetInput(Pi0DatasetInput):
         input.s1 = state["t1"]
         input.a0 = {"action": pad_dim_to(pad_last_dim_to(batch.batch["t0.actions"], 32), dim=1, target_size=50)}
         input.a1 = {"action": pad_dim_to(pad_last_dim_to(batch.batch["t1.actions"], 32), dim=1, target_size=50)}
-        input.reward = batch.batch["t1.chunk_dones"].unsqueeze(-1).expand(batch_size, 10)  # (B, 10)
-        input.valid = torch.ones((batch_size, 70), dtype=torch.bool, device=batch.batch["t0.actions"].device)
+        input.rewards = batch.batch["t1.chunk_dones"].float()
+        input.valids = torch.ones((batch_size,), dtype=torch.bool, device=device)
+        input.dones = batch.batch["t1.chunk_dones"].bool()
+        input.positive_sample_mask = torch.ones((batch_size,), dtype=torch.bool, device=device)
 
         return input

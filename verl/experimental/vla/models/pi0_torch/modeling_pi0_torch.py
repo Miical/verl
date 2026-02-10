@@ -275,11 +275,11 @@ class PI0ForActionPrediction(PreTrainedModel, SupportSACTraining):
         out['a0.full_action'] = self.action_normalize_transform(batch.a0['action'])
         out['a1.full_action'] = self.action_normalize_transform(batch.a1['action'])
 
-        # Process rewards
-        out['rewards'] = batch.reward
-
-        # Process response masks
-        out['response_mask'] = batch.valid
+        # Process other information
+        out['rewards'] = batch.rewards
+        out['valids'] = batch.valids
+        out['dones'] = batch.dones
+        out['positive_sample_mask'] = batch.positive_sample_mask
 
         return out
 

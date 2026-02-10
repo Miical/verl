@@ -434,8 +434,10 @@ class RobRaySACTrainer(RayPPOTrainer):
                                     "s0.image_masks", "s1.image_masks",
                                     "s0.lang_tokens", "s1.lang_tokens",
                                     "s0.lang_masks", "s1.lang_masks",
+                                    "dones",
+                                    "valids",
                                     "rewards",
-                                    "response_mask"
+                                    "positive_sample_mask"
                                 ])
 
                                 train_batch = DataProto.concat([rl_batch, rlpd_batch])

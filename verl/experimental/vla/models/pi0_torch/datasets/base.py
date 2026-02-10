@@ -20,10 +20,16 @@ class Pi0DatasetInput(ABC):
         self.a0, self.a1 = {}, {}
 
         # reward information, float tensor with shape (B,)
-        self.reward = None
+        self.rewards = None
 
         # valid mask, bool tensor with shape (B,)
-        self.valid = None
+        self.valids = None
+
+        # done information, bool tensor with shape (B,)
+        self.dones = None
+
+        # optional mask for positive samples in the batch, bool tensor with shape (B,)
+        self.positive_sample_mask = None
     
     @classmethod
     @abstractmethod

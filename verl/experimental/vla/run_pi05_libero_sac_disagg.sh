@@ -4,6 +4,8 @@ libero_test_path=$HOME/data/libero_rl/test.parquet
 
 train_files=$libero_train_path
 test_files=$libero_test_path
+# rlpd_files="/file_system/liujincheng/datasets/20251027T005_install_belt_cyt001_01"
+rlpd_files="/file_system/vla-datasets/datasets--yifengzhu-hf--LIBERO-datasets/snapshots/f13aa24a3da8c43c7225569f28c562979fa0e35a/libero_10"
 
 OUTPUT_DIR=${MLP_MODEL_OUTPUT:-"$HOME/models/vla_libero_grpo"}
 VIDEO_OUTPUT=${MLP_MODEL_OUTPUT:-"$HOME"}/video
@@ -33,6 +35,7 @@ MINI_BATCH_SIZE=2048                           # mini batch size (batch size per
                                                # invalid in SAC, currently
                                                # In SAC, it equal to (max_interactions - 1) * TRAIN_BATCH_SIZE * ROLLOUT_N / NUM_ROLLOUT_GPUS
 MICRO_BATCH_SIZE=32                            # micro batch size (per GPU, for gradient accumulation, should divide MINI_BATCH_SIZE)
+RLPD_BATCH_SIZE=$(((MAX_EPISODE_STEPS / NUM_ACTION_CHUNKS - 1) * TRAIN_BATCH_SIZE * ROLLOUT_N))  # batch size for RLPD data loader
 
 
 
@@ -65,8 +68,10 @@ export VERL_LOGGING_LEVEL=INFO
 $PYTHON -m verl.experimental.vla.main_sac \
     data.train_files="$train_files" \
     data.val_files="$test_files" \
+    +data.rlpd_files="$rlpd_files" \
     data.train_batch_size=$TRAIN_BATCH_SIZE \
     data.val_batch_size=4 \
+    +data.rlpd_batch_size=$RLPD_BATCH_SIZE \
     actor_rollout_ref.rollout.n=$ROLLOUT_N \
     env.train.num_envs=$NUM_ENV \
     data.max_prompt_length=256 \
@@ -101,6 +106,7 @@ $PYTHON -m verl.experimental.vla.main_sac \
     actor_rollout_ref.model.enable_gradient_checkpointing=False \
     actor_rollout_ref.model.use_remove_padding=False \
     actor_rollout_ref.model.trust_remote_code=False \
+    actor_rollout_ref.model.override_config.dataset_type=libero \
     +actor_rollout_ref.model.override_config.attn_implementation=eager \
     actor_rollout_ref.actor.entropy_coeff=0. \
     actor_rollout_ref.rollout.temperature=1.6 \
@@ -121,9 +127,10 @@ $PYTHON -m verl.experimental.vla.main_sac \
     trainer.n_gpus_per_node=$NUM_GPUS \
     +trainer.n_env_gpus_per_node=$NUM_ENV_GPUS \
     +trainer.n_rollout_gpus_per_node=$NUM_ROLLOUT_GPUS \
-    +trainer.rollout_interval=30 \
+    +trainer.rollout_interval=60 \
+    +trainer.rlpd_enable=True \
     trainer.nnodes=$NUM_NODES \
-    trainer.save_freq=30 \
+    trainer.save_freq=300 \
     trainer.test_freq=-1 \
     trainer.total_epochs=1000 \
     trainer.val_only=False \
