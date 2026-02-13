@@ -114,7 +114,10 @@ class EnvLoop:
 
                 trajectories[stage_id][-1]["action"] = action_result
                 action_data = DataProto.from_dict(
-                    non_tensors={"actions": action_result.batch["action"].cpu().numpy()},
+                    non_tensors={
+                        "actions": action_result.batch["action"].cpu().numpy(),
+                        "critic_values": action_result.batch["critic_value"].cpu().numpy(),
+                    },
                     meta_info={"stage_id": stage_id},
                 )
 
