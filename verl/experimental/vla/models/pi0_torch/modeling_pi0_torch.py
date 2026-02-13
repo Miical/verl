@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 from typing import Literal
+import logging
 
 import torch
 from onnx_ir import Tensor
@@ -39,6 +40,8 @@ from .pi0_utils import (
 )
 from .policy.base import Pi0Output
 
+logger = logging.getLogger(__name__)
+
 
 class PI0ForActionPrediction(PreTrainedModel, SupportSACTraining):
     config_class = PI0TorchConfig
@@ -50,6 +53,11 @@ class PI0ForActionPrediction(PreTrainedModel, SupportSACTraining):
         self.state_norm_stats = config.state_norm_stats
         self.action_norm_stats = config.action_norm_stats
         self.pi05_enabled = config.pi05_enabled
+        
+        # ===================== MERGED: Code B 配置 =====================
+        self.use_endpose = getattr(config, "use_endpose", False)
+        self.no_state = getattr(config, "no_state", False)
+        # ===================== END MERGED =====================
 
         assert self.state_norm_stats, "state_norm_stats must be provided in PI0TorchConfig"
         assert self.action_norm_stats, "action_norm_stats must be provided in PI0TorchConfig"
@@ -60,15 +68,27 @@ class PI0ForActionPrediction(PreTrainedModel, SupportSACTraining):
         self.action_normalize_transform = Normalize(self.action_norm_stats, use_quantiles=self.pi05_enabled)
         self.image_transform = ImageTransform(resize_imgs_with_padding=(224, 224), enable_image_aug=False)
         max_length = 200 if self.pi05_enabled else 48
-        self.prompt_tokenizer_transform = PromptTokenizerTransform(max_length=max_length, discrete_state_input=False)
+        
+        # ===================== MERGED: Code B 的关键修改 =====================
+        # Pi0.5 必须开启离散 state 输入，否则 prompt 里没有 state conditioning
+        self.prompt_tokenizer_transform = PromptTokenizerTransform(
+            max_length=max_length,
+            discrete_state_input=self.pi05_enabled
+        )
+        # ===================== END MERGED =====================
 
         # Output transforms
         self.state_unnormalize_transform = Unnormalize(self.state_norm_stats, use_quantiles=self.pi05_enabled)
         self.action_unnormalize_transform = Unnormalize(self.action_norm_stats, use_quantiles=self.pi05_enabled)
 
+        # ===================== MERGED: Code B 的警告开关 =====================
+        self._warned_no_abs_transform = False
+        # ===================== END MERGED =====================
+
         self._to(get_device_name())
 
         ##### SAC Algorithm Support #####
+        # ===================== 保留 Code A 的网络结构 =====================
         if getattr(self.config, "sac_enable", False):
             head_num = 2 if getattr(self.config, "double_q", True) else 1
 
@@ -97,6 +117,7 @@ class PI0ForActionPrediction(PreTrainedModel, SupportSACTraining):
                     for _ in range(head_num)
                 ]
             )
+        # ===================== END 保留 Code A =====================
 
             self.target_network_heads.load_state_dict(self.critic_heads.state_dict())
 
@@ -150,46 +171,174 @@ class PI0ForActionPrediction(PreTrainedModel, SupportSACTraining):
         self,
         env_obs: DataProto,
         tokenizer,
+        env_name: str,
     ) -> tuple[Pi0Output, dict, dict]:
-        """Run one forward pass from raw inputs to final action sequence.
-
-        Args:
-            env_obs: The environment observations as DataProto.
-            tokenizer: The tokenizer used for prompt tokenization.
-
-        Returns:
-            A tuple of (pi0_output, s, a):
-                - pi0_output: The Pi0Output containing the predicted actions.
-                - s: Dictionary of tensors representing the states, with keys
-                    - "images": torch.Tensor of shape (B, n_images, C, H, W)
-                    - "image_masks": torch.Tensor of shape (B, n_images)
-                    - "lang_tokens": torch.Tensor of shape (B, L)
-                    - "lang_masks": torch.Tensor of shape (B, L)
-                    - "states": torch.Tensor of shape (B, state_dim)
-                - a: Dictionary of tensors representing actions, with key:
-                    - "full_action": torch.Tensor of shape (B, action_steps, action_dim)
-        """
+        """Run one forward pass from raw inputs to final action sequence."""
 
         from .policy.libero_policy import LiberoPi0Input
+        from .policy.piper_policy import PiperPi0Input
 
-        pi0_input = LiberoPi0Input.from_env_obs(env_obs)
+        if env_name == "piper":
+            pi0_input = PiperPi0Input.from_env_obs(env_obs)
+        elif env_name == "libero":
+            pi0_input = LiberoPi0Input.from_env_obs(env_obs)
+        else:
+            raise ValueError(f"Unknown env_name={env_name}")
+
+        # 保存原始 state (未归一化) 用于 delta->absolute 后处理
+        state_raw_unnormalized = pi0_input.state
+
+        # 让 transforms buffer 跟随输入 device（解决 cuda:0 vs cuda:4）
+        target_device = state_raw_unnormalized.device
+        try:
+            self._to(target_device)
+        except Exception:
+            pass
+
+        raw_state_dim = int(state_raw_unnormalized.shape[-1])
+        cfg = getattr(self, "config", None)
+
+        # ===== CHANGED =====
+        # 真实动作维度：piper 优先用 cfg.action_dim（你已设为14），并强制 clamp，避免变成32导致 mask/where 维度炸
+        if env_name == "piper" and cfg is not None and getattr(cfg, "action_dim", None) is not None:
+            real_act_dim = int(cfg.action_dim)   # 期望=14
+        else:
+            # libero 等场景：默认跟随输入 state 的真实维度（更安全）
+            real_act_dim = raw_state_dim
+
+        # clamp：防御性对齐（避免 state/pred_action 维度更小导致越界）
+        real_act_dim = max(1, min(real_act_dim, raw_state_dim))
+        # ===== END CHANGED =====
 
         # Input transforms
-        state = self.state_normalize_transform(pi0_input.state)
+        state = self.state_normalize_transform(state_raw_unnormalized)
+
+        if self.no_state:
+            logger.info("no_state is True, zeroing state")
+            state = torch.zeros_like(state)
+
         images, _ = self.image_transform.call_batch(pi0_input.images)
+
+        # prompt：pi0.5 下只用真实动作维度（不含 pad）
+        if self.pi05_enabled:
+            state_for_prompt = state[:, :real_act_dim]
+        else:
+            state_for_prompt = state
+
         lang_tokens, lang_masks = self.prompt_tokenizer_transform.call_batch(
-            {"task": pi0_input.task, "observation.state": state}, tokenizer
+            {"task": pi0_input.task, "observation.state": state_for_prompt},
+            tokenizer,
         )
 
         # Inference
         pred_action = self.model.sample_actions(images, pi0_input.img_masks, lang_tokens, lang_masks, state=state)
 
-        # Output transforms
-        from .policy.libero_policy import LiberoPi0Output
+        # Unnormalize action
+        pred_action = self.action_unnormalize_transform(pred_action)
 
-        pi0_output = LiberoPi0Output.from_model_output({
-            "full_action": self.action_unnormalize_transform(pred_action)
-        })
+        # ===== CHANGED =====
+        # 进一步 clamp 到 pred_action 的最后维度（防止模型输出维度 < real_act_dim 的极端情况）
+        real_act_dim = min(real_act_dim, int(pred_action.shape[-1]))
+
+        # mask 改为“按 real_act_dim 动态生成”，避免硬编码14造成 where 维度不匹配
+        # 语义保持不变：joint=True（累加），gripper=False（保持delta）
+        mask = torch.ones((real_act_dim,), device=pred_action.device, dtype=torch.bool)
+        # 双臂：左 gripper=6，右 gripper=13（如果存在）
+        if real_act_dim > 6:
+            mask[6] = False
+        if real_act_dim > 13:
+            mask[13] = False
+        # ===== END CHANGED =====
+
+        if self.use_endpose:
+            logger.info("use_endpose is True, applying endpose transformation")
+            from scipy.spatial.transform import Rotation as R
+
+            B, T, A = pred_action.shape
+
+            # ===== CHANGED =====
+            # endpose 逻辑只对 piper(14维) 有意义；防御：维度不够就直接跳过转换
+            if real_act_dim < 14:
+                logger.warning(f"use_endpose=True but real_act_dim={real_act_dim} < 14, skip endpose abs conversion.")
+            else:
+                pos_indices_left = torch.tensor([0, 1, 2], device=pred_action.device)
+                pos_indices_right = torch.tensor([7, 8, 9], device=pred_action.device)
+                rot_indices_left = torch.tensor([3, 4, 5], device=pred_action.device)
+                rot_indices_right = torch.tensor([10, 11, 12], device=pred_action.device)
+
+                abs_action = pred_action.clone()
+
+                s0_pos = state_raw_unnormalized[:, :real_act_dim]
+                delta_pos = pred_action[:, :, :real_act_dim]
+
+                abs_action[:, :, pos_indices_left] = (
+                    s0_pos[:, pos_indices_left].unsqueeze(1) + delta_pos[:, :, pos_indices_left]
+                )
+                abs_action[:, :, pos_indices_right] = (
+                    s0_pos[:, pos_indices_right].unsqueeze(1) + delta_pos[:, :, pos_indices_right]
+                )
+
+                s0_rot_left = state_raw_unnormalized[:, rot_indices_left]
+                s0_rot_right = state_raw_unnormalized[:, rot_indices_right]
+
+                for t in range(T):
+                    delta_rot_left = pred_action[:, t, rot_indices_left]
+                    delta_rot_right = pred_action[:, t, rot_indices_right]
+
+                    for b in range(B):
+                        state_left_rot = R.from_euler("xyz", s0_rot_left[b].cpu().numpy(), degrees=True)
+                        delta_left_rot = R.from_euler("xyz", delta_rot_left[b].cpu().numpy(), degrees=True)
+                        abs_rot_left = state_left_rot * delta_left_rot
+                        abs_euler_left = torch.tensor(
+                            abs_rot_left.as_euler("xyz", degrees=True),
+                            device=pred_action.device,
+                            dtype=pred_action.dtype,
+                        )
+                        abs_action[b, t, rot_indices_left] = abs_euler_left
+
+                        state_right_rot = R.from_euler("xyz", s0_rot_right[b].cpu().numpy(), degrees=True)
+                        delta_right_rot = R.from_euler("xyz", delta_rot_right[b].cpu().numpy(), degrees=True)
+                        abs_rot_right = state_right_rot * delta_right_rot
+                        abs_euler_right = torch.tensor(
+                            abs_rot_right.as_euler("xyz", degrees=True),
+                            device=pred_action.device,
+                            dtype=pred_action.dtype,
+                        )
+                        abs_action[b, t, rot_indices_right] = abs_euler_right
+
+                pred_action = abs_action
+            # ===== END CHANGED =====
+
+        else:
+            # Joint 模式：根据 mask 选择性累加
+            s0 = state_raw_unnormalized[:, :real_act_dim].unsqueeze(1)  # (B,1,real_act_dim)
+            delta = pred_action[..., :real_act_dim]  # (B,T,real_act_dim)
+
+            abs_action = pred_action.clone()
+            abs_action[..., :real_act_dim] = torch.where(
+                mask.view(1, 1, -1),   # (1,1,real_act_dim)
+                s0 + delta,            # joint: state + delta
+                delta,                 # gripper: keep delta
+            )
+            pred_action = abs_action
+
+            if not self._warned_no_abs_transform:
+                logger.warning(
+                    "[PI0ForActionPrediction] Using fallback delta->absolute transformation "
+                    "(joint mode with mask-based accumulation)."
+                )
+                self._warned_no_abs_transform = True
+
+        from .policy.libero_policy import LiberoPi0Output
+        from .policy.piper_policy import PiperPi0Output
+
+        if env_name == "libero":
+            pi0_output = LiberoPi0Output.from_model_output({"full_action": pred_action})
+        else:
+            pi0_output = PiperPi0Output.from_model_output({"full_action": pred_action})
+
+        # ===== CHANGED =====
+        # piper 分支也补齐 s/a（很多训练/rollout链路会依赖）
         s = {
             "states": state,
             "images": torch.stack(images, dim=1),
@@ -198,10 +347,12 @@ class PI0ForActionPrediction(PreTrainedModel, SupportSACTraining):
             "lang_masks": lang_masks,
         }
         a = {
-            "full_action": pred_action,
+            "full_action": self.action_normalize_transform(pred_action),
         }
+        # ===== END CHANGED =====
 
         return pi0_output, s, a
+
 
     @classmethod
     def from_pretrained(cls, pretrained_model_name_or_path, *model_args, **kwargs):
