@@ -77,7 +77,7 @@ class PI0RolloutRob(NaiveRolloutRob):
         return all(key in prompts.batch for key in required_keys)
 
     def _generate_sequences_real_robot(self, prompts: DataProto) -> DataProto:
-        """真机模式：处理复杂的压缩输入（代码B逻辑）"""
+        """真机模式：处理三摄像头压缩输入，解码后重新打包为 DataProto 调用 PI0ForActionPrediction.sample_actions"""
         head_image = prompts.batch["head_image"]
         left_wrist_image = prompts.batch["left_wrist_image"]
         right_wrist_image = prompts.batch["right_wrist_image"]
@@ -96,17 +96,9 @@ class PI0RolloutRob(NaiveRolloutRob):
 
         device = next(self.module.parameters()).device
         state = state.to(device=device, dtype=torch.float32)
-        raw_state_dim = int(state.shape[-1])
-
-        # 2) pad state 到 32（模型forward需要）
-        state_pad32 = torch.nn.functional.pad(state, (0, max(0, 32 - raw_state_dim)), "constant", 0.0)
-
-        # 3) 检查模型是否支持 state_dim 参数
-        sample_sig = inspect.signature(self.module.sample_actions)
-        supports_state_dim = "state_dim" in sample_sig.parameters
-
+        
         with torch.autocast(device_type=get_device_name(), dtype=torch.bfloat16):
-            # 4) JPEG 解码（如果需要）
+            # 2) JPEG 解码（如果需要）
             if head_image.ndim == 2:
                 head_image = self._decode_jpeg_images(head_image)
             if left_wrist_image.ndim == 2:
@@ -114,67 +106,47 @@ class PI0RolloutRob(NaiveRolloutRob):
             if right_wrist_image.ndim == 2:
                 right_wrist_image = self._decode_jpeg_images(right_wrist_image)
 
-            # 5) 转换图像格式：[B,H,W,C] -> [B,C,H,W]
-            batch_size = head_image.shape[0]
-            cam_high = head_image.permute(0, 3, 1, 2).to(device)
-            left_wrist = left_wrist_image.permute(0, 3, 1, 2).to(device)
-            right_wrist = right_wrist_image.permute(0, 3, 1, 2).to(device)
+            # 3) 确保所有图像都在正确的设备上，保持 [B,H,W,C] 格式
+            head_image = head_image.to(device)
+            left_wrist_image = left_wrist_image.to(device)
+            right_wrist_image = right_wrist_image.to(device)
 
-            # 6) 构造详细的 kwargs
-            kwargs = dict(
-                images={
-                    "observation.images.cam_high": cam_high,
-                    "observation.images.cam_left_wrist": left_wrist,
-                    "observation.images.cam_right_wrist": right_wrist,
+            # 4) 重新打包成 DataProto 对象
+            # 真机有三个相机输入，需要用特殊的键名来区分
+            # 注意：这里使用真机特有的键名，与仿真的 full_image/wrist_image 不同
+            repackaged_env_obs = DataProto.from_dict(
+                {
+                    "head_image": head_image,           # [B,H,W,C] - 头部相机
+                    "left_wrist_image": left_wrist_image,   # [B,H,W,C] - 左腕相机
+                    "right_wrist_image": right_wrist_image, # [B,H,W,C] - 右腕相机
+                    "state": state,
                 },
-                img_masks=[
-                    torch.ones((batch_size,), device=device, dtype=torch.bool),
-                    torch.ones((batch_size,), device=device, dtype=torch.bool),
-                    torch.ones((batch_size,), device=device, dtype=torch.bool),
-                ],
-                task=task_descriptions.tolist() if hasattr(task_descriptions, "tolist") else list(task_descriptions),
-                state=state_pad32,
-                tokenizer=self.tokenizer,
+                non_tensors={
+                    "task_descriptions": task_descriptions.tolist() if hasattr(task_descriptions, "tolist") else list(task_descriptions)
+                }
             )
 
-            # 7) 传递 state_dim（如果支持）
-            if supports_state_dim:
-                kwargs["state_dim"] = raw_state_dim
+            # 5) 调用 PI0ForActionPrediction.sample_actions (标准接口)
+            # 注意：当前 PI0ForActionPrediction.sample_actions 内部的 LiberoPi0Input.from_env_obs
+            # 只处理仿真的 full_image/wrist_image，需要扩展以支持真机的三相机输入
+            output, s, a = self.module.sample_actions(repackaged_env_obs, tokenizer=self.tokenizer, env_name="piper")
 
-            # 8) 从模型config读取 use_endpose 和 no_state 配置并传递
-            cfg = getattr(self.module, "config", None)
-            if cfg is not None:
-                use_endpose = getattr(cfg, "use_endpose", False)
-                no_state = getattr(cfg, "no_state", False)
-                kwargs["use_endpose"] = use_endpose
-                kwargs["no_state"] = no_state
-
-            # 9) 调用模型
-            (
-                action,
-                images_out,
-                img_masks,
-                lang_tokens,
-                lang_masks,
-                state_out,
-            ) = self.module.sample_actions(**kwargs)
-
-        # 10) 读取 chunk_len 和 action_dim
+        # 6) 读取 chunk_len 和 action_dim
         cfg = getattr(self.module, "config", None)
-        T = getattr(cfg, "num_action_chunks", 30)
-        A = getattr(cfg, "action_dim", action.shape[-1])
-        T = min(int(T), int(action.shape[1]))
-        A = min(int(A), int(action.shape[2]))
+        T = getattr(cfg, "num_action_chunks", 10)
+        A = getattr(cfg, "action_dim", output.action.shape[-1])
+        T = min(int(T), int(output.action.shape[1]))
+        A = min(int(A), int(output.action.shape[2]))
 
         ret = DataProto.from_dict(
             {
-                "action": action[:, :T, :A],
-                "full_action": action,
-                "images": torch.stack(images_out, dim=1) if isinstance(images_out, (list, tuple)) else images_out,
-                "image_masks": torch.stack(img_masks, dim=1) if isinstance(img_masks, (list, tuple)) else img_masks,
-                "lang_tokens": lang_tokens,
-                "lang_masks": lang_masks,
-                "states": state_out,
+                "action": output.action[:, :T, :A],
+                "full_action": a["full_action"],
+                "images": s["images"],
+                "image_masks": s["image_masks"],
+                "lang_tokens": s["lang_tokens"],
+                "lang_masks": s["lang_masks"],
+                "states": s["states"],
             }
         )
         return ret
@@ -183,7 +155,7 @@ class PI0RolloutRob(NaiveRolloutRob):
         """仿真模式：简单输入处理（代码A逻辑）"""
         with torch.autocast(device_type=get_device_name(), dtype=torch.bfloat16):
             prompts.to(get_device_id())
-            output, s, a = self.module.sample_actions(prompts, tokenizer=self.tokenizer)
+            output, s, a = self.module.sample_actions(prompts, tokenizer=self.tokenizer, env_name="libero")
 
         ret = DataProto.from_dict(
             {

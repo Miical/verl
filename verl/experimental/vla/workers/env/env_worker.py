@@ -240,8 +240,8 @@ class EnvWorker(Worker, DistProfilerExtension):
         """Get all available state IDs from the environment."""
         state_ids = self.simulator_list[0].get_all_state_ids()
         return state_ids
-
-    @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="env"), blocking=False)
+    #=============================Change==================================
+    @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="env"), blocking=True)
     @DistProfiler.annotate(color="blue", role="env_reset_envs_to_state_ids")
     def reset_envs_to_state_ids(self, data: DataProto):
         """Reset environments to specified state IDs.

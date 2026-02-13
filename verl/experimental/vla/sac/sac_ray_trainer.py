@@ -128,6 +128,12 @@ def add_transition_prefixes(data: DataProto) -> DataProto:
 
 
 class RobRaySACTrainer(RayPPOTrainer):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+
+        # SAC 的 critic 在 actor_module(PI0ForActionPrediction) 内部，不存在独立 critic worker group
+        # 关闭 PPO RayTrainer 的 “外置 critic 保存逻辑”，否则 _save_checkpoint 会访问 self.critic_wg 直接炸。
+        self.use_critic = False
     def _start_profiling(self, do_profile: bool) -> None:
         """Start profiling for all worker groups including env workers."""
         super()._start_profiling(do_profile)
@@ -315,24 +321,18 @@ class RobRaySACTrainer(RayPPOTrainer):
                         gen_batch.meta_info["n_samples"] = self.config.actor_rollout_ref.rollout.n
                         gen_batch.meta_info["pad_token_id"] = self.tokenizer.pad_token_id
                         gen_batch = gen_batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
-                        if dataloader_step == 0 :
-                            reset_future = self._reset_envs(gen_batch)
+                        #=============================Change==================================
+                        # 【关键修改】移除异步 reset_future，reset 操作现在在 generate_sequences 内部同步完成
+                        # 这样可以避免 OwnerDiedError，因为 ray.put() 创建的 ObjectRef 的 Owner
+                        # 在整个操作期间都保持存活
 
                     with marked_timer("step", timing_raw):
                         if need_rollout:
                             # generate a batch
+                            # 【关键修改】不再传递 reset_future，reset 在 generate_sequences 内部完成
                             with marked_timer("gen", timing_raw, color="red"):
-                                batch = self.async_rollout_manager.generate_sequences(gen_batch, reset_future)
-
-                            # prepare for next batch's env reset
-                            if dataloader_step != dataloader_len - 1:
-                                next_batch: DataProto = DataProto.from_single_dict(next_batch_dict)
-                                next_gen_batch = self._get_gen_batch(next_batch)
-                                next_gen_batch = next_gen_batch.repeat(
-                                    repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True
-                                )
-                                reset_future = self._reset_envs(next_gen_batch)
-
+                                batch = self.async_rollout_manager.generate_sequences(gen_batch)
+                        #=============================Change==================================
                             complete_any = batch.batch["complete"].any(dim=-1)  # (B, T)
                             dones_step = complete_any.clone()
                             dones_step[:, -2] = True
