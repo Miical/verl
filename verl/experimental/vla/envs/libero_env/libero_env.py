@@ -299,7 +299,7 @@ class LiberoEnv(gym.Env):
         infos = {}
         return obs, infos
 
-    def step(self, actions=None):
+    def step(self, actions=None, critic_values=None):
         if actions is None:
             obs, infos = self.reset(reset_state_ids=self.reset_state_ids)
             terminations = np.zeros(self.num_envs, dtype=bool)
@@ -322,8 +322,9 @@ class LiberoEnv(gym.Env):
             plot_infos = {
                 "rewards": step_reward,
                 "terminations": terminations,
-                "task": self.task_descriptions,
+                "critic_value": np.asarray(critic_values, dtype=np.float32),
             }
+            plot_infos["task"] = self.task_descriptions
             self.add_new_frames(raw_obs, plot_infos)
 
         infos = self._record_metrics(step_reward, terminations, infos)
@@ -336,7 +337,7 @@ class LiberoEnv(gym.Env):
             infos,
         )
 
-    def chunk_step(self, chunk_actions):
+    def chunk_step(self, chunk_actions, chunk_values=None):
         # chunk_actions: [num_envs, chunk_step, action_dim]
         chunk_size = chunk_actions.shape[1]
 
@@ -346,7 +347,12 @@ class LiberoEnv(gym.Env):
         raw_chunk_truncations = []
         for i in range(chunk_size):
             actions = chunk_actions[:, i]
-            extracted_obs, step_reward, terminations, truncations, infos = self.step(actions)
+            if len(chunk_values.shape) == 1:
+                step_values = chunk_values
+            elif len(chunk_values.shape) == 2:
+                step_values = chunk_values[:, i]
+
+            extracted_obs, step_reward, terminations, truncations, infos = self.step(actions, critic_values=step_values)
 
             chunk_rewards.append(step_reward)
             raw_chunk_terminations.append(terminations)
