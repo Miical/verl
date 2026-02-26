@@ -455,7 +455,7 @@ class RobDataParallelSACActor(BaseSACActor):
                 "actor/qvalue_mean": valid_mean(torch.cat(actor_qvalues_list), batch["valids"]).detach().item(),
 
                 "sac/alpha_lr": self.alpha_optimizer.param_groups[0]["lr"] if self.auto_entropy else 0.0,
-                "sac/alpha_loss": sum(alpha_loss_list) / len(alpha_loss_list),
+                "sac/alpha_loss": sum(alpha_loss_list) / len(alpha_loss_list) if self.auto_entropy else 0.0,
                 "sac/alpha_grad_norm": alpha_grad_norm.detach().item() if self.auto_entropy else 0.0,
             })
 

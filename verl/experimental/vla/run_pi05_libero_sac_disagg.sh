@@ -10,10 +10,12 @@ VIDEO_OUTPUT=${MLP_MODEL_OUTPUT:-"$HOME"}/video
 SFT_MODEL_PATH=${SFT_MODEL_PATH:-"$HOME/data/pi05_libero_torch"}
 TOKENIZER_PATH="$SFT_MODEL_PATH"
 
+# Physical Node Config
+NUM_GPUS=8                                     # total number of gpus per node
+
 # Role Config
 NUM_NODES=1                                    # number of nodes for rollout
-NUM_GPUS=8                                     # number of gpus for rollout workers per node
-SIM_NODES=1                                    # number of nodes for sim                
+SIM_NODES=1                                    # number of nodes for sim     
 NUM_ENV_GPUS=4                                 # number of gpus for env workers per node
 NUM_ROLLOUT_GPUS=8                             # number of gpus for rollout workers per node
 
@@ -30,8 +32,6 @@ MAX_EPISODE_STEPS=512                          # max episode steps for each env
 
 # Training Config
 MINI_BATCH_SIZE=2048                           # mini batch size (batch size per GPU, automatically multiplied by ROLLOUT_N)
-                                               # invalid in SAC, currently
-                                               # In SAC, it equal to (max_interactions - 1) * TRAIN_BATCH_SIZE * ROLLOUT_N / NUM_ROLLOUT_GPUS
 MICRO_BATCH_SIZE=32                            # micro batch size (per GPU, for gradient accumulation, should divide MINI_BATCH_SIZE)
 
 
@@ -87,7 +87,7 @@ $PYTHON -m verl.experimental.vla.main_sac \
     actor_rollout_ref.model.path=$SFT_MODEL_PATH \
     actor_rollout_ref.model.tokenizer_path=$TOKENIZER_PATH \
     actor_rollout_ref.rollout.mode=async_envloop \
-    actor_rollout_ref.actor.optim.lr=5e-6 \
+    actor_rollout_ref.actor.optim.lr=1e-6 \
     actor_rollout_ref.actor.optim.warmup_style=constant \
     actor_rollout_ref.actor.ppo_mini_batch_size=$MINI_BATCH_SIZE \
     actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=$MICRO_BATCH_SIZE \
@@ -121,9 +121,9 @@ $PYTHON -m verl.experimental.vla.main_sac \
     trainer.n_gpus_per_node=$NUM_GPUS \
     +trainer.n_env_gpus_per_node=$NUM_ENV_GPUS \
     +trainer.n_rollout_gpus_per_node=$NUM_ROLLOUT_GPUS \
-    +trainer.rollout_interval=30 \
+    +trainer.rollout_interval=20 \
     trainer.nnodes=$NUM_NODES \
-    trainer.save_freq=30 \
+    trainer.save_freq=300 \
     trainer.test_freq=-1 \
     trainer.total_epochs=1000 \
     trainer.val_only=False \

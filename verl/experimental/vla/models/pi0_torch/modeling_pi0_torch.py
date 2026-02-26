@@ -31,12 +31,8 @@ from ...sac.base import SupportSACTraining
 from ..modules.mlp import MLP
 from .configuration_pi0_torch import PI0TorchConfig
 from .model.modeling_pi0 import PI0Model, make_att_2d_masks
-from .pi0_utils import (
-    ImageTransform,
-    Normalize,
-    PromptTokenizerTransform,
-    Unnormalize,
-)
+from .pi0_utils import (ImageTransform, Normalize, PromptTokenizerTransform,
+                        Unnormalize)
 from .policy.base import Pi0Output
 
 
@@ -76,7 +72,7 @@ class PI0ForActionPrediction(PreTrainedModel, SupportSACTraining):
                 [
                     MLP(
                         input_dim=2150,  # 2048(prefix mean) + 32(state) + 10*7(action flat)
-                        hidden_dims=[1024, 512, 256],
+                        hidden_dims=[2048, 1024, 256],
                         output_dim=1,
                         activation="relu",
                         init_method="kaiming",
@@ -89,7 +85,7 @@ class PI0ForActionPrediction(PreTrainedModel, SupportSACTraining):
                 [
                     MLP(
                         input_dim=2150,
-                        hidden_dims=[1024, 512, 256],
+                        hidden_dims=[2048, 1024, 256],
                         output_dim=1,
                         activation="relu",
                         init_method="kaiming",

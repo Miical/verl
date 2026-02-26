@@ -27,10 +27,6 @@ from verl.experimental.dataset.sampler import AbstractCurriculumSampler
 from verl.protocol import pad_dataproto_to_divisor, unpad_dataproto
 from verl.single_controller.ray import RayClassWithInitArgs
 from verl.single_controller.ray.base import create_colocated_worker_cls
-from verl.trainer.ppo.metric_utils import (
-    compute_throughout_metrics,
-    process_validation_metrics,
-)
 from verl.trainer.ppo.ray_trainer import RayPPOTrainer
 from verl.trainer.ppo.reward import compute_reward
 from verl.trainer.ppo.utils import Role
@@ -105,6 +101,29 @@ def flatten_trajectories(data: DataProto) -> DataProto:
     return new_data
 
 
+def length_normalized_reward(
+    batch: DataProto,
+    base_reward: float = 1.0,
+    p: float = 3.0,
+    L_ref: float = 51.0, 
+) -> torch.Tensor:
+    """
+    reward = base_reward * (L_ref / trajectory_length)^p * positive_sample_mask
+    More sensitive to trajectory length than 1/L.
+    """
+
+    dones = batch.batch["dones"].bool()                 # (B, T)
+    positive_mask = batch.batch["positive_sample_mask"] # (B, T)
+
+    B, T = dones.shape
+    done_idx = torch.argmax(dones.int(), dim=1)         # (B,)
+    traj_len = (done_idx + 1).clamp_min(1).float()      # (B,)
+
+    per_traj_reward = base_reward * (L_ref / traj_len).pow(p)  # (B,)
+    per_traj_reward = per_traj_reward.unsqueeze(1).expand(B, T)
+
+    return per_traj_reward * positive_mask.float()
+
 def add_transition_prefixes(data: DataProto) -> DataProto:
     batch = data.batch
     step_key = "action" if "action" in batch else "full_action"
@@ -121,7 +140,7 @@ def add_transition_prefixes(data: DataProto) -> DataProto:
     def shift_next(tensor: torch.Tensor) -> torch.Tensor:
         return tensor[:, 1:, ...]
 
-    state_keys = ["states", "images", "image_masks", "lang_tokens", "lang_masks"]
+    state_keys = ["states", "images", "image_masks", "lang_tokens", "lang_masks", "timestamp"]
     action_keys = ["full_action", "action"]
 
     for key in state_keys:
@@ -299,7 +318,6 @@ class RobRaySACTrainer(RayPPOTrainer):
                     timing_raw = {}
 
                     need_rollout = (training_step == 0)
-                    # need_rollout = False
                     is_last_step = self.global_steps >= self.total_training_steps
 
                     # start profiling
@@ -361,6 +379,9 @@ class RobRaySACTrainer(RayPPOTrainer):
                             average_reward = batch.batch["rewards"].any(dim=-1).mean(dtype=torch.float32).item()
                             metrics["data/trajectory_avg_reward"] = average_reward
                             metrics["data/avg_positive_trajectory_length"] = compute_avg_positive_trajectory_length(batch)
+
+                            # change to dense rewards
+                            batch.batch["rewards"] = length_normalized_reward(batch)
 
                             batch = add_transition_prefixes(batch)
                             batch = flatten_trajectories(batch)

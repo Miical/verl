@@ -155,9 +155,11 @@ class SACReplayPool:
                     batch_size=[self.capacity],
                     device=self.pool_device,
                 )
-
-        self.size = min(meta_info["size"], self.capacity)
-        self.position = meta_info["position"] % self.capacity
+                self.size = meta_info["size"]
+                self.position = meta_info["size"]
+        else:
+            self.size = meta_info["size"]
+            self.position = meta_info["position"]
 
         logger.info(f"[Rank {self.rank}] Replay pool loaded from {filepath} with size: {self.size}")
 
