@@ -14,7 +14,6 @@
 
 import asyncio
 import uuid
-from collections import defaultdict
 from pprint import pprint
 
 import numpy as np
@@ -23,12 +22,9 @@ from omegaconf import OmegaConf
 from tqdm import tqdm
 
 from verl import DataProto
-from verl.experimental.dataset.sampler import AbstractCurriculumSampler
-from verl.protocol import pad_dataproto_to_divisor, unpad_dataproto
 from verl.single_controller.ray import RayClassWithInitArgs
 from verl.single_controller.ray.base import create_colocated_worker_cls
 from verl.trainer.ppo.ray_trainer import RayPPOTrainer
-from verl.trainer.ppo.reward import compute_reward
 from verl.trainer.ppo.utils import Role
 from verl.utils.checkpoint.checkpoint_manager import should_save_ckpt_esi
 from verl.utils.debug import marked_timer
@@ -70,15 +66,15 @@ def compute_response_mask(config, data: DataProto) -> torch.Tensor:
 
 
 def compute_avg_positive_trajectory_length(batch: DataProto) -> float:
-    dones = batch.batch["dones"].bool()                    # (B, T)
-    positive_mask = batch.batch["positive_sample_mask"]    # (B, T)
-    positive_traj = positive_mask.any(dim=1)               # (B,)
+    dones = batch.batch["dones"].bool()  # (B, T)
+    positive_mask = batch.batch["positive_sample_mask"]  # (B, T)
+    positive_traj = positive_mask.any(dim=1)  # (B,)
 
     if positive_traj.sum() == 0:
         return 0.0
 
     B, T = dones.shape
-    done_idx = torch.argmax(dones.int(), dim=1)            # (B,)
+    done_idx = torch.argmax(dones.int(), dim=1)  # (B,)
     traj_lens = done_idx + 1
 
     return traj_lens[positive_traj].float().mean().item()
@@ -105,24 +101,25 @@ def length_normalized_reward(
     batch: DataProto,
     base_reward: float = 1.0,
     p: float = 3.0,
-    L_ref: float = 51.0, 
+    L_ref: float = 51.0,
 ) -> torch.Tensor:
     """
     reward = base_reward * (L_ref / trajectory_length)^p * positive_sample_mask
     More sensitive to trajectory length than 1/L.
     """
 
-    dones = batch.batch["dones"].bool()                 # (B, T)
-    positive_mask = batch.batch["positive_sample_mask"] # (B, T)
+    dones = batch.batch["dones"].bool()  # (B, T)
+    positive_mask = batch.batch["positive_sample_mask"]  # (B, T)
 
     B, T = dones.shape
-    done_idx = torch.argmax(dones.int(), dim=1)         # (B,)
-    traj_len = (done_idx + 1).clamp_min(1).float()      # (B,)
+    done_idx = torch.argmax(dones.int(), dim=1)  # (B,)
+    traj_len = (done_idx + 1).clamp_min(1).float()  # (B,)
 
     per_traj_reward = base_reward * (L_ref / traj_len).pow(p)  # (B,)
     per_traj_reward = per_traj_reward.unsqueeze(1).expand(B, T)
 
     return per_traj_reward * positive_mask.float()
+
 
 def add_transition_prefixes(data: DataProto) -> DataProto:
     batch = data.batch
@@ -290,7 +287,9 @@ class RobRaySACTrainer(RayPPOTrainer):
                 return
 
         # add tqdm
-        self.total_training_steps = self.config.trainer.total_epochs * len(self.train_dataloader) * self.config.trainer.rollout_interval
+        self.total_training_steps = (
+            self.config.trainer.total_epochs * len(self.train_dataloader) * self.config.trainer.rollout_interval
+        )
         progress_bar = tqdm(total=self.total_training_steps, initial=self.global_steps, desc="Training Progress")
 
         # we start from step 1
@@ -317,7 +316,7 @@ class RobRaySACTrainer(RayPPOTrainer):
                     metrics = {}
                     timing_raw = {}
 
-                    need_rollout = (training_step == 0)
+                    need_rollout = training_step == 0
                     is_last_step = self.global_steps >= self.total_training_steps
 
                     # start profiling
@@ -337,7 +336,9 @@ class RobRaySACTrainer(RayPPOTrainer):
                             next_batch_dict = None
 
                         batch: DataProto = DataProto.from_single_dict(batch_dict)
-                        batch.non_tensor_batch["uid"] = np.array([str(uuid.uuid4()) for _ in range(len(batch))], dtype=object)
+                        batch.non_tensor_batch["uid"] = np.array(
+                            [str(uuid.uuid4()) for _ in range(len(batch))], dtype=object
+                        )
 
                         gen_batch = self._get_gen_batch(batch)
                         gen_batch.meta_info["global_steps"] = self.global_steps
@@ -347,8 +348,10 @@ class RobRaySACTrainer(RayPPOTrainer):
                         gen_batch.meta_info["eos_token_id"] = self.tokenizer.eos_token_id
                         gen_batch.meta_info["n_samples"] = self.config.actor_rollout_ref.rollout.n
                         gen_batch.meta_info["pad_token_id"] = self.tokenizer.pad_token_id
-                        gen_batch = gen_batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
-                        if dataloader_step == 0 :
+                        gen_batch = gen_batch.repeat(
+                            repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True
+                        )
+                        if dataloader_step == 0:
                             reset_future = self._reset_envs(gen_batch)
 
                     with marked_timer("step", timing_raw):
@@ -372,13 +375,18 @@ class RobRaySACTrainer(RayPPOTrainer):
                             batch.batch["dones"] = dones_step.float()
                             batch.batch["rewards"] = complete_any.float()
                             batch.batch["valids"] = (~batch.batch["complete"]).any(dim=-1).float()
-                            batch.batch["positive_sample_mask"] = batch.batch["rewards"].any(dim=-1).unsqueeze(-1).repeat_interleave(
-                                batch.batch["action"].shape[1], dim=-1
+                            batch.batch["positive_sample_mask"] = (
+                                batch.batch["rewards"]
+                                .any(dim=-1)
+                                .unsqueeze(-1)
+                                .repeat_interleave(batch.batch["action"].shape[1], dim=-1)
                             )
 
                             average_reward = batch.batch["rewards"].any(dim=-1).mean(dtype=torch.float32).item()
                             metrics["data/trajectory_avg_reward"] = average_reward
-                            metrics["data/avg_positive_trajectory_length"] = compute_avg_positive_trajectory_length(batch)
+                            metrics["data/avg_positive_trajectory_length"] = compute_avg_positive_trajectory_length(
+                                batch
+                            )
 
                             # change to dense rewards
                             batch.batch["rewards"] = length_normalized_reward(batch)
@@ -394,11 +402,15 @@ class RobRaySACTrainer(RayPPOTrainer):
                             actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
                         else:
                             with marked_timer("update_actor", timing_raw, color="red"):
-                                actor_output = self.actor_rollout_wg.update_actor(DataProto(meta_info={
-                                    "empty_batch": True, 
-                                    "global_steps": self.global_steps, 
-                                    "global_token_num": [0]
-                                }))
+                                actor_output = self.actor_rollout_wg.update_actor(
+                                    DataProto(
+                                        meta_info={
+                                            "empty_batch": True,
+                                            "global_steps": self.global_steps,
+                                            "global_token_num": [0],
+                                        }
+                                    )
+                                )
                             actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
 
                         metrics.update(actor_output_metrics)
@@ -418,7 +430,9 @@ class RobRaySACTrainer(RayPPOTrainer):
                     # 3. The current step number is a multiple of the save frequency.
                     # 4. The ESI(Elastic Server Instance)/training plan is close to expiration.
                     if self.config.trainer.save_freq > 0 and (
-                        is_last_step or self.global_steps % self.config.trainer.save_freq == 0 or esi_close_to_expiration
+                        is_last_step
+                        or self.global_steps % self.config.trainer.save_freq == 0
+                        or esi_close_to_expiration
                     ):
                         if esi_close_to_expiration:
                             print("Force saving checkpoint: ESI instance expiration approaching.")

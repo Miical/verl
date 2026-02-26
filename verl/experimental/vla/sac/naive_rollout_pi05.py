@@ -59,13 +59,18 @@ class PI0RolloutRob(NaiveRolloutRob):
             prompts.to(get_device_id())
             output, s, a = self.module.sample_actions(prompts, tokenizer=self.tokenizer)
             state_features = self.module.sac_forward_state_features(s)
-            critic_value = self.module.sac_forward_critic(
-                {"full_action": a["full_action"]},
-                state_features,
-                use_target_network=False,
-                method="min",
-                requires_grad=False,
-            ).detach().float().reshape(-1)
+            critic_value = (
+                self.module.sac_forward_critic(
+                    {"full_action": a["full_action"]},
+                    state_features,
+                    use_target_network=False,
+                    method="min",
+                    requires_grad=False,
+                )
+                .detach()
+                .float()
+                .reshape(-1)
+            )
 
         tensor_batch = {
             "action": output.action,

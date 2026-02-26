@@ -31,8 +31,7 @@ from ...sac.base import SupportSACTraining
 from ..modules.mlp import MLP
 from .configuration_pi0_torch import PI0TorchConfig
 from .model.modeling_pi0 import PI0Model, make_att_2d_masks
-from .pi0_utils import (ImageTransform, Normalize, PromptTokenizerTransform,
-                        Unnormalize)
+from .pi0_utils import ImageTransform, Normalize, PromptTokenizerTransform, Unnormalize
 from .policy.base import Pi0Output
 
 
@@ -183,9 +182,7 @@ class PI0ForActionPrediction(PreTrainedModel, SupportSACTraining):
         # Output transforms
         from .policy.libero_policy import LiberoPi0Output
 
-        pi0_output = LiberoPi0Output.from_model_output({
-            "full_action": self.action_unnormalize_transform(pred_action)
-        })
+        pi0_output = LiberoPi0Output.from_model_output({"full_action": self.action_unnormalize_transform(pred_action)})
         s = {
             "states": state,
             "images": torch.stack(images, dim=1),
@@ -437,7 +434,7 @@ class PI0ForActionPrediction(PreTrainedModel, SupportSACTraining):
         q_values = self._multi_heads_value(critic_head, critic_input, method=method)
 
         return q_values
-    
+
     @override
     def sac_get_critic_parameters(self) -> list[torch.nn.Parameter]:
         return [p for head in self.critic_heads for p in head.parameters()]
