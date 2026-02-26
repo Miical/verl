@@ -19,10 +19,8 @@ from pprint import pprint
 import datasets
 import hydra
 import ray
-import torch
 from omegaconf import OmegaConf
 
-from verl import DataProto
 from verl.experimental.vla.sac.sac_ray_trainer import RobRaySACTrainer
 from verl.trainer.constants_ppo import get_ppo_ray_runtime_env
 from verl.trainer.ppo.ray_trainer import ResourcePoolManager
@@ -31,15 +29,6 @@ from verl.utils import hf_tokenizer
 from verl.utils.fs import copy_local_path_from_hdfs
 
 logger = logging.getLogger(__name__)
-
-
-def calculate_reward(data: DataProto, return_dict: bool = False) -> torch.Tensor:
-    complete_tensor = data.batch["complete"]
-    reward_per_step = complete_tensor.float()
-    if return_dict:
-        return {"reward_tensor": reward_per_step}
-    else:
-        return reward_per_step
 
 
 @hydra.main(config_path="config", config_name="rob_sac_trainer", version_base=None)
@@ -111,8 +100,6 @@ def main_task(config):
         role_worker_mapping=role_worker_mapping,
         resource_pool_manager=resource_pool_manager,
         ray_worker_group_cls=ray_worker_group_cls,
-        reward_fn=calculate_reward,
-        val_reward_fn=calculate_reward,
         train_dataset=train_dataset,
         val_dataset=val_dataset,
     )
