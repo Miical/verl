@@ -185,6 +185,7 @@ class RobRaySACTrainer(RayPPOTrainer):
         # There is no separate `critic_wg`, so inherited PPO checkpoint/profile paths
         # must not treat critic as an independent worker group.
         self.use_critic = False
+        self.use_bc_actor = OmegaConf.select(self.config, "sac.actor_loss_type") == "bc"
 
         if self.config.trainer.rlpd_enable:
             assert rlpd_dataset is not None, "rlpd_dataset must be provided when rlpd_enable is True"
@@ -432,21 +433,25 @@ class RobRaySACTrainer(RayPPOTrainer):
                                 rlpd_batch = DataProto.from_single_dict(rlpd_batch)
                                 rlpd_batch = self.actor_rollout_wg.process_dataset_batch(rlpd_batch).get()
 
-                                rl_batch = batch.select([
-                                    "a0.full_action", "a1.full_action",
-                                    "s0.states", "s1.states",
-                                    "s0.images", "s1.images",
-                                    "s0.image_masks", "s1.image_masks",
-                                    "s0.lang_tokens", "s1.lang_tokens",
-                                    "s0.lang_masks", "s1.lang_masks",
-                                    "dones",
-                                    "valids",
-                                    "rewards",
-                                    "positive_sample_mask"
-                                ])
+                                if self.use_bc_actor:
+                                    train_batch = rlpd_batch
+                                    print(f"BC mode: using pure RLPD batch, size {len(train_batch)}")
+                                else:
+                                    rl_batch = batch.select([
+                                        "a0.full_action", "a1.full_action",
+                                        "s0.states", "s1.states",
+                                        "s0.images", "s1.images",
+                                        "s0.image_masks", "s1.image_masks",
+                                        "s0.lang_tokens", "s1.lang_tokens",
+                                        "s0.lang_masks", "s1.lang_masks",
+                                        "dones",
+                                        "valids",
+                                        "rewards",
+                                        "positive_sample_mask"
+                                    ])
 
-                                train_batch = DataProto.concat([rl_batch, rlpd_batch])
-                                print(f"RLPD enabled: RL batch size {len(rl_batch)}, RLPD batch size {len(rlpd_batch)}, total {len(train_batch)}")
+                                    train_batch = DataProto.concat([rl_batch, rlpd_batch])
+                                    print(f"RLPD enabled: RL batch size {len(rl_batch)}, RLPD batch size {len(rlpd_batch)}, total {len(train_batch)}")
                             else:
                                 train_batch = batch
 
