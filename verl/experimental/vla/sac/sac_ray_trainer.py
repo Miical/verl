@@ -181,6 +181,11 @@ class RobRaySACTrainer(RayPPOTrainer):
             device_name=device_name,
         )
 
+        # SAC in VLA uses an integrated actor+critic model inside actor_rollout workers.
+        # There is no separate `critic_wg`, so inherited PPO checkpoint/profile paths
+        # must not treat critic as an independent worker group.
+        self.use_critic = False
+
         if self.config.trainer.rlpd_enable:
             assert rlpd_dataset is not None, "rlpd_dataset must be provided when rlpd_enable is True"
             self.rlpd_dataloader = StatefulDataLoader(
