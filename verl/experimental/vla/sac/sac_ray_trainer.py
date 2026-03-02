@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import asyncio
+import os
 import uuid
 from collections import defaultdict
 from pprint import pprint
@@ -39,6 +40,88 @@ from verl.trainer.ppo.utils import Role, WorkerType
 from verl.utils.checkpoint.checkpoint_manager import should_save_ckpt_esi
 from verl.utils.debug import marked_timer
 from verl.utils.metric import reduce_metrics
+
+
+def _to_hwc_uint8(image_like) -> np.ndarray | None:
+    if image_like is None:
+        return None
+    if isinstance(image_like, torch.Tensor):
+        arr = image_like.detach().cpu().numpy()
+    else:
+        arr = np.asarray(image_like)
+
+    while arr.ndim > 3:
+        arr = arr[0]
+
+    if arr.ndim != 3:
+        return None
+
+    # CHW -> HWC
+    if arr.shape[0] in (1, 3) and arr.shape[-1] not in (1, 3):
+        arr = np.transpose(arr, (1, 2, 0))
+
+    if arr.shape[-1] == 1:
+        arr = np.repeat(arr, 3, axis=-1)
+
+    if arr.shape[-1] != 3:
+        return None
+
+    if np.issubdtype(arr.dtype, np.floating):
+        vmax = float(np.max(arr)) if arr.size > 0 else 1.0
+        if vmax <= 1.0:
+            arr = arr * 255.0
+    arr = np.clip(arr, 0, 255).astype(np.uint8)
+    return arr
+
+
+def _pick_image_tensor(batch_tensors: dict, key_candidates: list[str]):
+    for k in key_candidates:
+        if k in batch_tensors:
+            return batch_tensors[k], k
+    return None, None
+
+
+def _dump_debug_images(data: DataProto, *, tag: str, global_step: int, output_dir: str, num_samples: int = 4) -> None:
+    if data is None or not hasattr(data, "batch"):
+        return
+    image_tensor, image_key = _pick_image_tensor(
+        data.batch,
+        ["images", "s0.images", "s1.images", "obs_images", "pixel_values"],
+    )
+    if image_tensor is None:
+        return
+
+    total = image_tensor.shape[0]
+    if total <= 0:
+        return
+
+    sample_num = min(int(num_samples), int(total))
+    chosen_idx = np.random.choice(total, size=sample_num, replace=False)
+    os.makedirs(output_dir, exist_ok=True)
+
+    for rank, idx in enumerate(chosen_idx.tolist()):
+        img = _to_hwc_uint8(image_tensor[idx])
+        if img is None:
+            continue
+        # add a clear top banner to distinguish source
+        banner_h = 24
+        canvas = np.zeros((img.shape[0] + banner_h, img.shape[1], 3), dtype=np.uint8)
+        canvas[banner_h:] = img
+        color = (60, 170, 255) if tag == "rollout" else (255, 180, 60)
+        canvas[:banner_h, :] = np.array(color, dtype=np.uint8)
+
+        # lightweight text annotation without extra dependencies: encode metadata in filename
+        out = os.path.join(
+            output_dir,
+            f"step_{global_step:08d}_{tag}_sample{rank}_idx{idx}_key_{image_key.replace('.', '_')}.png",
+        )
+        try:
+            import imageio.v2 as imageio
+
+            imageio.imwrite(out, canvas)
+        except Exception:
+            # best effort debug utility, never block training
+            pass
 
 
 def compute_response_mask(config, data: DataProto) -> torch.Tensor:
@@ -185,7 +268,11 @@ class RobRaySACTrainer(RayPPOTrainer):
         # There is no separate `critic_wg`, so inherited PPO checkpoint/profile paths
         # must not treat critic as an independent worker group.
         self.use_critic = False
-        self.use_bc_actor = OmegaConf.select(self.config, "sac.actor_loss_type") == "bc"
+        actor_loss_type = OmegaConf.select(self.config, "actor_rollout_ref.actor.sac.actor_loss_type")
+        if actor_loss_type is None:
+            # keep backward compatibility with legacy path
+            actor_loss_type = OmegaConf.select(self.config, "sac.actor_loss_type")
+        self.use_bc_actor = actor_loss_type == "bc"
 
         if self.use_bc_actor and not self.config.trainer.rlpd_enable:
             raise ValueError("BC actor mode requires trainer.rlpd_enable=True for offline dataset supervision")
@@ -375,8 +462,8 @@ class RobRaySACTrainer(RayPPOTrainer):
                             else curr_step_profile
                         )
 
-                    # prepare rollout batch
-                    if need_rollout:
+                    # prepare rollout batch (non-BC path only)
+                    if need_rollout and not self.use_bc_actor:
                         batch_dict = next_batch_dict
                         try:
                             next_batch_dict = next(train_iter)
@@ -400,11 +487,77 @@ class RobRaySACTrainer(RayPPOTrainer):
 
                     with marked_timer("step", timing_raw):
                         if self.use_bc_actor:
-                            # Pure offline BC update: skip env rollout entirely.
+                            # Pure offline BC update. We can optionally run sparse rollout for
+                            # video + debug image alignment checks.
+                            bc_video_interval = int(self.config.trainer.get("bc_video_interval", 100))
+                            debug_dump_interval = int(self.config.trainer.get("bc_debug_dump_interval", bc_video_interval))
+                            debug_dump_samples = int(self.config.trainer.get("bc_debug_dump_num_samples", 4))
+                            debug_dump_dir = self.config.trainer.get("bc_debug_dump_dir", "/tmp/verl_bc_debug")
+
+                            should_video_rollout = (
+                                need_rollout
+                                and self.config.env.train.video_cfg.save_video
+                                and bc_video_interval > 0
+                                and self.global_steps % bc_video_interval == 0
+                            )
+                            should_debug_dump = (
+                                need_rollout and debug_dump_interval > 0 and self.global_steps % debug_dump_interval == 0
+                            )
+
+                            rollout_debug_batch = None
+                            if should_video_rollout or should_debug_dump:
+                                if next_batch_dict is None:
+                                    train_iter = iter(self.train_dataloader)
+                                    next_batch_dict = next(train_iter)
+
+                                batch_dict = next_batch_dict
+                                try:
+                                    next_batch_dict = next(train_iter)
+                                except StopIteration:
+                                    next_batch_dict = None
+
+                                batch: DataProto = DataProto.from_single_dict(batch_dict)
+                                batch.non_tensor_batch["uid"] = np.array(
+                                    [str(uuid.uuid4()) for _ in range(len(batch))], dtype=object
+                                )
+
+                                gen_batch = self._get_gen_batch(batch)
+                                gen_batch.meta_info["global_steps"] = self.global_steps
+                                gen_batch.meta_info["do_sample"] = True
+                                gen_batch.meta_info["temperature"] = self.config.actor_rollout_ref.rollout.temperature
+                                gen_batch.meta_info["prompt_length"] = self.config.actor_rollout_ref.rollout.prompt_length
+                                gen_batch.meta_info["eos_token_id"] = self.tokenizer.eos_token_id
+                                gen_batch.meta_info["n_samples"] = self.config.actor_rollout_ref.rollout.n
+                                gen_batch.meta_info["pad_token_id"] = self.tokenizer.pad_token_id
+                                gen_batch = gen_batch.repeat(
+                                    repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True
+                                )
+                                reset_future = self._reset_envs(gen_batch)
+                                with marked_timer("gen_video", timing_raw, color="yellow"):
+                                    rollout_debug_batch = self.async_rollout_manager.generate_sequences(gen_batch, reset_future)
+                                print(f"BC mode rollout/debug dump at step {self.global_steps}")
+
+                            if should_debug_dump and rollout_debug_batch is not None:
+                                _dump_debug_images(
+                                    rollout_debug_batch,
+                                    tag="rollout",
+                                    global_step=self.global_steps,
+                                    output_dir=debug_dump_dir,
+                                    num_samples=debug_dump_samples,
+                                )
+
                             with marked_timer("update_actor", timing_raw, color="red"):
                                 rlpd_batch = next(rlpd_dataloader_iter)
                                 rlpd_batch = DataProto.from_single_dict(rlpd_batch)
                                 train_batch = self.actor_rollout_wg.process_dataset_batch(rlpd_batch).get()
+                                if should_debug_dump:
+                                    _dump_debug_images(
+                                        train_batch,
+                                        tag="dataset",
+                                        global_step=self.global_steps,
+                                        output_dir=debug_dump_dir,
+                                        num_samples=debug_dump_samples,
+                                    )
                                 actor_output = self.actor_rollout_wg.update_actor(train_batch)
                             actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
                         elif need_rollout:
