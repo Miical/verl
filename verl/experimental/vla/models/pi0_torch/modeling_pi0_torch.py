@@ -468,6 +468,7 @@ class PI0ForActionPrediction(PreTrainedModel, SupportSACTraining):
         register_fsdp_forward_method(self, "sac_forward_actor")
         register_fsdp_forward_method(self, "sac_update_target_network")
         register_fsdp_forward_method(self, "sac_forward_state_features")
+        register_fsdp_forward_method(self, "sac_forward_bc_loss")
 
     @override
     def sac_forward_actor(
@@ -503,6 +504,57 @@ class PI0ForActionPrediction(PreTrainedModel, SupportSACTraining):
 
         return q_values
     
+
+    @override
+    def sac_forward_bc_loss(
+        self,
+        state_features: tuple[tuple[torch.Tensor, torch.Tensor, torch.Tensor], torch.Tensor],
+        target_actions: torch.Tensor,
+        valids: torch.Tensor,
+        *,
+        action_steps: int,
+        action_dim: int,
+    ) -> torch.Tensor:
+        """Diffusion SFT objective with flow-matching style velocity regression."""
+
+        prefix_features, states = state_features
+        prefix_embs, prefix_pad_masks, _ = prefix_features
+        device = prefix_embs.device
+
+        # Supervise only real action area (exclude padded tail steps/dims)
+        max_steps = min(int(action_steps), target_actions.shape[1])
+        max_dim = min(int(action_dim), target_actions.shape[2])
+
+        x1 = target_actions.float()
+        x0 = self.model.sample_noise(x1.shape, device=device)
+        t = torch.rand((x1.shape[0],), dtype=torch.float32, device=device)
+
+        t_b = t[:, None, None]
+        x_t = x0 + t_b * (x1 - x0)
+        v_target = x1 - x0
+
+        past_key_values = self._build_kv_cache_from_prefix(prefix_features)
+        v_pred = self.model.denoise_step(
+            states,
+            prefix_pad_masks,
+            past_key_values,
+            x_t,
+            t,
+        )
+
+        diff_sq = (v_pred - v_target).pow(2)
+
+        # mask padded steps/dims and invalid samples
+        step_mask = torch.zeros((1, diff_sq.shape[1], 1), dtype=diff_sq.dtype, device=device)
+        step_mask[:, :max_steps, :] = 1.0
+        dim_mask = torch.zeros((1, 1, diff_sq.shape[2]), dtype=diff_sq.dtype, device=device)
+        dim_mask[:, :, :max_dim] = 1.0
+        sample_mask = valids.float().to(device)[:, None, None]
+
+        mask = sample_mask * step_mask * dim_mask
+        denom = mask.sum().clamp_min(1.0)
+        return (diff_sq * mask).sum() / denom
+
     @override
     def sac_get_critic_parameters(self) -> list[torch.nn.Parameter]:
         return [p for head in self.critic_heads for p in head.parameters()]

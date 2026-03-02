@@ -53,6 +53,9 @@ actor_rollout_ref:
       alpha_type: exp
       alpha_lr: 0.0003
       target_entropy: -64.0
+      actor_loss_type: sac
+      bc_action_steps: 10
+      bc_action_dim: 7
     critic_lr: 0.0001
     critic_weight_decay: 0.0001
     critic_warmup_steps: 100
@@ -75,3 +78,13 @@ actor_rollout_ref:
   rollout:
     mode: async_envloop
     prompt_length: 512
+
+trainer:
+  # In BC mode, run one sparse env rollout every N optimization steps to dump videos.
+  # Set <= 0 to fully disable rollout video generation during BC training.
+  bc_video_interval: 100
+  # In BC mode, dump rollout + dataset images for alignment debugging every N steps.
+  # Set <= 0 to disable image dumping.
+  bc_debug_dump_interval: 100
+  bc_debug_dump_num_samples: 4
+  bc_debug_dump_dir: /tmp/verl_bc_debug
