@@ -325,10 +325,16 @@ class RobDataParallelSACActor(BaseSACActor):
         with torch.autocast(device_type=get_device_name(), dtype=torch.bfloat16):
             s0_state_features = self.actor_module.sac_forward_state_features(s0)
             if self.actor_loss_type == "bc":
+                bc_valids = micro_batch["valids"]
+                if "positive_sample_mask" in micro_batch.keys():
+                    # In BC mode only trust demonstration samples.
+                    # Rollout samples contain policy actions, and cloning them can cause
+                    # the policy to self-reinforce bad behavior over time.
+                    bc_valids = bc_valids & micro_batch["positive_sample_mask"]
                 actor_loss = self._calculate_bc_loss(
                     state_features=s0_state_features,
                     target_actions=micro_batch["a0.full_action"],
-                    valids=micro_batch["valids"],
+                    valids=bc_valids,
                 )
                 return actor_loss, None, None
 
@@ -350,10 +356,20 @@ class RobDataParallelSACActor(BaseSACActor):
 
     @override
     def update_policy(self, data: DataProto):
-        if "empty_batch" not in data.meta_info:
-            self.replay_pool.add_batch(data.batch)
+        if "empty_batch" in data.meta_info:
+            return {}
 
-        batch = self.replay_pool.sample_batch(self.config.ppo_mini_batch_size)
+        # For BC, train directly on the incoming expert batch instead of replayed
+        # mixed rollout data. This avoids drifting when the replay pool contains
+        # model-generated actions.
+        if self.actor_loss_type == "bc":
+            batch = data.batch
+            if batch.size(0) > self.config.ppo_mini_batch_size:
+                idx = torch.randperm(batch.size(0), device=get_device_id())[: self.config.ppo_mini_batch_size]
+                batch = batch[idx]
+        else:
+            self.replay_pool.add_batch(data.batch)
+            batch = self.replay_pool.sample_batch(self.config.ppo_mini_batch_size)
         micro_batches = batch.split(self.config.ppo_micro_batch_size_per_gpu)
         global_steps = data.meta_info["global_steps"]
         grad_accum_steps = len(micro_batches) * torch.distributed.get_world_size()
@@ -362,23 +378,28 @@ class RobDataParallelSACActor(BaseSACActor):
         critic_qvalues_0_list, critic_qvalues_1_list = [], []
         actor_loss_list, critic_loss_list, alpha_loss_list = [], [], []
 
-        # Training critic
-        self.critic_optimizer.zero_grad()
-        for batch_idx, micro_batch in enumerate(micro_batches):
-            logger.info(f"[{batch_idx + 1}/{len(micro_batches)}] critic micro batch ")
+        critic_grad_norm = torch.tensor(0.0, device=get_device_id())
+        if self.actor_loss_type == "sac":
+            # Training critic
+            self.critic_optimizer.zero_grad()
+            for batch_idx, micro_batch in enumerate(micro_batches):
+                logger.info(f"[{batch_idx + 1}/{len(micro_batches)}] critic micro batch ")
 
-            micro_batch = micro_batch.to(get_device_id())
-            raw_critic_loss, q_values_0, q_values_1 = self._forward_critic(micro_batch)
-            (raw_critic_loss / grad_accum_steps).backward()
-            critic_loss_list.append(raw_critic_loss.detach().item())
-            critic_qvalues_0_list.append(q_values_0.mean(dim=-1).detach())
-            critic_qvalues_1_list.append(q_values_1.detach())
-        critic_grad_norm = torch.nn.utils.clip_grad_norm_(self.actor_module.sac_get_critic_parameters(), 
-                                                          max_norm=self.config.grad_clip)
-        self.critic_optimizer.step()
-        self.critic_scheduler.step()
+                micro_batch = micro_batch.to(get_device_id())
+                raw_critic_loss, q_values_0, q_values_1 = self._forward_critic(micro_batch)
+                (raw_critic_loss / grad_accum_steps).backward()
+                critic_loss_list.append(raw_critic_loss.detach().item())
+                critic_qvalues_0_list.append(q_values_0.mean(dim=-1).detach())
+                critic_qvalues_1_list.append(q_values_1.detach())
+            critic_grad_norm = torch.nn.utils.clip_grad_norm_(
+                self.actor_module.sac_get_critic_parameters(), max_norm=self.config.grad_clip
+            )
+            self.critic_optimizer.step()
+            self.critic_scheduler.step()
 
-        update_actor = (global_steps >= self.config.critic_warmup_steps and global_steps % self.config.actor_update_interval == 0)
+        update_actor = self.actor_loss_type == "bc" or (
+            global_steps >= self.config.critic_warmup_steps and global_steps % self.config.actor_update_interval == 0
+        )
         if update_actor:
             # Training actor
             self.actor_optimizer.zero_grad()
@@ -412,10 +433,11 @@ class RobDataParallelSACActor(BaseSACActor):
                 self.alpha_scheduler.step()
 
         # Update target networks
-        self.actor_module.sac_update_target_network(self.sac_config.tau)
+        if self.actor_loss_type == "sac":
+            self.actor_module.sac_update_target_network(self.sac_config.tau)
 
         # Save replay pool
-        if global_steps % self.config.replay_pool_save_interval == 0:
+        if self.actor_loss_type == "sac" and global_steps % self.config.replay_pool_save_interval == 0:
             self.replay_pool.save(self.config.replay_pool_save_dir)
 
         # Log metrics
