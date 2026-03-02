@@ -69,8 +69,12 @@ def _to_hwc_uint8(image_like) -> np.ndarray | None:
         return None
 
     if np.issubdtype(arr.dtype, np.floating):
+        vmin = float(np.min(arr)) if arr.size > 0 else 0.0
         vmax = float(np.max(arr)) if arr.size > 0 else 1.0
-        if vmax <= 1.0:
+        # Support both [0, 1] and [-1, 1] image ranges in debug dumps.
+        if vmin < 0.0 and vmax <= 1.0:
+            arr = (arr + 1.0) * 0.5 * 255.0
+        elif vmax <= 1.0:
             arr = arr * 255.0
     arr = np.clip(arr, 0, 255).astype(np.uint8)
     return arr
@@ -105,12 +109,7 @@ def _dump_debug_images(data: DataProto, *, tag: str, global_step: int, output_di
         img = _to_hwc_uint8(image_tensor[idx])
         if img is None:
             continue
-        # add a clear top banner to distinguish source
-        banner_h = 24
-        canvas = np.zeros((img.shape[0] + banner_h, img.shape[1], 3), dtype=np.uint8)
-        canvas[banner_h:] = img
-        color = (60, 170, 255) if tag == "rollout" else (255, 180, 60)
-        canvas[:banner_h, :] = np.array(color, dtype=np.uint8)
+        canvas = img
 
         # lightweight text annotation without extra dependencies: encode metadata in filename
         out = os.path.join(
