@@ -200,7 +200,13 @@ class SACReplayPool:
         length = min(source.size(0), self.capacity)
         idx = (self.position + torch.arange(length)) % self.capacity
         for key in source.keys():
-            self.pool[key].index_copy_(0, idx, source[key][:length].to(self.pool_device))
+            # Replay storage dtype is fixed at lazy-init time. In BC/SFT flows, incoming
+            # batches may carry bf16 tensors while pool tensors are fp32 (or vice versa),
+            # which makes index_copy_ fail on dtype mismatch.
+            # Always cast to the destination tensor dtype/device before copy.
+            dst = self.pool[key]
+            src = source[key][:length].to(device=self.pool_device, dtype=dst.dtype)
+            dst.index_copy_(0, idx, src)
 
         self.position = (self.position + length) % self.capacity
         self.size = min(self.size + length, self.capacity)
