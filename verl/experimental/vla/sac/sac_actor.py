@@ -371,7 +371,10 @@ class RobDataParallelSACActor(BaseSACActor):
             self.replay_pool.add_batch(data.batch)
             batch = self.replay_pool.sample_batch(self.config.ppo_mini_batch_size)
         micro_batches = batch.split(self.config.ppo_micro_batch_size_per_gpu)
-        global_steps = data.meta_info["global_steps"]
+        # In some training paths (e.g., BC-only / RLPD mixed updates),
+        # `global_steps` may be absent from actor update meta_info.
+        # Fall back to 0 so BC updates can proceed instead of crashing.
+        global_steps = data.meta_info["global_steps"] if "global_steps" in data.meta_info else 0
         grad_accum_steps = len(micro_batches) * torch.distributed.get_world_size()
 
         actor_logprobs_list, actor_qvalues_list = [], []
