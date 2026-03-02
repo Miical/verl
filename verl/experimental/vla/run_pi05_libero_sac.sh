@@ -5,12 +5,12 @@ libero_test_path=$HOME/data/libero_rl/test.parquet
 train_files=$libero_train_path
 test_files=$libero_test_path
 # rlpd_files="/file_system/liujincheng/datasets/20251027T005_install_belt_cyt001_01"
-rlpd_files="/file_system/vla-datasets/datasets--yifengzhu-hf--LIBERO-datasets/snapshots/f13aa24a3da8c43c7225569f28c562979fa0e35a/libero_10"
+rlpd_files=${RLPD_FILES:-"/shared_disk/users/angen.ye/code/hil-serl/datasets/LIBERO-dataset/libero_10"}
 
-OUTPUT_DIR=${MLP_MODEL_OUTPUT:-"$HOME/models/vla_libero_grpo"}
-VIDEO_OUTPUT=${MLP_MODEL_OUTPUT:-"$HOME"}/video
+OUTPUT_DIR=${MLP_MODEL_OUTPUT:-"/shared_disk/users/angen.ye/code/hil-serl/model/verl_fintune_model/test302_libero4"}
+VIDEO_OUTPUT="${OUTPUT_DIR}/video"
 RL_DEBUG_DIR=${RL_DEBUG_DIR:-"${OUTPUT_DIR}/rl_debug_once"}
-SFT_MODEL_PATH=${SFT_MODEL_PATH:-"$HOME/data/pi05_libero_torch"}
+SFT_MODEL_PATH=${SFT_MODEL_PATH:-"/shared_disk/users/angen.ye/code/hil-serl/model/pi05_libero_torch"}
 TOKENIZER_PATH="$SFT_MODEL_PATH"
 
 # Physical Node Config
