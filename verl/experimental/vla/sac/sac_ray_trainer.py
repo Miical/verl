@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import asyncio
+import json
 import os
 import uuid
 from collections import defaultdict
@@ -169,11 +170,49 @@ def _dump_debug_prompts_and_actions(
         r_action = rollout_batch.batch["a0.full_action"][ri].detach().cpu().numpy()
         d_action = dataset_batch.batch["a0.full_action"][di].detach().cpu().numpy()
 
+        base = os.path.join(output_dir, f"step_{global_step:08d}_pair{i}")
         np.savez_compressed(
-            os.path.join(output_dir, f"step_{global_step:08d}_pair{i}_actions.npz"),
+            f"{base}_actions.npz",
             rollout_action=r_action,
             dataset_action=d_action,
         )
+        # Save raw arrays separately for convenient inspection tools.
+        np.save(f"{base}_rollout_action.npy", r_action)
+        np.save(f"{base}_dataset_action.npy", d_action)
+
+        # Detailed per-dimension stats (all action dims) and full tensors for one-shot debugging.
+        r_dim_mean = np.mean(r_action, axis=0)
+        d_dim_mean = np.mean(d_action, axis=0)
+        r_dim_min = np.min(r_action, axis=0)
+        d_dim_min = np.min(d_action, axis=0)
+        r_dim_max = np.max(r_action, axis=0)
+        d_dim_max = np.max(d_action, axis=0)
+
+        with open(f"{base}_actions_full.json", "w", encoding="utf-8") as jf:
+            json.dump(
+                {
+                    "pair_id": i,
+                    "rollout_index": ri,
+                    "dataset_index": di,
+                    "rollout_prompt": r_prompt,
+                    "dataset_prompt": d_prompt,
+                    "rollout_action_shape": list(r_action.shape),
+                    "dataset_action_shape": list(d_action.shape),
+                    "rollout_action": r_action.tolist(),
+                    "dataset_action": d_action.tolist(),
+                    "rollout_minus_dataset": (r_action - d_action).tolist(),
+                    "per_dim_stats": {
+                        "rollout_mean": r_dim_mean.tolist(),
+                        "dataset_mean": d_dim_mean.tolist(),
+                        "rollout_min": r_dim_min.tolist(),
+                        "dataset_min": d_dim_min.tolist(),
+                        "rollout_max": r_dim_max.tolist(),
+                        "dataset_max": d_dim_max.tolist(),
+                    },
+                },
+                jf,
+                ensure_ascii=False,
+            )
 
         rows.append(
             {
