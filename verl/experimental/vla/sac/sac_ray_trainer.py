@@ -135,6 +135,34 @@ def _decode_prompt_tokens(tokenizer, tokens: torch.Tensor) -> str:
         return "<decode_failed>"
 
 
+def _dump_debug_prompts(
+    *,
+    tokenizer,
+    data: DataProto,
+    tag: str,
+    global_step: int,
+    output_dir: str,
+    num_samples: int = 4,
+) -> None:
+    if not hasattr(data, "batch") or "s0.lang_tokens" not in data.batch:
+        return
+
+    tokens = data.batch["s0.lang_tokens"]
+    total = int(tokens.shape[0])
+    if total <= 0:
+        return
+
+    sample_num = min(int(num_samples), total)
+    chosen_idx = np.random.choice(total, size=sample_num, replace=False)
+    os.makedirs(output_dir, exist_ok=True)
+
+    out_path = os.path.join(output_dir, f"step_{global_step:08d}_{tag}_prompts.jsonl")
+    with open(out_path, "w", encoding="utf-8") as f:
+        for idx in chosen_idx.tolist():
+            prompt = _decode_prompt_tokens(tokenizer, tokens[idx])
+            f.write(json.dumps({"tag": tag, "idx": idx, "prompt": prompt}, ensure_ascii=False) + "\n")
+
+
 def _dump_debug_prompts_and_actions(
     *,
     tokenizer,
@@ -738,6 +766,22 @@ class RobRaySACTrainer(RayPPOTrainer):
                                     )
                                     _dump_debug_images(
                                         rlpd_batch,
+                                        tag="dataset",
+                                        global_step=self.global_steps,
+                                        output_dir=rl_debug_dump_dir,
+                                        num_samples=rl_debug_dump_samples,
+                                    )
+                                    _dump_debug_prompts(
+                                        tokenizer=self.tokenizer,
+                                        data=rl_batch,
+                                        tag="rollout",
+                                        global_step=self.global_steps,
+                                        output_dir=rl_debug_dump_dir,
+                                        num_samples=rl_debug_dump_samples,
+                                    )
+                                    _dump_debug_prompts(
+                                        tokenizer=self.tokenizer,
+                                        data=rlpd_batch,
                                         tag="dataset",
                                         global_step=self.global_steps,
                                         output_dir=rl_debug_dump_dir,
