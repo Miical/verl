@@ -9,6 +9,7 @@ rlpd_files="/file_system/vla-datasets/datasets--yifengzhu-hf--LIBERO-datasets/sn
 
 OUTPUT_DIR=${MLP_MODEL_OUTPUT:-"$HOME/models/vla_libero_grpo"}
 VIDEO_OUTPUT=${MLP_MODEL_OUTPUT:-"$HOME"}/video
+RL_DEBUG_DIR=${RL_DEBUG_DIR:-"${OUTPUT_DIR}/rl_debug_once"}
 SFT_MODEL_PATH=${SFT_MODEL_PATH:-"$HOME/data/pi05_libero_torch"}
 TOKENIZER_PATH="$SFT_MODEL_PATH"
 
@@ -64,6 +65,16 @@ if echo "$gpu_name" | grep "NVIDIA H"; then
 fi
 
 export VERL_LOGGING_LEVEL=INFO
+
+ACTOR_LOSS_TYPE=${ACTOR_LOSS_TYPE:-sac}
+
+# One-shot RL debug dump for checking rollout-vs-dataset alignment.
+# Set RL_DEBUG_DUMP=1 to enable and dump on step 1.
+RL_DEBUG_DUMP=${RL_DEBUG_DUMP:-0}
+RL_DEBUG_DUMP_INTERVAL=0
+if [ "$RL_DEBUG_DUMP" = "1" ]; then
+    RL_DEBUG_DUMP_INTERVAL=1
+fi
 
 $PYTHON -m verl.experimental.vla.main_sac \
     data.train_files="$train_files" \
@@ -127,9 +138,13 @@ $PYTHON -m verl.experimental.vla.main_sac \
     +trainer.n_rollout_gpus_per_node=$NUM_ROLLOUT_GPUS \
     +trainer.rollout_interval=60 \
     +trainer.rlpd_enable=True \
+    +trainer.rl_debug_dump_interval=$RL_DEBUG_DUMP_INTERVAL \
+    +trainer.rl_debug_dump_num_samples=4 \
+    +trainer.rl_debug_dump_dir=${RL_DEBUG_DIR} \
     trainer.nnodes=$NUM_NODES \
     trainer.save_freq=30 \
     trainer.test_freq=-1 \
     trainer.total_epochs=100 \
     trainer.val_only=False \
-    trainer.val_before_train=False
+    trainer.val_before_train=False \
+    actor_rollout_ref.actor.sac.actor_loss_type=${ACTOR_LOSS_TYPE}
