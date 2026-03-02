@@ -466,9 +466,12 @@ class RobDataParallelSACActor(BaseSACActor):
             "data/reward_mean": valid_mean(batch["rewards"], batch["valids"]).detach().item(),
             "data/valid_ratio": batch["valids"].float().mean().item(),
             "data/positive_sample_ratio": valid_mean(batch["positive_sample_mask"].float(), batch["valids"]).detach().item(),
+            # BC diagnostics: if these explode, action normalization/stats are likely mismatched.
+            "data/a0_abs_mean": batch["a0.full_action"].abs().mean().detach().item(),
+            "data/a0_std": batch["a0.full_action"].std().detach().item(),
 
             "sac/alpha": self._get_alpha().detach().item(),
-            "sac/replay_pool_size": len(self.replay_pool),
+            "sac/replay_pool_size": len(self.replay_pool) if self.actor_loss_type == "sac" else 0,
 
             "critic/loss": sum(critic_loss_list) / len(critic_loss_list) if critic_loss_list else 0.0,
             "critic/lr": self.critic_optimizer.param_groups[0]["lr"],

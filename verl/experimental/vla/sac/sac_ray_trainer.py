@@ -550,6 +550,9 @@ class RobRaySACTrainer(RayPPOTrainer):
                                 rlpd_batch = next(rlpd_dataloader_iter)
                                 rlpd_batch = DataProto.from_single_dict(rlpd_batch)
                                 train_batch = self.actor_rollout_wg.process_dataset_batch(rlpd_batch).get()
+                                # Keep actor-worker metadata expectations aligned with non-BC paths.
+                                train_batch.meta_info["global_steps"] = self.global_steps
+                                train_batch.meta_info.setdefault("global_token_num", [0])
                                 if should_debug_dump:
                                     _dump_debug_images(
                                         train_batch,
