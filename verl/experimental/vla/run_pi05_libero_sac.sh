@@ -70,7 +70,7 @@ ACTOR_LOSS_TYPE=${ACTOR_LOSS_TYPE:-sac}
 
 # One-shot RL debug dump for checking rollout-vs-dataset alignment.
 # Set RL_DEBUG_DUMP=1 to enable and dump on step 1.
-RL_DEBUG_DUMP=${RL_DEBUG_DUMP:-0}
+RL_DEBUG_DUMP=${RL_DEBUG_DUMP:-1}
 RL_DEBUG_DUMP_INTERVAL=0
 if [ "$RL_DEBUG_DUMP" = "1" ]; then
     RL_DEBUG_DUMP_INTERVAL=1
