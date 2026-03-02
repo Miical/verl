@@ -365,7 +365,7 @@ class RobDataParallelSACActor(BaseSACActor):
         if self.actor_loss_type == "bc":
             batch = data.batch
             if batch.size(0) > self.config.ppo_mini_batch_size:
-                idx = torch.randperm(batch.size(0), device=get_device_id())[: self.config.ppo_mini_batch_size]
+                idx = torch.randperm(batch.size(0))[: self.config.ppo_mini_batch_size]
                 batch = batch[idx]
         else:
             self.replay_pool.add_batch(data.batch)
