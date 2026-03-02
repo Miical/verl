@@ -46,7 +46,8 @@ def _to_hwc_uint8(image_like) -> np.ndarray | None:
     if image_like is None:
         return None
     if isinstance(image_like, torch.Tensor):
-        arr = image_like.detach().cpu().numpy()
+        # numpy does not support bfloat16 tensors directly
+        arr = image_like.detach().to(torch.float32).cpu().numpy()
     else:
         arr = np.asarray(image_like)
 
