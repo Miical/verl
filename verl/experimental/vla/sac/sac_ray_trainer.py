@@ -187,6 +187,9 @@ class RobRaySACTrainer(RayPPOTrainer):
         self.use_critic = False
         self.use_bc_actor = OmegaConf.select(self.config, "sac.actor_loss_type") == "bc"
 
+        if self.use_bc_actor and not self.config.trainer.rlpd_enable:
+            raise ValueError("BC actor mode requires trainer.rlpd_enable=True for offline dataset supervision")
+
         if self.config.trainer.rlpd_enable:
             assert rlpd_dataset is not None, "rlpd_dataset must be provided when rlpd_enable is True"
             self.rlpd_dataloader = StatefulDataLoader(
@@ -396,7 +399,15 @@ class RobRaySACTrainer(RayPPOTrainer):
                             reset_future = self._reset_envs(gen_batch)
 
                     with marked_timer("step", timing_raw):
-                        if need_rollout:
+                        if self.use_bc_actor:
+                            # Pure offline BC update: skip env rollout entirely.
+                            with marked_timer("update_actor", timing_raw, color="red"):
+                                rlpd_batch = next(rlpd_dataloader_iter)
+                                rlpd_batch = DataProto.from_single_dict(rlpd_batch)
+                                train_batch = self.actor_rollout_wg.process_dataset_batch(rlpd_batch).get()
+                                actor_output = self.actor_rollout_wg.update_actor(train_batch)
+                            actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
+                        elif need_rollout:
                             # generate a batch
                             with marked_timer("gen", timing_raw, color="red"):
                                 batch = self.async_rollout_manager.generate_sequences(gen_batch, reset_future)
@@ -433,25 +444,21 @@ class RobRaySACTrainer(RayPPOTrainer):
                                 rlpd_batch = DataProto.from_single_dict(rlpd_batch)
                                 rlpd_batch = self.actor_rollout_wg.process_dataset_batch(rlpd_batch).get()
 
-                                if self.use_bc_actor:
-                                    train_batch = rlpd_batch
-                                    print(f"BC mode: using pure RLPD batch, size {len(train_batch)}")
-                                else:
-                                    rl_batch = batch.select([
-                                        "a0.full_action", "a1.full_action",
-                                        "s0.states", "s1.states",
-                                        "s0.images", "s1.images",
-                                        "s0.image_masks", "s1.image_masks",
-                                        "s0.lang_tokens", "s1.lang_tokens",
-                                        "s0.lang_masks", "s1.lang_masks",
-                                        "dones",
-                                        "valids",
-                                        "rewards",
-                                        "positive_sample_mask"
-                                    ])
+                                rl_batch = batch.select([
+                                    "a0.full_action", "a1.full_action",
+                                    "s0.states", "s1.states",
+                                    "s0.images", "s1.images",
+                                    "s0.image_masks", "s1.image_masks",
+                                    "s0.lang_tokens", "s1.lang_tokens",
+                                    "s0.lang_masks", "s1.lang_masks",
+                                    "dones",
+                                    "valids",
+                                    "rewards",
+                                    "positive_sample_mask"
+                                ])
 
-                                    train_batch = DataProto.concat([rl_batch, rlpd_batch])
-                                    print(f"RLPD enabled: RL batch size {len(rl_batch)}, RLPD batch size {len(rlpd_batch)}, total {len(train_batch)}")
+                                train_batch = DataProto.concat([rl_batch, rlpd_batch])
+                                print(f"RLPD enabled: RL batch size {len(rl_batch)}, RLPD batch size {len(rlpd_batch)}, total {len(train_batch)}")
                             else:
                                 train_batch = batch
 
