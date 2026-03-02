@@ -124,6 +124,72 @@ def _dump_debug_images(data: DataProto, *, tag: str, global_step: int, output_di
             pass
 
 
+
+
+def _decode_prompt_tokens(tokenizer, tokens: torch.Tensor) -> str:
+    try:
+        return tokenizer.decode(tokens.detach().cpu().tolist(), skip_special_tokens=True)
+    except Exception:
+        return "<decode_failed>"
+
+
+def _dump_debug_prompts_and_actions(
+    *,
+    tokenizer,
+    rollout_batch: DataProto,
+    dataset_batch: DataProto,
+    global_step: int,
+    output_dir: str,
+    num_samples: int = 4,
+) -> None:
+    """Best-effort debug dump for RL mode data alignment checks."""
+    if not hasattr(rollout_batch, "batch") or not hasattr(dataset_batch, "batch"):
+        return
+    if "a0.full_action" not in rollout_batch.batch or "a0.full_action" not in dataset_batch.batch:
+        return
+    if "s0.lang_tokens" not in rollout_batch.batch or "s0.lang_tokens" not in dataset_batch.batch:
+        return
+
+    os.makedirs(output_dir, exist_ok=True)
+    roll_n = int(rollout_batch.batch["a0.full_action"].shape[0])
+    data_n = int(dataset_batch.batch["a0.full_action"].shape[0])
+    sample_num = min(int(num_samples), roll_n, data_n)
+    if sample_num <= 0:
+        return
+
+    rollout_idx = np.random.choice(roll_n, size=sample_num, replace=False)
+    dataset_idx = np.random.choice(data_n, size=sample_num, replace=False)
+
+    rows = []
+    for i, (ri, di) in enumerate(zip(rollout_idx.tolist(), dataset_idx.tolist(), strict=False)):
+        r_prompt = _decode_prompt_tokens(tokenizer, rollout_batch.batch["s0.lang_tokens"][ri])
+        d_prompt = _decode_prompt_tokens(tokenizer, dataset_batch.batch["s0.lang_tokens"][di])
+
+        r_action = rollout_batch.batch["a0.full_action"][ri].detach().cpu().numpy()
+        d_action = dataset_batch.batch["a0.full_action"][di].detach().cpu().numpy()
+
+        np.savez_compressed(
+            os.path.join(output_dir, f"step_{global_step:08d}_pair{i}_actions.npz"),
+            rollout_action=r_action,
+            dataset_action=d_action,
+        )
+
+        rows.append(
+            {
+                "pair_id": i,
+                "rollout_index": ri,
+                "dataset_index": di,
+                "rollout_prompt": r_prompt,
+                "dataset_prompt": d_prompt,
+                "rollout_action_abs_mean": float(np.mean(np.abs(r_action))),
+                "dataset_action_abs_mean": float(np.mean(np.abs(d_action))),
+            }
+        )
+
+    with open(os.path.join(output_dir, f"step_{global_step:08d}_prompt_action_pairs.jsonl"), "w", encoding="utf-8") as f:
+        for row in rows:
+            f.write(f"{row}\n")
+
 def compute_response_mask(config, data: DataProto) -> torch.Tensor:
     """Compute the attention mask for the response part of the sequence.
 
@@ -564,6 +630,13 @@ class RobRaySACTrainer(RayPPOTrainer):
                                 actor_output = self.actor_rollout_wg.update_actor(train_batch)
                             actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
                         elif need_rollout:
+                            rl_debug_dump_interval = int(self.config.trainer.get("rl_debug_dump_interval", 0))
+                            rl_debug_dump_samples = int(self.config.trainer.get("rl_debug_dump_num_samples", 4))
+                            rl_debug_dump_dir = self.config.trainer.get("rl_debug_dump_dir", "/tmp/verl_rl_debug")
+                            should_rl_debug_dump = (
+                                rl_debug_dump_interval > 0 and self.global_steps % rl_debug_dump_interval == 0
+                            )
+
                             # generate a batch
                             with marked_timer("gen", timing_raw, color="red"):
                                 batch = self.async_rollout_manager.generate_sequences(gen_batch, reset_future)
@@ -615,6 +688,29 @@ class RobRaySACTrainer(RayPPOTrainer):
 
                                 train_batch = DataProto.concat([rl_batch, rlpd_batch])
                                 print(f"RLPD enabled: RL batch size {len(rl_batch)}, RLPD batch size {len(rlpd_batch)}, total {len(train_batch)}")
+                                if should_rl_debug_dump:
+                                    _dump_debug_images(
+                                        rl_batch,
+                                        tag="rollout",
+                                        global_step=self.global_steps,
+                                        output_dir=rl_debug_dump_dir,
+                                        num_samples=rl_debug_dump_samples,
+                                    )
+                                    _dump_debug_images(
+                                        rlpd_batch,
+                                        tag="dataset",
+                                        global_step=self.global_steps,
+                                        output_dir=rl_debug_dump_dir,
+                                        num_samples=rl_debug_dump_samples,
+                                    )
+                                    _dump_debug_prompts_and_actions(
+                                        tokenizer=self.tokenizer,
+                                        rollout_batch=rl_batch,
+                                        dataset_batch=rlpd_batch,
+                                        global_step=self.global_steps,
+                                        output_dir=rl_debug_dump_dir,
+                                        num_samples=rl_debug_dump_samples,
+                                    )
                             else:
                                 train_batch = batch
 
