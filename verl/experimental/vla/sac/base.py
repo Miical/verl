@@ -89,6 +89,30 @@ class SupportSACTraining:
 
         raise NotImplementedError("Subclasses must implement sac_forward_actor method.")
 
+    def sac_forward_bc_loss(
+        self,
+        state_features: Any,
+        target_actions: torch.Tensor,
+        valids: torch.Tensor,
+        *,
+        action_steps: int,
+        action_dim: int,
+    ) -> torch.Tensor:
+        """Compute diffusion SFT/BC loss on dataset actions.
+
+        Args:
+            state_features: Processed state features.
+            target_actions: Tensor of shape (B, n_action_steps, action_dim_full).
+            valids: Tensor of shape (B,) indicating valid samples.
+            action_steps: Number of real action steps to supervise (exclude padded steps).
+            action_dim: Number of real action dimensions to supervise (exclude padded dims).
+
+        Returns:
+            Scalar loss tensor.
+        """
+
+        raise NotImplementedError("Subclasses must implement sac_forward_bc_loss method.")
+
     def sac_forward_state_features(self, s: dict[str, torch.Tensor]) -> Any:
         """Compute state features needed for SAC actor and critic.
 

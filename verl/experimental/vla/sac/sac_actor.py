@@ -134,6 +134,8 @@ class RobDataParallelSACActor(BaseSACActor):
         self.actor_loss_type = self.sac_config.get("actor_loss_type", "sac")
         if self.actor_loss_type not in {"sac", "bc"}:
             raise ValueError(f"Unsupported actor_loss_type: {self.actor_loss_type}")
+        self.bc_action_steps = int(self.sac_config.get("bc_action_steps", 10))
+        self.bc_action_dim = int(self.sac_config.get("bc_action_dim", 7))
 
         self.replay_pool = SACReplayPool(capacity=self.config.replay_pool_capacity, sample_device=self.device)
         self.replay_pool.load(self.config.replay_pool_save_dir)
@@ -302,16 +304,19 @@ class RobDataParallelSACActor(BaseSACActor):
 
     def _calculate_bc_loss(
         self,
-        pred_actions: torch.Tensor,
+        state_features,
         target_actions: torch.Tensor,
         valids: torch.Tensor,
     ) -> torch.Tensor:
-        """Calculate behavior cloning loss using action regression."""
+        """Calculate behavior cloning loss using diffusion SFT objective."""
 
-        per_action_l2 = F.mse_loss(pred_actions, target_actions, reduction="none")
-        per_sample_loss = per_action_l2.mean(dim=(1, 2))
-        valid_f = valids.float().to(per_sample_loss.device)
-        return (per_sample_loss * valid_f).sum() / valid_f.sum().clamp_min(1.0)
+        return self.actor_module.sac_forward_bc_loss(
+            state_features=state_features,
+            target_actions=target_actions,
+            valids=valids,
+            action_steps=self.bc_action_steps,
+            action_dim=self.bc_action_dim,
+        )
 
     def _forward_actor(self, micro_batch: TensorDict) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
         micro_batch = micro_batch.to(get_device_id())
@@ -319,15 +324,15 @@ class RobDataParallelSACActor(BaseSACActor):
 
         with torch.autocast(device_type=get_device_name(), dtype=torch.bfloat16):
             s0_state_features = self.actor_module.sac_forward_state_features(s0)
-            a0_actions, log_probs_0 = self.actor_module.sac_forward_actor(s0_state_features)
             if self.actor_loss_type == "bc":
                 actor_loss = self._calculate_bc_loss(
-                    pred_actions=a0_actions,
+                    state_features=s0_state_features,
                     target_actions=micro_batch["a0.full_action"],
                     valids=micro_batch["valids"],
                 )
                 return actor_loss, None, None
 
+            a0_actions, log_probs_0 = self.actor_module.sac_forward_actor(s0_state_features)
             q_values_0 = self.actor_module.sac_forward_critic(
                 {"full_action": a0_actions},
                 s0_state_features,

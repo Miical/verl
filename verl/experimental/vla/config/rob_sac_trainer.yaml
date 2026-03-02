@@ -54,6 +54,8 @@ actor_rollout_ref:
       alpha_lr: 0.0003
       target_entropy: -64.0
       actor_loss_type: sac
+      bc_action_steps: 10
+      bc_action_dim: 7
     critic_lr: 0.0001
     critic_weight_decay: 0.0001
     critic_warmup_steps: 100
