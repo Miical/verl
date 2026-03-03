@@ -106,23 +106,27 @@ def _dump_debug_images(data: DataProto, *, tag: str, global_step: int, output_di
     os.makedirs(output_dir, exist_ok=True)
 
     for rank, idx in enumerate(chosen_idx.tolist()):
-        img = _to_hwc_uint8(image_tensor[idx])
-        if img is None:
-            continue
-        canvas = img
+        sample = image_tensor[idx]
+        # Support both single-view (C,H,W) and multi-view (N,C,H,W) tensors.
+        views = [sample] if sample.ndim == 3 else [sample[v] for v in range(sample.shape[0])]
 
-        # lightweight text annotation without extra dependencies: encode metadata in filename
-        out = os.path.join(
-            output_dir,
-            f"step_{global_step:08d}_{tag}_sample{rank}_idx{idx}_key_{image_key.replace('.', '_')}.png",
-        )
-        try:
-            import imageio.v2 as imageio
+        for view_id, view in enumerate(views):
+            img = _to_hwc_uint8(view)
+            if img is None:
+                continue
 
-            imageio.imwrite(out, canvas)
-        except Exception:
-            # best effort debug utility, never block training
-            pass
+            # lightweight text annotation without extra dependencies: encode metadata in filename
+            out = os.path.join(
+                output_dir,
+                f"step_{global_step:08d}_{tag}_sample{rank}_idx{idx}_view{view_id}_key_{image_key.replace('.', '_')}.png",
+            )
+            try:
+                import imageio.v2 as imageio
+
+                imageio.imwrite(out, img)
+            except Exception:
+                # best effort debug utility, never block training
+                pass
 
 
 
