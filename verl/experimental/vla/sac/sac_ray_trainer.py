@@ -19,6 +19,7 @@ import uuid
 from collections import defaultdict
 from pprint import pprint
 import itertools
+import h5py
 
 import numpy as np
 import torch
@@ -260,6 +261,94 @@ def _dump_debug_prompts_and_actions(
     with open(os.path.join(output_dir, f"step_{global_step:08d}_prompt_action_pairs.jsonl"), "w", encoding="utf-8") as f:
         for row in rows:
             f.write(f"{row}\n")
+
+
+
+def _to_uint8_hwc(img_chw: torch.Tensor) -> np.ndarray:
+    arr = img_chw.detach().to(torch.float32).cpu().numpy()  # (C,H,W), normalized [-1,1]
+    if arr.shape[0] in (1, 3):
+        arr = np.transpose(arr, (1, 2, 0))
+    arr = ((arr + 1.0) * 0.5 * 255.0).clip(0, 255).astype(np.uint8)
+    # Make stored image compatible with libero_dataset.py which flips H/W on load.
+    arr = np.flip(arr, axis=(0, 1)).copy()
+    return arr
+
+
+def _export_rollout_batch_to_libero_hdf5(
+    *,
+    rollout_batch: DataProto,
+    output_dir: str,
+    global_step: int,
+    max_demos: int,
+) -> int:
+    """Export rollout batch to Libero-style *_demo.hdf5 for dataset replay."""
+    if not hasattr(rollout_batch, "batch"):
+        return 0
+    required = ["action", "complete", "full_image", "wrist_image", "state"]
+    if any(k not in rollout_batch.batch for k in required):
+        return 0
+
+    actions = rollout_batch.batch["action"]          # (B,S,C,A)
+    done_chunk = rollout_batch.batch["complete"].any(dim=-1)  # (B,S)
+    full_image = rollout_batch.batch["full_image"]   # (B,S,H,W,C)
+    wrist_image = rollout_batch.batch["wrist_image"] # (B,S,H,W,C)
+    states = rollout_batch.batch["state"]            # (B,S,D)
+
+    B, S, C, A = actions.shape
+    demos_to_save = min(int(max_demos), int(B))
+    if demos_to_save <= 0:
+        return 0
+
+    os.makedirs(output_dir, exist_ok=True)
+    out_path = os.path.join(output_dir, f"ROLLOUT_SCENE0_step{global_step:08d}_demo.hdf5")
+
+    with h5py.File(out_path, "w") as f:
+        data_grp = f.create_group("data")
+        for b in range(demos_to_save):
+            demo_grp = data_grp.create_group(f"demo_{b:04d}")
+            obs_grp = demo_grp.create_group("obs")
+
+            # Flatten chunk actions (S,C,A) -> (T,A)
+            action_flat = actions[b].detach().to(torch.float32).cpu().reshape(S * C, A).numpy()
+            demo_grp.create_dataset("actions", data=action_flat)
+
+            # Repeat each chunk obs/state for each action in that chunk to get length T.
+            agent_chunk = full_image[b]   # (S,H,W,C) uint8-like
+            wrist_chunk = wrist_image[b]  # (S,H,W,C) uint8-like
+            state_chunk = states[b].detach().to(torch.float32).cpu().numpy()  # (S,D)
+
+            agent_rep = np.repeat(agent_chunk.detach().cpu().numpy(), C, axis=0)
+            wrist_rep = np.repeat(wrist_chunk.detach().cpu().numpy(), C, axis=0)
+            state_rep = np.repeat(state_chunk, C, axis=0)
+
+            # Convert rollout normalized/model images back to uint8 HWC expected by libero dataset.
+            if agent_rep.ndim == 4 and agent_rep.shape[-1] == 3:
+                # raw env images are already HWC uint8; just ensure type and pre-flip.
+                agent_u8 = np.flip(agent_rep.astype(np.uint8), axis=(1, 2)).copy()
+                wrist_u8 = np.flip(wrist_rep.astype(np.uint8), axis=(1, 2)).copy()
+            else:
+                # fallback for CHW-like tensors
+                agent_u8 = np.stack([_to_uint8_hwc(torch.from_numpy(x)) for x in agent_rep], axis=0)
+                wrist_u8 = np.stack([_to_uint8_hwc(torch.from_numpy(x)) for x in wrist_rep], axis=0)
+
+            obs_grp.create_dataset("agentview_rgb", data=agent_u8)
+            obs_grp.create_dataset("eye_in_hand_rgb", data=wrist_u8)
+
+            d = state_rep.shape[-1]
+            ee_pos = state_rep[:, :3] if d >= 3 else np.pad(state_rep, ((0, 0), (0, max(0, 3 - d))))[:, :3]
+            ee_ori = state_rep[:, 3:6] if d >= 6 else np.pad(state_rep, ((0, 0), (0, max(0, 6 - d))))[:, 3:6]
+            gripper = state_rep[:, 6:7] if d >= 7 else np.zeros((state_rep.shape[0], 1), dtype=np.float32)
+            obs_grp.create_dataset("ee_pos", data=ee_pos.astype(np.float32))
+            obs_grp.create_dataset("ee_ori", data=ee_ori.astype(np.float32))
+            obs_grp.create_dataset("gripper_states", data=gripper.astype(np.float32))
+
+            done_rep = np.repeat(done_chunk[b].detach().cpu().numpy().astype(np.uint8), C, axis=0)
+            demo_grp.create_dataset("dones", data=done_rep)
+            demo_grp.create_dataset("rewards", data=done_rep.astype(np.float32))
+            demo_grp.create_dataset("robot_states", data=state_rep.astype(np.float32))
+            demo_grp.create_dataset("states", data=state_rep.astype(np.float32))
+
+    return demos_to_save
 
 def compute_response_mask(config, data: DataProto) -> torch.Tensor:
     """Compute the attention mask for the response part of the sequence.
@@ -576,6 +665,11 @@ class RobRaySACTrainer(RayPPOTrainer):
         if self.config.trainer.rlpd_enable:
             rlpd_dataloader_iter = itertools.cycle(self.rlpd_dataloader)
 
+        export_rollout_dir = self.config.trainer.get("export_rollout_hdf5_dir", None)
+        export_rollout_max_demos = int(self.config.trainer.get("export_rollout_max_demos", 0))
+        export_rollout_exit = bool(self.config.trainer.get("export_rollout_exit_after_dump", True))
+        exported_rollout_demos = 0
+
         for epoch in range(self.config.trainer.total_epochs):
             train_iter = iter(self.train_dataloader)
             next_batch_dict = next(train_iter)
@@ -618,6 +712,7 @@ class RobRaySACTrainer(RayPPOTrainer):
                         gen_batch.meta_info["eos_token_id"] = self.tokenizer.eos_token_id
                         gen_batch.meta_info["n_samples"] = self.config.actor_rollout_ref.rollout.n
                         gen_batch.meta_info["pad_token_id"] = self.tokenizer.pad_token_id
+                        gen_batch.meta_info["collect_env_obs"] = export_rollout_dir is not None and export_rollout_max_demos > 0
                         gen_batch = gen_batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
                         if dataloader_step == 0 :
                             reset_future = self._reset_envs(gen_batch)
@@ -666,6 +761,7 @@ class RobRaySACTrainer(RayPPOTrainer):
                                 gen_batch.meta_info["eos_token_id"] = self.tokenizer.eos_token_id
                                 gen_batch.meta_info["n_samples"] = self.config.actor_rollout_ref.rollout.n
                                 gen_batch.meta_info["pad_token_id"] = self.tokenizer.pad_token_id
+                                gen_batch.meta_info["collect_env_obs"] = export_rollout_dir is not None and export_rollout_max_demos > 0
                                 gen_batch = gen_batch.repeat(
                                     repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True
                                 )
@@ -711,6 +807,21 @@ class RobRaySACTrainer(RayPPOTrainer):
                             # generate a batch
                             with marked_timer("gen", timing_raw, color="red"):
                                 batch = self.async_rollout_manager.generate_sequences(gen_batch, reset_future)
+
+                            if export_rollout_dir is not None and export_rollout_max_demos > exported_rollout_demos:
+                                remaining = export_rollout_max_demos - exported_rollout_demos
+                                saved = _export_rollout_batch_to_libero_hdf5(
+                                    rollout_batch=batch,
+                                    output_dir=export_rollout_dir,
+                                    global_step=self.global_steps,
+                                    max_demos=remaining,
+                                )
+                                exported_rollout_demos += int(saved)
+                                if export_rollout_exit and exported_rollout_demos >= export_rollout_max_demos:
+                                    print(
+                                        f"Exported {exported_rollout_demos} rollout demos to {export_rollout_dir}. Exiting early as requested."
+                                    )
+                                    return
 
                             # prepare for next batch's env reset
                             if dataloader_step != dataloader_len - 1:

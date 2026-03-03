@@ -67,6 +67,9 @@ fi
 export VERL_LOGGING_LEVEL=INFO
 
 ACTOR_LOSS_TYPE=${ACTOR_LOSS_TYPE:-sac}
+EXPORT_ROLLOUT_HDF5_DIR=${EXPORT_ROLLOUT_HDF5_DIR:-""}
+EXPORT_ROLLOUT_MAX_DEMOS=${EXPORT_ROLLOUT_MAX_DEMOS:-0}
+EXPORT_ROLLOUT_EXIT_AFTER_DUMP=${EXPORT_ROLLOUT_EXIT_AFTER_DUMP:-1}
 
 # One-shot RL debug dump for checking rollout-vs-dataset alignment.
 # Set RL_DEBUG_DUMP=1 to enable and dump on step 1.
@@ -147,4 +150,7 @@ $PYTHON -m verl.experimental.vla.main_sac \
     trainer.total_epochs=100 \
     trainer.val_only=False \
     trainer.val_before_train=False \
-    actor_rollout_ref.actor.sac.actor_loss_type=${ACTOR_LOSS_TYPE}
+    actor_rollout_ref.actor.sac.actor_loss_type=${ACTOR_LOSS_TYPE} \
+    +trainer.export_rollout_hdf5_dir=${EXPORT_ROLLOUT_HDF5_DIR} \
+    +trainer.export_rollout_max_demos=${EXPORT_ROLLOUT_MAX_DEMOS} \
+    +trainer.export_rollout_exit_after_dump=${EXPORT_ROLLOUT_EXIT_AFTER_DUMP}
