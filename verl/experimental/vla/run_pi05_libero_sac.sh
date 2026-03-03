@@ -29,7 +29,7 @@ NUM_STAGE=2                                    # number of pipeline stages
 NUM_ENV=8                                      # number of envs per env worker
 
 NUM_ACTION_CHUNKS=10                           # number of action chunks
-MAX_EPISODE_STEPS=30                           # max episode steps for each env
+MAX_EPISODE_STEPS=500                           # max episode steps for each env
                                                # max_interactions = MAX_EPISODE_STEPS / num_action_chunks
 
 # Training Config
@@ -67,7 +67,7 @@ fi
 export VERL_LOGGING_LEVEL=INFO
 
 ACTOR_LOSS_TYPE=${ACTOR_LOSS_TYPE:-sac}
-EXPORT_ROLLOUT_HDF5_DIR=${EXPORT_ROLLOUT_HDF5_DIR:-""}
+EXPORT_ROLLOUT_HDF5_DIR=${EXPORT_ROLLOUT_HDF5_DIR:-"/shared_disk/users/angen.ye/code/hil-serl/datasets/LIBERO-dataset/mylibero"}
 EXPORT_ROLLOUT_MAX_DEMOS=${EXPORT_ROLLOUT_MAX_DEMOS:-0}
 EXPORT_ROLLOUT_EXIT_AFTER_DUMP=${EXPORT_ROLLOUT_EXIT_AFTER_DUMP:-1}
 
