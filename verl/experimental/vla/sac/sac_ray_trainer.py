@@ -735,9 +735,14 @@ class RobRaySACTrainer(RayPPOTrainer):
                             should_debug_dump = (
                                 need_rollout and debug_dump_interval > 0 and self.global_steps % debug_dump_interval == 0
                             )
+                            should_export_rollout = (
+                                need_rollout
+                                and export_rollout_dir is not None
+                                and export_rollout_max_demos > exported_rollout_demos
+                            )
 
                             rollout_debug_batch = None
-                            if should_video_rollout or should_debug_dump:
+                            if should_video_rollout or should_debug_dump or should_export_rollout:
                                 if next_batch_dict is None:
                                     train_iter = iter(self.train_dataloader)
                                     next_batch_dict = next(train_iter)
@@ -769,6 +774,21 @@ class RobRaySACTrainer(RayPPOTrainer):
                                 with marked_timer("gen_video", timing_raw, color="yellow"):
                                     rollout_debug_batch = self.async_rollout_manager.generate_sequences(gen_batch, reset_future)
                                 print(f"BC mode rollout/debug dump at step {self.global_steps}")
+
+                            if should_export_rollout and rollout_debug_batch is not None:
+                                remaining = export_rollout_max_demos - exported_rollout_demos
+                                saved = _export_rollout_batch_to_libero_hdf5(
+                                    rollout_batch=rollout_debug_batch,
+                                    output_dir=export_rollout_dir,
+                                    global_step=self.global_steps,
+                                    max_demos=remaining,
+                                )
+                                exported_rollout_demos += int(saved)
+                                if export_rollout_exit and exported_rollout_demos >= export_rollout_max_demos:
+                                    print(
+                                        f"Exported {exported_rollout_demos} rollout demos to {export_rollout_dir}. Exiting early as requested."
+                                    )
+                                    return
 
                             if should_debug_dump and rollout_debug_batch is not None:
                                 _dump_debug_images(
