@@ -132,7 +132,10 @@ class RobDataParallelSACActor(BaseSACActor):
         self.actor_module.sac_init()
         self.tokenizer = tokenizer
 
-        self.replay_pool = SACReplayPool(capacity=self.config.replay_pool_capacity, sample_device=self.device)
+        self.replay_pool = SACReplayPool(
+            single_pool_capacity=self.config.replay_pool_single_size,
+            sample_device=self.device,
+        )
         self.replay_pool.load(self.config.replay_pool_save_dir)
 
         self._init_alpha()
@@ -433,8 +436,9 @@ class RobDataParallelSACActor(BaseSACActor):
             "data/valid_ratio": batch["valids"].float().mean().item(),
             "data/positive_sample_ratio": valid_mean(batch["positive_sample_mask"].float(), batch["valids"]).detach().item(),
             "sac/replay_sampled_positive_ratio_actual": replay_sample_info["actual_positive_sample_ratio"],
-            "sac/replay_sampled_positive_count": replay_sample_info["sampled_positive_count"],
-            "sac/replay_sampled_negative_count": replay_sample_info["sampled_negative_count"],
+            "sac/replay_pool_positive_size": replay_sample_info["positive_size"],
+            "sac/replay_pool_negative_size": replay_sample_info["negative_size"],
+            "sac/replay_task_count": replay_sample_info["task_count"],
 
             "sac/alpha": self._get_alpha().detach().item(),
             "sac/replay_pool_size": len(self.replay_pool),

@@ -14,7 +14,8 @@
 
 import logging
 import os
-from typing import Optional
+from dataclasses import dataclass
+from typing import Any, Optional, Sequence
 
 import torch
 from tensordict import TensorDict
@@ -23,54 +24,81 @@ logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 
+@dataclass
+class _DualPoolState:
+    positive_pool: Optional[TensorDict] = None
+    negative_pool: Optional[TensorDict] = None
+    positive_size: int = 0
+    negative_size: int = 0
+    positive_position: int = 0
+    negative_position: int = 0
+
+
 class SACReplayPool:
-    """SAC Replay Pool for storing samples."""
+    """Task-aware SAC Replay Pool.
+
+    For each task_id we maintain two independent pools:
+    - positive pool
+    - negative pool
+
+    `single_pool_capacity` is the size of each single pool.
+    """
 
     def __init__(
         self,
-        capacity: int,
+        single_pool_capacity: int,
         pool_device: str = "cpu",
         sample_device: str = "cpu",
     ):
-        self.positive_pool: Optional[TensorDict] = None
-        self.negative_pool: Optional[TensorDict] = None
-        self.capacity = capacity
+        self.single_pool_capacity = int(single_pool_capacity)
+        self.pool_device = pool_device
+        self.sample_device = sample_device
+
+        self.task_pools: dict[str, _DualPoolState] = {}
 
         self.size = 0
         self.positive_size = 0
         self.negative_size = 0
-        self.positive_position = 0
-        self.negative_position = 0
 
         self.rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
 
-        self.pool_device = pool_device
-        self.sample_device = sample_device
+    def add_batch(self, batch: TensorDict, task_ids: Sequence[Any]):
+        """Add a batch of samples into task-specific positive/negative pools."""
 
-    def add_batch(self, batch: TensorDict):
-        """Add a batch of samples to the replay pool.
+        if batch.batch_size[0] == 0:
+            return
 
-        Args:
-            batch (TensorDict): A batch of samples to add. The batch should be a TensorDict
-                containing the necessary keys for SAC training, each with shape [batch_size, ...].
-        """
-
-        if self.positive_pool is None or self.negative_pool is None:
-            self._lazy_init_pool(batch)
+        if len(task_ids) != batch.batch_size[0]:
+            raise ValueError(
+                f"task_ids length ({len(task_ids)}) must match batch size ({batch.batch_size[0]})."
+            )
 
         positive_mask = self._extract_positive_mask(batch)
-        positive_idx = torch.nonzero(positive_mask, as_tuple=False).squeeze(-1)
-        negative_idx = torch.nonzero(~positive_mask, as_tuple=False).squeeze(-1)
 
-        if positive_idx.numel() > 0:
-            positive_batch = self._index_select_batch(batch, positive_idx)
-            self._insert_block_to_pool(positive_batch, is_positive_pool=True)
+        grouped_indices: dict[str, dict[str, list[int]]] = {}
+        for idx in range(batch.batch_size[0]):
+            task_key = self._normalize_task_id(task_ids[idx])
+            if task_key not in grouped_indices:
+                grouped_indices[task_key] = {"positive": [], "negative": []}
+            if bool(positive_mask[idx].item()):
+                grouped_indices[task_key]["positive"].append(idx)
+            else:
+                grouped_indices[task_key]["negative"].append(idx)
 
-        if negative_idx.numel() > 0:
-            negative_batch = self._index_select_batch(batch, negative_idx)
-            self._insert_block_to_pool(negative_batch, is_positive_pool=False)
+        for task_key, groups in grouped_indices.items():
+            pool_state = self._get_or_create_task_pool(task_key, batch)
 
-        self.size = self.positive_size + self.negative_size
+            if groups["positive"]:
+                positive_idx = torch.tensor(groups["positive"], device=batch.device, dtype=torch.long)
+                positive_batch = self._index_select_batch(batch, positive_idx)
+                self._insert_block_to_pool(pool_state, positive_batch, is_positive_pool=True)
+
+            if groups["negative"]:
+                negative_idx = torch.tensor(groups["negative"], device=batch.device, dtype=torch.long)
+                negative_batch = self._index_select_batch(batch, negative_idx)
+                self._insert_block_to_pool(pool_state, negative_batch, is_positive_pool=False)
+
+        self._refresh_global_stats()
 
     def sample_batch(
         self,
@@ -78,16 +106,9 @@ class SACReplayPool:
         positive_sample_ratio: float = 0.5,
         return_sample_info: bool = False,
     ) -> TensorDict | tuple[TensorDict, dict]:
-        """Sample a batch of experiences from the replay pool.
+        """Sample a batch from all task-specific pools."""
 
-        Args:
-            batch_size (int): The number of samples to draw.
-
-        Returns:
-            TensorDict: A batch of sampled experiences.
-        """
-
-        assert self.size >= batch_size, "Not enough samples in the replay pool to sample the requested batch size."
+        assert self.size >= batch_size, "Not enough samples in replay pool to sample the requested batch size."
 
         positive_sample_ratio = max(0.0, min(1.0, float(positive_sample_ratio)))
         target_positive = int(round(batch_size * positive_sample_ratio))
@@ -122,9 +143,9 @@ class SACReplayPool:
 
         sampled_parts = []
         if sampled_positive > 0:
-            sampled_parts.append(self._sample_from_single_pool(sampled_positive, is_positive_pool=True))
+            sampled_parts.append(self._sample_from_task_pools(sampled_positive, is_positive_pool=True))
         if sampled_negative > 0:
-            sampled_parts.append(self._sample_from_single_pool(sampled_negative, is_positive_pool=False))
+            sampled_parts.append(self._sample_from_task_pools(sampled_negative, is_positive_pool=False))
 
         if len(sampled_parts) == 1:
             sampled_batch = sampled_parts[0]
@@ -149,48 +170,60 @@ class SACReplayPool:
             return sampled_batch
 
         sample_info = {
-            "requested_positive_sample_ratio": positive_sample_ratio,
             "actual_positive_sample_ratio": sampled_positive / max(batch_size, 1),
-            "sampled_positive_count": sampled_positive,
-            "sampled_negative_count": sampled_negative,
+            "positive_size": self.positive_size,
+            "negative_size": self.negative_size,
+            "task_count": len(self.task_pools),
         }
         return sampled_batch, sample_info
 
     def insert_and_resample(
         self,
         source: TensorDict,
+        task_ids: Sequence[Any],
     ) -> TensorDict:
-        """Insert a block of data from source to the replay pool and sample a batch with the same size."""
+        """Insert source into replay pool and sample a batch with the same size."""
 
-        self.add_batch(source)
+        self.add_batch(source, task_ids=task_ids)
         return self.sample_batch(source.batch_size[0])
 
     def save(self, directory: str):
         """Save the replay pool to a directory."""
 
         os.makedirs(directory, exist_ok=True)
-
         filepath = f"{directory}/sac_replay_pool_rank_{self.rank}.pt"
-        if self.positive_pool is not None or self.negative_pool is not None:
-            meta_info = {
-                "version": 2,
-                "size": self.size,
-                "capacity": self.capacity,
-                "positive_size": self.positive_size,
-                "negative_size": self.negative_size,
-                "positive_position": self.positive_position,
-                "negative_position": self.negative_position,
+
+        tasks_payload: dict[str, dict[str, Any]] = {}
+        for task_id, pool_state in self.task_pools.items():
+            assert pool_state.positive_pool is not None
+            assert pool_state.negative_pool is not None
+            tasks_payload[task_id] = {
+                "positive_pool": pool_state.positive_pool.cpu(),
+                "negative_pool": pool_state.negative_pool.cpu(),
+                "positive_size": pool_state.positive_size,
+                "negative_size": pool_state.negative_size,
+                "positive_position": pool_state.positive_position,
+                "negative_position": pool_state.negative_position,
+            }
+
+        payload = {
+            "meta_info": {
+                "version": 3,
+                "single_pool_capacity": self.single_pool_capacity,
                 "pool_device": self.pool_device,
                 "sample_device": self.sample_device,
-            }
-            payload = {
-                "positive_pool": self.positive_pool.cpu() if self.positive_pool is not None else None,
-                "negative_pool": self.negative_pool.cpu() if self.negative_pool is not None else None,
-            }
-            torch.save((payload, meta_info), filepath)
-            logger.info(f"[Rank {self.rank}] Replay pool saved to {filepath} with size: {self.size}")
-        else:
-            logger.info("Replay pool is empty. Nothing to save.")
+                "size": self.size,
+                "positive_size": self.positive_size,
+                "negative_size": self.negative_size,
+                "task_count": len(self.task_pools),
+            },
+            "tasks": tasks_payload,
+        }
+
+        torch.save(payload, filepath)
+        logger.info(
+            f"[Rank {self.rank}] Task replay pool saved to {filepath} with size={self.size}, tasks={len(self.task_pools)}"
+        )
 
     def load(self, directory: str):
         """Load the replay pool from a directory."""
@@ -199,50 +232,28 @@ class SACReplayPool:
         if not os.path.exists(filepath):
             return False
 
-        try:
-            payload, meta_info = torch.load(filepath, weights_only=False)
-        except (RuntimeError, EOFError, ValueError) as exc:
-            logger.warning(
-                f"[Rank {self.rank}] Failed to load replay pool from {filepath}: {exc}. "
-                "Starting with an empty replay pool."
+        payload = torch.load(filepath, weights_only=False)
+        meta_info = payload["meta_info"]
+        tasks_payload = payload["tasks"]
+
+        self.single_pool_capacity = int(meta_info["single_pool_capacity"])
+        self.task_pools = {}
+
+        for task_id, task_payload in tasks_payload.items():
+            pool_state = _DualPoolState(
+                positive_pool=task_payload["positive_pool"].to(self.pool_device),
+                negative_pool=task_payload["negative_pool"].to(self.pool_device),
+                positive_size=int(task_payload["positive_size"]),
+                negative_size=int(task_payload["negative_size"]),
+                positive_position=int(task_payload["positive_position"]),
+                negative_position=int(task_payload["negative_position"]),
             )
-            return False
+            self.task_pools[task_id] = pool_state
 
-        loaded_capacity = meta_info.get("capacity", self.capacity)
-        positive_capacity = meta_info.get("positive_capacity", loaded_capacity)
-        negative_capacity = meta_info.get("negative_capacity", loaded_capacity)
-
-        loaded_positive_pool = payload.get("positive_pool", None)
-        loaded_negative_pool = payload.get("negative_pool", None)
-
-        if loaded_positive_pool is not None:
-            loaded_positive_pool = loaded_positive_pool.to(self.pool_device)
-        if loaded_negative_pool is not None:
-            loaded_negative_pool = loaded_negative_pool.to(self.pool_device)
-
-        self.positive_pool = self._resize_loaded_pool(loaded_positive_pool, positive_capacity)
-        self.negative_pool = self._resize_loaded_pool(loaded_negative_pool, negative_capacity)
-
-        if self.positive_pool is None and self.negative_pool is None:
-            logger.info(f"[Rank {self.rank}] Replay pool file exists but contains no data.")
-            return True
-
-        if self.positive_pool is None:
-            self.positive_pool = self._create_empty_pool_like(self.negative_pool)
-        if self.negative_pool is None:
-            self.negative_pool = self._create_empty_pool_like(self.positive_pool)
-
-        self.positive_size = min(meta_info.get("positive_size", 0), self.capacity)
-        self.negative_size = min(meta_info.get("negative_size", 0), self.capacity)
-        self.positive_position = meta_info.get("positive_position", self.positive_size) % self.capacity
-        self.negative_position = meta_info.get("negative_position", self.negative_size) % self.capacity
-        self.size = self.positive_size + self.negative_size
-
+        self._refresh_global_stats()
         logger.info(
-            f"[Rank {self.rank}] Replay pool loaded from {filepath} with size: {self.size} "
-            f"(pos={self.positive_size}, neg={self.negative_size})"
+            f"[Rank {self.rank}] Task replay pool loaded from {filepath} with size={self.size}, tasks={len(self.task_pools)}"
         )
-
         return True
 
     @classmethod
@@ -250,32 +261,15 @@ class SACReplayPool:
         cls,
         directory: str,
     ) -> "SACReplayPool":
-        """Load a replay pool from a file.
+        """Load a replay pool from a file."""
 
-        Args:
-            directory (str): The directory containing the saved replay pool.
-        Returns:
-            SACReplayPool: An instance of SACReplayPool with the loaded data.
-        """
         rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
         filepath = f"{directory}/sac_replay_pool_rank_{rank}.pt"
-        payload, meta_info = torch.load(filepath, weights_only=False)
-
-        loaded_capacity = meta_info.get("capacity", None)
-        if loaded_capacity is None:
-            if isinstance(payload, TensorDict):
-                loaded_capacity = payload.batch_size[0]
-            elif isinstance(payload, dict):
-                for key in ["positive_pool", "negative_pool"]:
-                    value = payload.get(key, None)
-                    if value is not None:
-                        loaded_capacity = value.batch_size[0]
-                        break
-        if loaded_capacity is None:
-            raise ValueError(f"Cannot determine replay pool capacity from {filepath}.")
+        payload = torch.load(filepath, weights_only=False)
+        meta_info = payload["meta_info"]
 
         replay_pool = cls(
-            capacity=loaded_capacity,
+            single_pool_capacity=int(meta_info["single_pool_capacity"]),
             pool_device=meta_info["pool_device"],
             sample_device=meta_info["sample_device"],
         )
@@ -285,69 +279,71 @@ class SACReplayPool:
         if not loaded:
             raise RuntimeError(f"Failed to load replay pool from {filepath}.")
 
-        logger.info(
-            f"[Rank {rank}] Replay pool loaded from {filepath} with size: {replay_pool.size} "
-            f"(pos={replay_pool.positive_size}, neg={replay_pool.negative_size})"
-        )
         return replay_pool
 
     def _insert_block_to_pool(
         self,
+        pool_state: _DualPoolState,
         source: TensorDict,
         is_positive_pool: bool,
     ):
-        """insert a block of data from source to the replay pool."""
+        """Insert a block of data from source into one task pool."""
 
         source_size = source.batch_size[0]
         if source_size == 0:
             return
 
-        length = min(source_size, self.capacity)
+        length = min(source_size, self.single_pool_capacity)
         idx = torch.arange(length, device=self.pool_device)
 
         if is_positive_pool:
-            assert self.positive_pool is not None
-            idx = (self.positive_position + idx) % self.capacity
+            assert pool_state.positive_pool is not None
+            idx = (pool_state.positive_position + idx) % self.single_pool_capacity
             for key in source.keys():
-                self.positive_pool[key].index_copy_(0, idx, source[key][:length].to(self.pool_device))
+                pool_state.positive_pool[key].index_copy_(0, idx, source[key][:length].to(self.pool_device))
 
-            self.positive_position = (self.positive_position + length) % self.capacity
-            self.positive_size = min(self.positive_size + length, self.capacity)
+            pool_state.positive_position = (pool_state.positive_position + length) % self.single_pool_capacity
+            pool_state.positive_size = min(pool_state.positive_size + length, self.single_pool_capacity)
         else:
-            assert self.negative_pool is not None
-            idx = (self.negative_position + idx) % self.capacity
+            assert pool_state.negative_pool is not None
+            idx = (pool_state.negative_position + idx) % self.single_pool_capacity
             for key in source.keys():
-                self.negative_pool[key].index_copy_(0, idx, source[key][:length].to(self.pool_device))
+                pool_state.negative_pool[key].index_copy_(0, idx, source[key][:length].to(self.pool_device))
 
-            self.negative_position = (self.negative_position + length) % self.capacity
-            self.negative_size = min(self.negative_size + length, self.capacity)
+            pool_state.negative_position = (pool_state.negative_position + length) % self.single_pool_capacity
+            pool_state.negative_size = min(pool_state.negative_size + length, self.single_pool_capacity)
 
-    def _lazy_init_pool(self, sample: TensorDict):
-        """Lazily initialize the replay pool based on the sample structure."""
+    def _get_or_create_task_pool(self, task_id: str, sample: TensorDict) -> _DualPoolState:
+        if task_id in self.task_pools:
+            return self.task_pools[task_id]
 
-        logger.info(f"Initializing dual replay pools with capacity: {self.capacity} per pool")
-
+        logger.info(
+            f"Initializing replay pools for task_id={task_id} with single_pool_capacity={self.single_pool_capacity}"
+        )
         pool_template = TensorDict(
             {
-                key: torch.zeros((self.capacity, *value.shape[1:]), dtype=value.dtype, device=self.pool_device)
+                key: torch.zeros(
+                    (self.single_pool_capacity, *value.shape[1:]),
+                    dtype=value.dtype,
+                    device=self.pool_device,
+                )
                 for key, value in sample.items()
             },
-            batch_size=[self.capacity],
+            batch_size=[self.single_pool_capacity],
             device=self.pool_device,
         )
-        self.positive_pool = pool_template.clone()
-        self.negative_pool = pool_template.clone()
-
-        self.size = 0
-        self.positive_size = 0
-        self.negative_size = 0
-        self.positive_position = 0
-        self.negative_position = 0
+        pool_state = _DualPoolState(
+            positive_pool=pool_template.clone(),
+            negative_pool=pool_template.clone(),
+            positive_size=0,
+            negative_size=0,
+            positive_position=0,
+            negative_position=0,
+        )
+        self.task_pools[task_id] = pool_state
+        return pool_state
 
     def _extract_positive_mask(self, batch: TensorDict) -> torch.Tensor:
-        if "positive_sample_mask" not in batch.keys():
-            raise KeyError("`positive_sample_mask` is required in batch for dual replay pool insertion.")
-
         positive_mask = batch["positive_sample_mask"].to(torch.bool)
         if positive_mask.ndim == 1:
             return positive_mask
@@ -361,9 +357,41 @@ class SACReplayPool:
             device=batch.device,
         )
 
-    def _sample_from_single_pool(self, batch_size: int, is_positive_pool: bool) -> TensorDict:
-        pool = self.positive_pool if is_positive_pool else self.negative_pool
-        size = self.positive_size if is_positive_pool else self.negative_size
+    def _sample_from_task_pools(self, batch_size: int, is_positive_pool: bool) -> TensorDict:
+        task_sizes = {
+            task_id: (pool_state.positive_size if is_positive_pool else pool_state.negative_size)
+            for task_id, pool_state in self.task_pools.items()
+            if (pool_state.positive_size if is_positive_pool else pool_state.negative_size) > 0
+        }
+
+        allocation = self._allocate_counts_across_tasks(task_sizes, batch_size)
+
+        sampled_parts = []
+        for task_id, count in allocation.items():
+            if count == 0:
+                continue
+            sampled_parts.append(self._sample_from_single_task_pool(self.task_pools[task_id], count, is_positive_pool))
+
+        if len(sampled_parts) == 1:
+            return sampled_parts[0]
+
+        return TensorDict(
+            {
+                key: torch.cat([part[key] for part in sampled_parts], dim=0)
+                for key in sampled_parts[0].keys()
+            },
+            batch_size=[batch_size],
+            device=self.sample_device,
+        )
+
+    def _sample_from_single_task_pool(
+        self,
+        pool_state: _DualPoolState,
+        batch_size: int,
+        is_positive_pool: bool,
+    ) -> TensorDict:
+        pool = pool_state.positive_pool if is_positive_pool else pool_state.negative_pool
+        size = pool_state.positive_size if is_positive_pool else pool_state.negative_size
         assert pool is not None
 
         idx = torch.randperm(size, device=self.pool_device)[:batch_size]
@@ -373,63 +401,47 @@ class SACReplayPool:
             device=self.sample_device,
         )
 
-    def _resize_loaded_pool(self, pool: Optional[TensorDict], loaded_capacity: int) -> Optional[TensorDict]:
-        if pool is None:
-            return None
-
-        loaded_pool = pool.to(self.pool_device)
-        if loaded_capacity == self.capacity:
-            return loaded_pool
-
-        if loaded_capacity > self.capacity:
-            logger.warning(
-                f"Loaded replay pool capacity {loaded_capacity} is greater than "
-                f"the current capacity {self.capacity}. Truncating loaded pool."
-            )
-            return TensorDict(
-                {key: value[: self.capacity] for key, value in loaded_pool.items()},
-                batch_size=[self.capacity],
-                device=self.pool_device,
+    def _allocate_counts_across_tasks(self, task_sizes: dict[str, int], total_count: int) -> dict[str, int]:
+        total_available = sum(task_sizes.values())
+        if total_count > total_available:
+            raise ValueError(
+                f"Requested {total_count} samples but only {total_available} available across task pools."
             )
 
-        logger.warning(
-            f"Loaded replay pool capacity {loaded_capacity} is less than "
-            f"the current capacity {self.capacity}. Padding loaded pool."
-        )
-        return TensorDict(
-            {
-                key: torch.cat(
-                    [
-                        value,
-                        torch.zeros(
-                            (self.capacity - loaded_capacity, *value.shape[1:]),
-                            dtype=value.dtype,
-                            device=self.pool_device,
-                        ),
-                    ],
-                    dim=0,
-                )
-                for key, value in loaded_pool.items()
-            },
-            batch_size=[self.capacity],
-            device=self.pool_device,
-        )
+        allocation: dict[str, int] = {task_id: 0 for task_id in task_sizes}
+        task_order = list(task_sizes.keys())
 
-    def _create_empty_pool_like(self, reference_pool: TensorDict) -> TensorDict:
-        return TensorDict(
-            {
-                key: torch.zeros((self.capacity, *value.shape[1:]), dtype=value.dtype, device=self.pool_device)
-                for key, value in reference_pool.items()
-            },
-            batch_size=[self.capacity],
-            device=self.pool_device,
-        )
+        remaining = total_count
+        while remaining > 0:
+            progressed = False
+            for task_id in task_order:
+                if allocation[task_id] < task_sizes[task_id]:
+                    allocation[task_id] += 1
+                    remaining -= 1
+                    progressed = True
+                    if remaining == 0:
+                        break
+
+            if not progressed:
+                raise RuntimeError("No eligible task pool left while allocation is still remaining.")
+
+        return allocation
+
+    def _refresh_global_stats(self):
+        self.positive_size = sum(state.positive_size for state in self.task_pools.values())
+        self.negative_size = sum(state.negative_size for state in self.task_pools.values())
+        self.size = self.positive_size + self.negative_size
+
+    def _normalize_task_id(self, task_id: Any) -> str:
+        if isinstance(task_id, torch.Tensor):
+            task_id = task_id.item()
+        return str(task_id)
 
     def __repr__(self):
         return (
-            f"SACReplayPool(capacity={self.capacity}, "
-            f"size={self.size}, positive_size={self.positive_size}, negative_size={self.negative_size}, "
-            f"pool_device={self.pool_device}, sample_device={self.sample_device})"
+            f"SACReplayPool(single_pool_capacity={self.single_pool_capacity}, size={self.size}, "
+            f"positive_size={self.positive_size}, negative_size={self.negative_size}, "
+            f"task_count={len(self.task_pools)}, pool_device={self.pool_device}, sample_device={self.sample_device})"
         )
 
     def __len__(self):
