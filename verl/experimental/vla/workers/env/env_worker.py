@@ -106,26 +106,28 @@ class EnvWorker(Worker, DistProfilerExtension):
         if self.cfg.train.simulator_type == "libero":
             from verl.experimental.vla.envs.libero_env.libero_env import LiberoEnv
 
-            for _ in range(self.stage_num):
+            for stage_id in range(self.stage_num):
                 self.simulator_list.append(
                     EnvManager(
                         self.cfg.train,
                         rank=self._rank,
                         world_size=self._world_size,
                         env_cls=LiberoEnv,
+                        stage_id=stage_id,
                     )
                 )
 
         elif self.cfg.train.simulator_type == "isaac":
             from verl.experimental.vla.envs.isaac_env.isaac_env import IsaacEnv
 
-            for _ in range(self.stage_num):
+            for stage_id in range(self.stage_num):
                 self.simulator_list.append(
                     EnvManager(
                         self.cfg.train,
                         rank=self._rank,
                         world_size=self._world_size,
                         env_cls=IsaacEnv,
+                        stage_id=stage_id,
                     )
                 )
         else:
