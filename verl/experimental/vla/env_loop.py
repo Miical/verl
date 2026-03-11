@@ -177,12 +177,12 @@ class EnvLoop:
                             flat_trajs[step_idx][key] = DataProto.concat([flat_trajs[step_idx][key], value])
                         elif isinstance(value, torch.Tensor):
                             flat_trajs[step_idx][key] = torch.cat([flat_trajs[step_idx][key], value], dim=0)
-                        elif hasattr(value, "keys"):
-                            # Handle TensorDict-like nested tensors (e.g., collected env obs).
-                            for sub_k in value.keys():
-                                flat_trajs[step_idx][key][sub_k] = torch.cat(
-                                    [flat_trajs[step_idx][key][sub_k], value[sub_k]], dim=0
-                                )
+                        elif hasattr(value, "keys") and hasattr(value, "batch_size"):
+                            # Handle TensorDict-like nested tensors (e.g., collected env obs)
+                            # by concatenating the whole container on batch dim.
+                            flat_trajs[step_idx][key] = value.__class__.cat(
+                                [flat_trajs[step_idx][key], value], dim=0
+                            )
 
         # iterate all action batch keys (e.g., action, images, pixel_values, input_ids, ...)
         batch_dict = {}
