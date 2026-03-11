@@ -5,7 +5,8 @@ libero_test_path=$HOME/data/libero_rl/test.parquet
 train_files=$libero_train_path
 test_files=$libero_test_path
 # rlpd_files="/file_system/liujincheng/datasets/20251027T005_install_belt_cyt001_01"
-rlpd_files=${RLPD_FILES:-"/shared_disk/users/angen.ye/code/hil-serl/datasets/LIBERO-dataset/libero_10"}
+# Priority: explicit env RLPD_FILES > pre-set shell variable rlpd_files > default.
+rlpd_files=${RLPD_FILES:-${rlpd_files:-"/shared_disk/users/angen.ye/code/hil-serl/datasets/LIBERO-dataset/libero_10"}}
 
 OUTPUT_DIR=${MLP_MODEL_OUTPUT:-"/shared_disk/users/angen.ye/code/hil-serl/model/verl_fintune_model/test302_libero4"}
 VIDEO_OUTPUT="${OUTPUT_DIR}/video"
@@ -67,17 +68,21 @@ fi
 export VERL_LOGGING_LEVEL=INFO
 
 ACTOR_LOSS_TYPE=${ACTOR_LOSS_TYPE:-sac}
-EXPORT_ROLLOUT_HDF5_DIR=${EXPORT_ROLLOUT_HDF5_DIR:-"/shared_disk/users/angen.ye/code/hil-serl/datasets/LIBERO-dataset/mylibero"}
+EXPORT_ROLLOUT_HDF5_DIR=${EXPORT_ROLLOUT_HDF5_DIR:-"${rlpd_files}"}
 EXPORT_ROLLOUT_MAX_DEMOS=${EXPORT_ROLLOUT_MAX_DEMOS:-0}
-EXPORT_ROLLOUT_EXIT_AFTER_DUMP=${EXPORT_ROLLOUT_EXIT_AFTER_DUMP:-1}
+EXPORT_ROLLOUT_EXIT_AFTER_DUMP=${EXPORT_ROLLOUT_EXIT_AFTER_DUMP:-0}
 
 # One-shot RL debug dump for checking rollout-vs-dataset alignment.
 # Set RL_DEBUG_DUMP=1 to enable and dump on step 1.
-RL_DEBUG_DUMP=${RL_DEBUG_DUMP:-1}
+RL_DEBUG_DUMP=${RL_DEBUG_DUMP:-0}
 RL_DEBUG_DUMP_INTERVAL=0
 if [ "$RL_DEBUG_DUMP" = "1" ]; then
     RL_DEBUG_DUMP_INTERVAL=1
 fi
+
+echo "[run_pi05_libero_sac] Using rlpd_files=${rlpd_files}"
+echo "[run_pi05_libero_sac] Using export_rollout_hdf5_dir=${EXPORT_ROLLOUT_HDF5_DIR}"
+echo "[run_pi05_libero_sac] actor_loss_type=${ACTOR_LOSS_TYPE}, export_rollout_max_demos=${EXPORT_ROLLOUT_MAX_DEMOS}, rl_debug_dump=${RL_DEBUG_DUMP}"
 
 $PYTHON -m verl.experimental.vla.main_sac \
     data.train_files="$train_files" \
