@@ -389,6 +389,7 @@ class RobDataParallelSACActor(BaseSACActor):
     @override
     def update_policy(self, data: DataProto):
         if "empty_batch" not in data.meta_info:
+            task_ids = data.batch["task_ids"]
             self.replay_pool.add_batch(data.select([
                 "a0.full_action",
                 "a1.full_action",
@@ -406,7 +407,7 @@ class RobDataParallelSACActor(BaseSACActor):
                 "dones",
                 "valids",
                 "positive_sample_mask"
-            ]).batch)
+            ]).batch, task_ids=task_ids)
 
         replay_positive_sample_ratio = float(self.sac_config.get("replay_positive_sample_ratio", 0.5))
         batch, replay_sample_info = self.replay_pool.sample_batch(

@@ -297,6 +297,7 @@ class RobRaySACTrainer(RayPPOTrainer):
                 for training_step in range(self.config.trainer.rollout_interval):
                     metrics = {}
                     timing_raw = {}
+                    task_ids_from_dataloader = None
 
                     need_rollout = (training_step == 0)
                     # need_rollout = False
@@ -317,6 +318,11 @@ class RobRaySACTrainer(RayPPOTrainer):
                             next_batch_dict = next(train_iter)
                         except StopIteration:
                             next_batch_dict = None
+
+                        task_ids_from_dataloader = [
+                            batch_dict["extra_info"][task_i]["task_ids"]
+                            for task_i in range(len(batch_dict["extra_info"]))
+                        ]
 
                         batch: DataProto = DataProto.from_single_dict(batch_dict)
                         batch.non_tensor_batch["uid"] = np.array([str(uuid.uuid4()) for _ in range(len(batch))], dtype=object)
@@ -366,6 +372,17 @@ class RobRaySACTrainer(RayPPOTrainer):
                             metrics["data/avg_positive_trajectory_length"] = compute_avg_positive_trajectory_length(batch)
 
                             batch = add_transition_prefixes(batch)
+                            assert task_ids_from_dataloader is not None
+                            rollout_level_task_ids = [
+                                task_id
+                                for task_id in task_ids_from_dataloader
+                                for _ in range(self.config.actor_rollout_ref.rollout.n)
+                            ]
+                            batch.batch["task_ids"] = torch.tensor(
+                                rollout_level_task_ids,
+                                dtype=torch.long,
+                                device=batch.batch["dones"].device,
+                            )
                             batch = flatten_trajectories(batch)
 
                             batch.meta_info["global_token_num"] = [0]
