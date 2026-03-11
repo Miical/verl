@@ -59,7 +59,9 @@ class PI0ForActionPrediction(PreTrainedModel, SupportSACTraining):
         self.action_normalize_transform = Normalize(self.action_norm_stats, use_quantiles=self.pi05_enabled)
         self.image_transform = ImageTransform(resize_imgs_with_padding=(224, 224), enable_image_aug=False)
         max_length = 200 if self.pi05_enabled else 48
-        self.prompt_tokenizer_transform = PromptTokenizerTransform(max_length=max_length, discrete_state_input=False)
+        self.prompt_tokenizer_transform = PromptTokenizerTransform(
+            max_length=max_length, discrete_state_input=self.pi05_enabled
+        )
 
         # Output transforms
         self.state_unnormalize_transform = Unnormalize(self.state_norm_stats, use_quantiles=self.pi05_enabled)
@@ -250,10 +252,14 @@ class PI0ForActionPrediction(PreTrainedModel, SupportSACTraining):
         out['s1.images'] = torch.stack(images, dim=1)
         out['s1.image_masks'] = torch.stack(batch.s1['img_masks'], dim=1)
 
+        # Process states first so pi0.5 prompt state discretization uses normalized values
+        out['s0.states'] = self.state_normalize_transform(batch.s0['state'])
+        out['s1.states'] = self.state_normalize_transform(batch.s1['state'])
+
         # Process language
         # s0
         lang_tokens, lang_masks = self.prompt_tokenizer_transform.call_batch(
-            {'task': batch.s0['task'], 'observation.state': batch.s0['state']},
+            {'task': batch.s0['task'], 'observation.state': out['s0.states']},
             tokenizer=tokenizer
         )
         out['s0.lang_tokens'] = lang_tokens
@@ -261,15 +267,11 @@ class PI0ForActionPrediction(PreTrainedModel, SupportSACTraining):
 
         # s1
         lang_tokens, lang_masks = self.prompt_tokenizer_transform.call_batch(
-            {'task': batch.s1['task'], 'observation.state': batch.s1['state']},
+            {'task': batch.s1['task'], 'observation.state': out['s1.states']},
             tokenizer=tokenizer
         )
         out['s1.lang_tokens'] = lang_tokens
         out['s1.lang_masks'] = lang_masks
-
-        # Process states
-        out['s0.states'] = self.state_normalize_transform(batch.s0['state'])
-        out['s1.states'] = self.state_normalize_transform(batch.s1['state'])
 
         # Process actions
         out['a0.full_action'] = self.action_normalize_transform(batch.a0['action'])
@@ -525,13 +527,19 @@ class PI0ForActionPrediction(PreTrainedModel, SupportSACTraining):
         max_steps = min(int(action_steps), target_actions.shape[1])
         max_dim = min(int(action_dim), target_actions.shape[2])
 
-        x1 = target_actions.float()
-        x0 = self.model.sample_noise(x1.shape, device=device)
-        t = torch.rand((x1.shape[0],), dtype=torch.float32, device=device)
+        x1 = target_actions.float()  # action
+        x0 = self.model.sample_noise(x1.shape, device=device)  # noise
+
+        # Keep BC flow-matching objective consistent with sampling ODE (integrate from t=1 noise -> t=0 action).
+        beta_dist = torch.distributions.Beta(
+            torch.full((x1.shape[0],), 1.5, dtype=torch.float32, device=device),
+            torch.full((x1.shape[0],), 1.0, dtype=torch.float32, device=device),
+        )
+        t = beta_dist.sample() * 0.999 + 0.001
 
         t_b = t[:, None, None]
-        x_t = x0 + t_b * (x1 - x0)
-        v_target = x1 - x0
+        x_t = (1.0 - t_b) * x1 + t_b * x0
+        v_target = x0 - x1
 
         past_key_values = self._build_kv_cache_from_prefix(prefix_features)
         v_pred = self.model.denoise_step(
