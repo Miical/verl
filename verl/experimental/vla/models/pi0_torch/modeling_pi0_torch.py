@@ -75,8 +75,8 @@ class PI0ForActionPrediction(PreTrainedModel, SupportSACTraining):
             self.critic_heads = nn.ModuleList(
                 [
                     MLP(
-                        input_dim=2150,  # 2048(prefix mean) + 32(state) + 10*7(action flat)
-                        hidden_dims=[1024, 512, 256],
+                        input_dim=2150,
+                        hidden_dims=[2048, 1024, 256],
                         output_dim=1,
                         activation="relu",
                         init_method="kaiming",
@@ -89,7 +89,7 @@ class PI0ForActionPrediction(PreTrainedModel, SupportSACTraining):
                 [
                     MLP(
                         input_dim=2150,
-                        hidden_dims=[1024, 512, 256],
+                        hidden_dims=[2048, 1024, 256],
                         output_dim=1,
                         activation="relu",
                         init_method="kaiming",
@@ -225,13 +225,13 @@ class PI0ForActionPrediction(PreTrainedModel, SupportSACTraining):
     
     def bc_loss(
         self,
-        state_features: tuple[tuple[torch.Tensor, torch.Tensor, torch.Tensor], torch.Tensor, torch.Tensor, torch.Tensor],
+        state_features: tuple[tuple[torch.Tensor, torch.Tensor, torch.Tensor], torch.Tensor],
         actions: dict[str, torch.Tensor],
         valids: torch.Tensor,
     ) -> torch.Tensor:
         """Calculate the BC loss for the actor."""
 
-        prefix_features, states, _, _ = state_features
+        prefix_features, states = state_features
         _, prefix_pad_masks, _ = prefix_features
         action_tensor = actions["full_action"]
 
@@ -315,11 +315,9 @@ class PI0ForActionPrediction(PreTrainedModel, SupportSACTraining):
         state_features: tuple[
             tuple[torch.Tensor, torch.Tensor, torch.Tensor],
             torch.Tensor,
-            torch.Tensor,
-            torch.Tensor,
         ],
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        prefix_features, states, _, _ = state_features
+        prefix_features, states = state_features
 
         prefix_embs, prefix_pad_masks, _ = prefix_features
         batch_size = prefix_embs.shape[0]
@@ -394,8 +392,6 @@ class PI0ForActionPrediction(PreTrainedModel, SupportSACTraining):
         a: dict[str, torch.Tensor],
         state_features: tuple[
             tuple[torch.Tensor, torch.Tensor, torch.Tensor],
-            torch.Tensor,
-            torch.Tensor,
             torch.Tensor,
         ],
         *,
