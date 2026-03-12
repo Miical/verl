@@ -5,11 +5,12 @@ libero_test_path=$HOME/data/libero_rl/test.parquet
 train_files=$libero_train_path
 test_files=$libero_test_path
 # rlpd_files="/file_system/liujincheng/datasets/20251027T005_install_belt_cyt001_01"
-rlpd_files="/file_system/vla-datasets/datasets--yifengzhu-hf--LIBERO-datasets/snapshots/f13aa24a3da8c43c7225569f28c562979fa0e35a/libero_10"
+# Priority: explicit env RLPD_FILES > pre-set shell variable rlpd_files > default.
+rlpd_files=${RLPD_FILES:-${rlpd_files:-"/shared_disk/users/angen.ye/code/hil-serl/datasets/LIBERO-dataset/libero_10"}}
 
-OUTPUT_DIR=${MLP_MODEL_OUTPUT:-"$HOME/models/vla_libero_grpo"}
-VIDEO_OUTPUT=${MLP_MODEL_OUTPUT:-"$HOME"}/video
-SFT_MODEL_PATH=${SFT_MODEL_PATH:-"$HOME/data/pi05_libero_torch"}
+OUTPUT_DIR=${MLP_MODEL_OUTPUT:-"/shared_disk/users/angen.ye/code/hil-serl/model/verl_fintune_model/test302_libero4"}
+VIDEO_OUTPUT="${OUTPUT_DIR}/video"
+SFT_MODEL_PATH=${SFT_MODEL_PATH:-"/shared_disk/users/angen.ye/code/hil-serl/model/pi05_libero_torch"}
 TOKENIZER_PATH="$SFT_MODEL_PATH"
 
 # Physical Node Config
@@ -28,7 +29,7 @@ NUM_STAGE=2                                    # number of pipeline stages
 NUM_ENV=8                                      # number of envs per env worker
 
 NUM_ACTION_CHUNKS=10                           # number of action chunks
-MAX_EPISODE_STEPS=30                           # max episode steps for each env
+MAX_EPISODE_STEPS=500                           # max episode steps for each env
                                                # max_interactions = MAX_EPISODE_STEPS / num_action_chunks
 
 # Training Config
@@ -64,6 +65,8 @@ if echo "$gpu_name" | grep "NVIDIA H"; then
 fi
 
 export VERL_LOGGING_LEVEL=INFO
+
+ACTOR_LOSS_TYPE=${ACTOR_LOSS_TYPE:-sac}
 
 $PYTHON -m verl.experimental.vla.main_sac \
     data.train_files="$train_files" \
@@ -132,4 +135,5 @@ $PYTHON -m verl.experimental.vla.main_sac \
     trainer.test_freq=-1 \
     trainer.total_epochs=100 \
     trainer.val_only=False \
-    trainer.val_before_train=False
+    trainer.val_before_train=False \
+    actor_rollout_ref.actor.sac.actor_loss_type=${ACTOR_LOSS_TYPE}

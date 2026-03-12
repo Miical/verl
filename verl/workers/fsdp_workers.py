@@ -900,6 +900,9 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         with self.ulysses_sharding_manager:
             data = data.to("cpu")  # data will to device with each micro batch on actor.update_policy
             data.meta_info.setdefault("pad_token_id", self.tokenizer.pad_token_id)
+            # Some VLA/BC update paths do not populate token-count metadata.
+            # Keep actor update robust by defaulting to zero-token FLOPs accounting.
+            data.meta_info.setdefault("global_token_num", [0])
             # perform training
             with Timer(name="update_policy", logger=None) as timer:
                 metrics = self.actor.update_policy(data=data)

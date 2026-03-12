@@ -473,7 +473,14 @@ class ImageTransform:
                     imgs.append(sample)
                 img = torch.stack(imgs, dim=0)
 
-            img = img / 255.0 * 2.0 - 1.0  # pi05 libero
+            # Accept both uint8 [0, 255] and float [0, 1] images.
+            if img.dtype == torch.uint8:
+                img = img.float() / 255.0
+            else:
+                img = img.float()
+                if torch.amax(img).item() > 1.5:
+                    img = img / 255.0
+            img = img * 2.0 - 1.0
             images.append(img)
             img_masks.append(torch.ones((img.shape[0],), dtype=torch.bool, device=img.device))
 

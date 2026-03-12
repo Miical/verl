@@ -92,7 +92,6 @@ class EnvLoop:
             DataProto: A batch containing the complete trajectories.
         """
         initial_state_ids = prompts.non_tensor_batch["state_ids"]
-
         staged_obs = self._restructure_obs_data(reset_results)
         # --- Pipeline state ---
         trajectories = {i: [] for i in range(self.stage_num)}  # To store (obs, action, rew, done) tuples
@@ -123,7 +122,6 @@ class EnvLoop:
 
                 trajectories[stage_id][-1]["rew"] = env_result.batch["rews"]
                 trajectories[stage_id][-1]["done"] = env_result.batch["terminations"]
-
                 next_obs = DataProto(
                     batch=env_result.batch.select("full_image", "wrist_image", "state"),
                     non_tensor_batch={"task_descriptions": env_result.non_tensor_batch["task_descriptions"]},
