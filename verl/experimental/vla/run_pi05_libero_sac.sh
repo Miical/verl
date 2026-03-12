@@ -10,7 +10,6 @@ rlpd_files=${RLPD_FILES:-${rlpd_files:-"/shared_disk/users/angen.ye/code/hil-ser
 
 OUTPUT_DIR=${MLP_MODEL_OUTPUT:-"/shared_disk/users/angen.ye/code/hil-serl/model/verl_fintune_model/test302_libero4"}
 VIDEO_OUTPUT="${OUTPUT_DIR}/video"
-RL_DEBUG_DIR=${RL_DEBUG_DIR:-"${OUTPUT_DIR}/rl_debug_once"}
 SFT_MODEL_PATH=${SFT_MODEL_PATH:-"/shared_disk/users/angen.ye/code/hil-serl/model/pi05_libero_torch"}
 TOKENIZER_PATH="$SFT_MODEL_PATH"
 
@@ -68,30 +67,6 @@ fi
 export VERL_LOGGING_LEVEL=INFO
 
 ACTOR_LOSS_TYPE=${ACTOR_LOSS_TYPE:-sac}
-EXPORT_ROLLOUT_HDF5_DIR=${EXPORT_ROLLOUT_HDF5_DIR:-"${rlpd_files}"}
-EXPORT_ROLLOUT_MAX_DEMOS=${EXPORT_ROLLOUT_MAX_DEMOS:-0}
-EXPORT_ROLLOUT_EXIT_AFTER_DUMP=${EXPORT_ROLLOUT_EXIT_AFTER_DUMP:-0}
-
-# One-shot RL debug dump for checking rollout-vs-dataset alignment.
-# Set RL_DEBUG_DUMP=1 to enable and dump on step 1.
-RL_DEBUG_DUMP=${RL_DEBUG_DUMP:-0}
-RL_DEBUG_DUMP_INTERVAL=0
-if [ "$RL_DEBUG_DUMP" = "1" ]; then
-    RL_DEBUG_DUMP_INTERVAL=1
-fi
-
-# BC-mode temporary rollout/video switch.
-# Default keeps BC pure-offline behavior (no extra rollout for video).
-BC_ENABLE_ROLLOUT_VIDEO=${BC_ENABLE_ROLLOUT_VIDEO:-0}
-BC_VIDEO_INTERVAL=${BC_VIDEO_INTERVAL:-100}
-if [ "${BC_ENABLE_ROLLOUT_VIDEO}" = "1" ]; then
-    # 1 means run rollout for video every rollout step in BC mode.
-    BC_VIDEO_INTERVAL=1
-fi
-echo "[run_pi05_libero_sac] Using rlpd_files=${rlpd_files}"
-echo "[run_pi05_libero_sac] Using export_rollout_hdf5_dir=${EXPORT_ROLLOUT_HDF5_DIR}"
-echo "[run_pi05_libero_sac] actor_loss_type=${ACTOR_LOSS_TYPE}, export_rollout_max_demos=${EXPORT_ROLLOUT_MAX_DEMOS}, rl_debug_dump=${RL_DEBUG_DUMP}"
-echo "[run_pi05_libero_sac] bc_enable_rollout_video=${BC_ENABLE_ROLLOUT_VIDEO}, bc_video_interval=${BC_VIDEO_INTERVAL}"
 
 $PYTHON -m verl.experimental.vla.main_sac \
     data.train_files="$train_files" \
@@ -155,17 +130,10 @@ $PYTHON -m verl.experimental.vla.main_sac \
     +trainer.n_rollout_gpus_per_node=$NUM_ROLLOUT_GPUS \
     +trainer.rollout_interval=60 \
     +trainer.rlpd_enable=True \
-    +trainer.rl_debug_dump_interval=$RL_DEBUG_DUMP_INTERVAL \
-    +trainer.rl_debug_dump_num_samples=4 \
-    +trainer.rl_debug_dump_dir=${RL_DEBUG_DIR} \
     trainer.nnodes=$NUM_NODES \
     trainer.save_freq=30 \
     trainer.test_freq=-1 \
     trainer.total_epochs=100 \
     trainer.val_only=False \
     trainer.val_before_train=False \
-    actor_rollout_ref.actor.sac.actor_loss_type=${ACTOR_LOSS_TYPE} \
-    +trainer.bc_video_interval=${BC_VIDEO_INTERVAL} \
-    +trainer.export_rollout_hdf5_dir=${EXPORT_ROLLOUT_HDF5_DIR} \
-    +trainer.export_rollout_max_demos=${EXPORT_ROLLOUT_MAX_DEMOS} \
-    +trainer.export_rollout_exit_after_dump=${EXPORT_ROLLOUT_EXIT_AFTER_DUMP}
+    actor_rollout_ref.actor.sac.actor_loss_type=${ACTOR_LOSS_TYPE}

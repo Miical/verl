@@ -13,13 +13,10 @@
 # limitations under the License.
 
 import asyncio
-import json
-import os
 import uuid
 from collections import defaultdict
 from pprint import pprint
 import itertools
-import h5py
 
 import numpy as np
 import torch
@@ -42,313 +39,6 @@ from verl.trainer.ppo.utils import Role, WorkerType
 from verl.utils.checkpoint.checkpoint_manager import should_save_ckpt_esi
 from verl.utils.debug import marked_timer
 from verl.utils.metric import reduce_metrics
-
-
-def _to_hwc_uint8(image_like) -> np.ndarray | None:
-    if image_like is None:
-        return None
-    if isinstance(image_like, torch.Tensor):
-        # numpy does not support bfloat16 tensors directly
-        arr = image_like.detach().to(torch.float32).cpu().numpy()
-    else:
-        arr = np.asarray(image_like)
-
-    while arr.ndim > 3:
-        arr = arr[0]
-
-    if arr.ndim != 3:
-        return None
-
-    # CHW -> HWC
-    if arr.shape[0] in (1, 3) and arr.shape[-1] not in (1, 3):
-        arr = np.transpose(arr, (1, 2, 0))
-
-    if arr.shape[-1] == 1:
-        arr = np.repeat(arr, 3, axis=-1)
-
-    if arr.shape[-1] != 3:
-        return None
-
-    if np.issubdtype(arr.dtype, np.floating):
-        vmin = float(np.min(arr)) if arr.size > 0 else 0.0
-        vmax = float(np.max(arr)) if arr.size > 0 else 1.0
-        # Support both [0, 1] and [-1, 1] image ranges in debug dumps.
-        if vmin < 0.0 and vmax <= 1.0:
-            arr = (arr + 1.0) * 0.5 * 255.0
-        elif vmax <= 1.0:
-            arr = arr * 255.0
-    arr = np.clip(arr, 0, 255).astype(np.uint8)
-    return arr
-
-
-def _pick_image_tensor(batch_tensors: dict, key_candidates: list[str]):
-    for k in key_candidates:
-        if k in batch_tensors:
-            return batch_tensors[k], k
-    return None, None
-
-
-def _dump_debug_images(data: DataProto, *, tag: str, global_step: int, output_dir: str, num_samples: int = 4) -> None:
-    if data is None or not hasattr(data, "batch"):
-        return
-    image_tensor, image_key = _pick_image_tensor(
-        data.batch,
-        ["images", "s0.images", "s1.images", "obs_images", "pixel_values"],
-    )
-    if image_tensor is None:
-        return
-
-    total = image_tensor.shape[0]
-    if total <= 0:
-        return
-
-    sample_num = min(int(num_samples), int(total))
-    chosen_idx = np.random.choice(total, size=sample_num, replace=False)
-    os.makedirs(output_dir, exist_ok=True)
-
-    for rank, idx in enumerate(chosen_idx.tolist()):
-        sample = image_tensor[idx]
-        # Support both single-view (C,H,W) and multi-view (N,C,H,W) tensors.
-        views = [sample] if sample.ndim == 3 else [sample[v] for v in range(sample.shape[0])]
-
-        for view_id, view in enumerate(views):
-            img = _to_hwc_uint8(view)
-            if img is None:
-                continue
-
-            # lightweight text annotation without extra dependencies: encode metadata in filename
-            out = os.path.join(
-                output_dir,
-                f"step_{global_step:08d}_{tag}_sample{rank}_idx{idx}_view{view_id}_key_{image_key.replace('.', '_')}.png",
-            )
-            try:
-                import imageio.v2 as imageio
-
-                imageio.imwrite(out, img)
-            except Exception:
-                # best effort debug utility, never block training
-                pass
-
-
-
-
-def _decode_prompt_tokens(tokenizer, tokens: torch.Tensor) -> str:
-    try:
-        return tokenizer.decode(tokens.detach().cpu().tolist(), skip_special_tokens=True)
-    except Exception:
-        return "<decode_failed>"
-
-
-def _dump_debug_prompts(
-    *,
-    tokenizer,
-    data: DataProto,
-    tag: str,
-    global_step: int,
-    output_dir: str,
-    num_samples: int = 4,
-) -> None:
-    if not hasattr(data, "batch") or "s0.lang_tokens" not in data.batch:
-        return
-
-    tokens = data.batch["s0.lang_tokens"]
-    total = int(tokens.shape[0])
-    if total <= 0:
-        return
-
-    sample_num = min(int(num_samples), total)
-    chosen_idx = np.random.choice(total, size=sample_num, replace=False)
-    os.makedirs(output_dir, exist_ok=True)
-
-    out_path = os.path.join(output_dir, f"step_{global_step:08d}_{tag}_prompts.jsonl")
-    with open(out_path, "w", encoding="utf-8") as f:
-        for idx in chosen_idx.tolist():
-            prompt = _decode_prompt_tokens(tokenizer, tokens[idx])
-            f.write(json.dumps({"tag": tag, "idx": idx, "prompt": prompt}, ensure_ascii=False) + "\n")
-
-
-def _dump_debug_prompts_and_actions(
-    *,
-    tokenizer,
-    rollout_batch: DataProto,
-    dataset_batch: DataProto,
-    global_step: int,
-    output_dir: str,
-    num_samples: int = 4,
-) -> None:
-    """Best-effort debug dump for RL mode data alignment checks."""
-    if not hasattr(rollout_batch, "batch") or not hasattr(dataset_batch, "batch"):
-        return
-    if "a0.full_action" not in rollout_batch.batch or "a0.full_action" not in dataset_batch.batch:
-        return
-    if "s0.lang_tokens" not in rollout_batch.batch or "s0.lang_tokens" not in dataset_batch.batch:
-        return
-
-    os.makedirs(output_dir, exist_ok=True)
-    roll_n = int(rollout_batch.batch["a0.full_action"].shape[0])
-    data_n = int(dataset_batch.batch["a0.full_action"].shape[0])
-    sample_num = min(int(num_samples), roll_n, data_n)
-    if sample_num <= 0:
-        return
-
-    rollout_idx = np.random.choice(roll_n, size=sample_num, replace=False)
-    dataset_idx = np.random.choice(data_n, size=sample_num, replace=False)
-
-    rows = []
-    for i, (ri, di) in enumerate(zip(rollout_idx.tolist(), dataset_idx.tolist(), strict=False)):
-        r_prompt = _decode_prompt_tokens(tokenizer, rollout_batch.batch["s0.lang_tokens"][ri])
-        d_prompt = _decode_prompt_tokens(tokenizer, dataset_batch.batch["s0.lang_tokens"][di])
-
-        r_action = rollout_batch.batch["a0.full_action"][ri].detach().cpu().numpy()
-        d_action = dataset_batch.batch["a0.full_action"][di].detach().cpu().numpy()
-
-        base = os.path.join(output_dir, f"step_{global_step:08d}_pair{i}")
-        np.savez_compressed(
-            f"{base}_actions.npz",
-            rollout_action=r_action,
-            dataset_action=d_action,
-        )
-        # Save raw arrays separately for convenient inspection tools.
-        np.save(f"{base}_rollout_action.npy", r_action)
-        np.save(f"{base}_dataset_action.npy", d_action)
-
-        # Detailed per-dimension stats (all action dims) and full tensors for one-shot debugging.
-        r_dim_mean = np.mean(r_action, axis=0)
-        d_dim_mean = np.mean(d_action, axis=0)
-        r_dim_min = np.min(r_action, axis=0)
-        d_dim_min = np.min(d_action, axis=0)
-        r_dim_max = np.max(r_action, axis=0)
-        d_dim_max = np.max(d_action, axis=0)
-
-        with open(f"{base}_actions_full.json", "w", encoding="utf-8") as jf:
-            json.dump(
-                {
-                    "pair_id": i,
-                    "rollout_index": ri,
-                    "dataset_index": di,
-                    "rollout_prompt": r_prompt,
-                    "dataset_prompt": d_prompt,
-                    "rollout_action_shape": list(r_action.shape),
-                    "dataset_action_shape": list(d_action.shape),
-                    "rollout_action": r_action.tolist(),
-                    "dataset_action": d_action.tolist(),
-                    "rollout_minus_dataset": (r_action - d_action).tolist(),
-                    "per_dim_stats": {
-                        "rollout_mean": r_dim_mean.tolist(),
-                        "dataset_mean": d_dim_mean.tolist(),
-                        "rollout_min": r_dim_min.tolist(),
-                        "dataset_min": d_dim_min.tolist(),
-                        "rollout_max": r_dim_max.tolist(),
-                        "dataset_max": d_dim_max.tolist(),
-                    },
-                },
-                jf,
-                ensure_ascii=False,
-            )
-
-        rows.append(
-            {
-                "pair_id": i,
-                "rollout_index": ri,
-                "dataset_index": di,
-                "rollout_prompt": r_prompt,
-                "dataset_prompt": d_prompt,
-                "rollout_action_abs_mean": float(np.mean(np.abs(r_action))),
-                "dataset_action_abs_mean": float(np.mean(np.abs(d_action))),
-            }
-        )
-
-    with open(os.path.join(output_dir, f"step_{global_step:08d}_prompt_action_pairs.jsonl"), "w", encoding="utf-8") as f:
-        for row in rows:
-            f.write(f"{row}\n")
-
-
-
-def _to_uint8_hwc(img_chw: torch.Tensor) -> np.ndarray:
-    arr = img_chw.detach().to(torch.float32).cpu().numpy()  # (C,H,W), normalized [-1,1]
-    if arr.shape[0] in (1, 3):
-        arr = np.transpose(arr, (1, 2, 0))
-    arr = ((arr + 1.0) * 0.5 * 255.0).clip(0, 255).astype(np.uint8)
-    # Make stored image compatible with libero_dataset.py which flips H/W on load.
-    arr = np.flip(arr, axis=(0, 1)).copy()
-    return arr
-
-
-def _export_rollout_batch_to_libero_hdf5(
-    *,
-    rollout_batch: DataProto,
-    output_dir: str,
-    global_step: int,
-    max_demos: int,
-) -> int:
-    """Export rollout batch to Libero-style *_demo.hdf5 for dataset replay."""
-    if not hasattr(rollout_batch, "batch"):
-        return 0
-    required = ["action", "complete", "full_image", "wrist_image", "state"]
-    if any(k not in rollout_batch.batch for k in required):
-        return 0
-
-    actions = rollout_batch.batch["action"]          # (B,S,C,A)
-    done_chunk = rollout_batch.batch["complete"].any(dim=-1)  # (B,S)
-    full_image = rollout_batch.batch["full_image"]   # (B,S,H,W,C)
-    wrist_image = rollout_batch.batch["wrist_image"] # (B,S,H,W,C)
-    states = rollout_batch.batch["state"]            # (B,S,D)
-
-    B, S, C, A = actions.shape
-    demos_to_save = min(int(max_demos), int(B))
-    if demos_to_save <= 0:
-        return 0
-
-    os.makedirs(output_dir, exist_ok=True)
-    out_path = os.path.join(output_dir, f"ROLLOUT_SCENE0_step{global_step:08d}_demo.hdf5")
-
-    with h5py.File(out_path, "w") as f:
-        data_grp = f.create_group("data")
-        for b in range(demos_to_save):
-            demo_grp = data_grp.create_group(f"demo_{b:04d}")
-            obs_grp = demo_grp.create_group("obs")
-
-            # Flatten chunk actions (S,C,A) -> (T,A)
-            action_flat = actions[b].detach().to(torch.float32).cpu().reshape(S * C, A).numpy()
-            demo_grp.create_dataset("actions", data=action_flat)
-
-            # Repeat each chunk obs/state for each action in that chunk to get length T.
-            agent_chunk = full_image[b]   # (S,H,W,C) uint8-like
-            wrist_chunk = wrist_image[b]  # (S,H,W,C) uint8-like
-            state_chunk = states[b].detach().to(torch.float32).cpu().numpy()  # (S,D)
-
-            agent_rep = np.repeat(agent_chunk.detach().cpu().numpy(), C, axis=0)
-            wrist_rep = np.repeat(wrist_chunk.detach().cpu().numpy(), C, axis=0)
-            state_rep = np.repeat(state_chunk, C, axis=0)
-
-            # Convert rollout normalized/model images back to uint8 HWC expected by libero dataset.
-            if agent_rep.ndim == 4 and agent_rep.shape[-1] == 3:
-                # raw env images are already HWC uint8; just ensure type and pre-flip.
-                agent_u8 = np.flip(agent_rep.astype(np.uint8), axis=(1, 2)).copy()
-                wrist_u8 = np.flip(wrist_rep.astype(np.uint8), axis=(1, 2)).copy()
-            else:
-                # fallback for CHW-like tensors
-                agent_u8 = np.stack([_to_uint8_hwc(torch.from_numpy(x)) for x in agent_rep], axis=0)
-                wrist_u8 = np.stack([_to_uint8_hwc(torch.from_numpy(x)) for x in wrist_rep], axis=0)
-
-            obs_grp.create_dataset("agentview_rgb", data=agent_u8)
-            obs_grp.create_dataset("eye_in_hand_rgb", data=wrist_u8)
-
-            d = state_rep.shape[-1]
-            ee_pos = state_rep[:, :3] if d >= 3 else np.pad(state_rep, ((0, 0), (0, max(0, 3 - d))))[:, :3]
-            ee_ori = state_rep[:, 3:6] if d >= 6 else np.pad(state_rep, ((0, 0), (0, max(0, 6 - d))))[:, 3:6]
-            gripper = state_rep[:, 6:7] if d >= 7 else np.zeros((state_rep.shape[0], 1), dtype=np.float32)
-            obs_grp.create_dataset("ee_pos", data=ee_pos.astype(np.float32))
-            obs_grp.create_dataset("ee_ori", data=ee_ori.astype(np.float32))
-            obs_grp.create_dataset("gripper_states", data=gripper.astype(np.float32))
-
-            done_rep = np.repeat(done_chunk[b].detach().cpu().numpy().astype(np.uint8), C, axis=0)
-            demo_grp.create_dataset("dones", data=done_rep)
-            demo_grp.create_dataset("rewards", data=done_rep.astype(np.float32))
-            demo_grp.create_dataset("robot_states", data=state_rep.astype(np.float32))
-            demo_grp.create_dataset("states", data=state_rep.astype(np.float32))
-
-    return demos_to_save
 
 def compute_response_mask(config, data: DataProto) -> torch.Tensor:
     """Compute the attention mask for the response part of the sequence.
@@ -665,11 +355,6 @@ class RobRaySACTrainer(RayPPOTrainer):
         if self.config.trainer.rlpd_enable:
             rlpd_dataloader_iter = itertools.cycle(self.rlpd_dataloader)
 
-        export_rollout_dir = self.config.trainer.get("export_rollout_hdf5_dir", None)
-        export_rollout_max_demos = int(self.config.trainer.get("export_rollout_max_demos", 0))
-        export_rollout_exit = bool(self.config.trainer.get("export_rollout_exit_after_dump", True))
-        exported_rollout_demos = 0
-
         for epoch in range(self.config.trainer.total_epochs):
             train_iter = iter(self.train_dataloader)
             next_batch_dict = next(train_iter)
@@ -712,93 +397,12 @@ class RobRaySACTrainer(RayPPOTrainer):
                         gen_batch.meta_info["eos_token_id"] = self.tokenizer.eos_token_id
                         gen_batch.meta_info["n_samples"] = self.config.actor_rollout_ref.rollout.n
                         gen_batch.meta_info["pad_token_id"] = self.tokenizer.pad_token_id
-                        gen_batch.meta_info["collect_env_obs"] = export_rollout_dir is not None and export_rollout_max_demos > 0
                         gen_batch = gen_batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
                         if dataloader_step == 0 :
                             reset_future = self._reset_envs(gen_batch)
 
                     with marked_timer("step", timing_raw):
                         if self.use_bc_actor:
-                            # Pure offline BC update. We can optionally run sparse rollout for
-                            # video + debug image alignment checks.
-                            bc_video_interval = int(self.config.trainer.get("bc_video_interval", 100))
-                            debug_dump_interval = int(self.config.trainer.get("bc_debug_dump_interval", bc_video_interval))
-                            debug_dump_samples = int(self.config.trainer.get("bc_debug_dump_num_samples", 4))
-                            debug_dump_dir = self.config.trainer.get("bc_debug_dump_dir", "/tmp/verl_bc_debug")
-
-                            should_video_rollout = (
-                                need_rollout
-                                and self.config.env.train.video_cfg.save_video
-                                and bc_video_interval > 0
-                                and self.global_steps % bc_video_interval == 0
-                            )
-                            should_debug_dump = (
-                                need_rollout and debug_dump_interval > 0 and self.global_steps % debug_dump_interval == 0
-                            )
-                            should_export_rollout = (
-                                need_rollout
-                                and export_rollout_dir is not None
-                                and export_rollout_max_demos > exported_rollout_demos
-                            )
-
-                            rollout_debug_batch = None
-                            if should_video_rollout or should_debug_dump or should_export_rollout:
-                                if next_batch_dict is None:
-                                    train_iter = iter(self.train_dataloader)
-                                    next_batch_dict = next(train_iter)
-
-                                batch_dict = next_batch_dict
-                                try:
-                                    next_batch_dict = next(train_iter)
-                                except StopIteration:
-                                    next_batch_dict = None
-
-                                batch: DataProto = DataProto.from_single_dict(batch_dict)
-                                batch.non_tensor_batch["uid"] = np.array(
-                                    [str(uuid.uuid4()) for _ in range(len(batch))], dtype=object
-                                )
-
-                                gen_batch = self._get_gen_batch(batch)
-                                gen_batch.meta_info["global_steps"] = self.global_steps
-                                gen_batch.meta_info["do_sample"] = True
-                                gen_batch.meta_info["temperature"] = self.config.actor_rollout_ref.rollout.temperature
-                                gen_batch.meta_info["prompt_length"] = self.config.actor_rollout_ref.rollout.prompt_length
-                                gen_batch.meta_info["eos_token_id"] = self.tokenizer.eos_token_id
-                                gen_batch.meta_info["n_samples"] = self.config.actor_rollout_ref.rollout.n
-                                gen_batch.meta_info["pad_token_id"] = self.tokenizer.pad_token_id
-                                gen_batch.meta_info["collect_env_obs"] = export_rollout_dir is not None and export_rollout_max_demos > 0
-                                gen_batch = gen_batch.repeat(
-                                    repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True
-                                )
-                                reset_future = self._reset_envs(gen_batch)
-                                with marked_timer("gen_video", timing_raw, color="yellow"):
-                                    rollout_debug_batch = self.async_rollout_manager.generate_sequences(gen_batch, reset_future)
-                                print(f"BC mode rollout/debug dump at step {self.global_steps}")
-
-                            if should_export_rollout and rollout_debug_batch is not None:
-                                remaining = export_rollout_max_demos - exported_rollout_demos
-                                saved = _export_rollout_batch_to_libero_hdf5(
-                                    rollout_batch=rollout_debug_batch,
-                                    output_dir=export_rollout_dir,
-                                    global_step=self.global_steps,
-                                    max_demos=remaining,
-                                )
-                                exported_rollout_demos += int(saved)
-                                if export_rollout_exit and exported_rollout_demos >= export_rollout_max_demos:
-                                    print(
-                                        f"Exported {exported_rollout_demos} rollout demos to {export_rollout_dir}. Exiting early as requested."
-                                    )
-                                    return
-
-                            if should_debug_dump and rollout_debug_batch is not None:
-                                _dump_debug_images(
-                                    rollout_debug_batch,
-                                    tag="rollout",
-                                    global_step=self.global_steps,
-                                    output_dir=debug_dump_dir,
-                                    num_samples=debug_dump_samples,
-                                )
-
                             with marked_timer("update_actor", timing_raw, color="red"):
                                 rlpd_batch = next(rlpd_dataloader_iter)
                                 rlpd_batch = DataProto.from_single_dict(rlpd_batch)
@@ -806,42 +410,12 @@ class RobRaySACTrainer(RayPPOTrainer):
                                 # Keep actor-worker metadata expectations aligned with non-BC paths.
                                 train_batch.meta_info["global_steps"] = self.global_steps
                                 train_batch.meta_info.setdefault("global_token_num", [0])
-                                if should_debug_dump:
-                                    _dump_debug_images(
-                                        train_batch,
-                                        tag="dataset",
-                                        global_step=self.global_steps,
-                                        output_dir=debug_dump_dir,
-                                        num_samples=debug_dump_samples,
-                                    )
                                 actor_output = self.actor_rollout_wg.update_actor(train_batch)
                             actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
                         elif need_rollout:
-                            rl_debug_dump_interval = int(self.config.trainer.get("rl_debug_dump_interval", 0))
-                            rl_debug_dump_samples = int(self.config.trainer.get("rl_debug_dump_num_samples", 4))
-                            rl_debug_dump_dir = self.config.trainer.get("rl_debug_dump_dir", "/tmp/verl_rl_debug")
-                            should_rl_debug_dump = (
-                                rl_debug_dump_interval > 0 and self.global_steps % rl_debug_dump_interval == 0
-                            )
-
                             # generate a batch
                             with marked_timer("gen", timing_raw, color="red"):
                                 batch = self.async_rollout_manager.generate_sequences(gen_batch, reset_future)
-
-                            if export_rollout_dir is not None and export_rollout_max_demos > exported_rollout_demos:
-                                remaining = export_rollout_max_demos - exported_rollout_demos
-                                saved = _export_rollout_batch_to_libero_hdf5(
-                                    rollout_batch=batch,
-                                    output_dir=export_rollout_dir,
-                                    global_step=self.global_steps,
-                                    max_demos=remaining,
-                                )
-                                exported_rollout_demos += int(saved)
-                                if export_rollout_exit and exported_rollout_demos >= export_rollout_max_demos:
-                                    print(
-                                        f"Exported {exported_rollout_demos} rollout demos to {export_rollout_dir}. Exiting early as requested."
-                                    )
-                                    return
 
                             # prepare for next batch's env reset
                             if dataloader_step != dataloader_len - 1:
@@ -889,46 +463,6 @@ class RobRaySACTrainer(RayPPOTrainer):
                                 ])
 
                                 train_batch = DataProto.concat([rl_batch, rlpd_batch])
-                                print(f"RLPD enabled: RL batch size {len(rl_batch)}, RLPD batch size {len(rlpd_batch)}, total {len(train_batch)}")
-                                if should_rl_debug_dump:
-                                    _dump_debug_images(
-                                        rl_batch,
-                                        tag="rollout",
-                                        global_step=self.global_steps,
-                                        output_dir=rl_debug_dump_dir,
-                                        num_samples=rl_debug_dump_samples,
-                                    )
-                                    _dump_debug_images(
-                                        rlpd_batch,
-                                        tag="dataset",
-                                        global_step=self.global_steps,
-                                        output_dir=rl_debug_dump_dir,
-                                        num_samples=rl_debug_dump_samples,
-                                    )
-                                    _dump_debug_prompts(
-                                        tokenizer=self.tokenizer,
-                                        data=rl_batch,
-                                        tag="rollout",
-                                        global_step=self.global_steps,
-                                        output_dir=rl_debug_dump_dir,
-                                        num_samples=rl_debug_dump_samples,
-                                    )
-                                    _dump_debug_prompts(
-                                        tokenizer=self.tokenizer,
-                                        data=rlpd_batch,
-                                        tag="dataset",
-                                        global_step=self.global_steps,
-                                        output_dir=rl_debug_dump_dir,
-                                        num_samples=rl_debug_dump_samples,
-                                    )
-                                    _dump_debug_prompts_and_actions(
-                                        tokenizer=self.tokenizer,
-                                        rollout_batch=rl_batch,
-                                        dataset_batch=rlpd_batch,
-                                        global_step=self.global_steps,
-                                        output_dir=rl_debug_dump_dir,
-                                        num_samples=rl_debug_dump_samples,
-                                    )
                             else:
                                 train_batch = batch
 

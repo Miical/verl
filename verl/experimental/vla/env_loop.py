@@ -92,8 +92,6 @@ class EnvLoop:
             DataProto: A batch containing the complete trajectories.
         """
         initial_state_ids = prompts.non_tensor_batch["state_ids"]
-        collect_env_obs = bool(prompts.meta_info.get("collect_env_obs", False))
-
         staged_obs = self._restructure_obs_data(reset_results)
         # --- Pipeline state ---
         trajectories = {i: [] for i in range(self.stage_num)}  # To store (obs, action, rew, done) tuples
@@ -124,9 +122,6 @@ class EnvLoop:
 
                 trajectories[stage_id][-1]["rew"] = env_result.batch["rews"]
                 trajectories[stage_id][-1]["done"] = env_result.batch["terminations"]
-                if collect_env_obs:
-                    trajectories[stage_id][-1]["obs"] = env_result.batch.select("full_image", "wrist_image", "state")
-
                 next_obs = DataProto(
                     batch=env_result.batch.select("full_image", "wrist_image", "state"),
                     non_tensor_batch={"task_descriptions": env_result.non_tensor_batch["task_descriptions"]},
@@ -177,12 +172,6 @@ class EnvLoop:
                             flat_trajs[step_idx][key] = DataProto.concat([flat_trajs[step_idx][key], value])
                         elif isinstance(value, torch.Tensor):
                             flat_trajs[step_idx][key] = torch.cat([flat_trajs[step_idx][key], value], dim=0)
-                        elif hasattr(value, "keys") and hasattr(value, "batch_size"):
-                            # Handle TensorDict-like nested tensors (e.g., collected env obs)
-                            # by concatenating the whole container on batch dim.
-                            flat_trajs[step_idx][key] = value.__class__.cat(
-                                [flat_trajs[step_idx][key], value], dim=0
-                            )
 
         # iterate all action batch keys (e.g., action, images, pixel_values, input_ids, ...)
         batch_dict = {}
@@ -193,11 +182,5 @@ class EnvLoop:
 
         batch_dict["complete"] = torch.stack([step["done"] for step in flat_trajs], dim=1).squeeze(-1)
         batch_dict["env_state_id"] = torch.from_numpy(initial_state_ids.astype(int))
-
-        if "obs" in flat_trajs[0]:
-            obs_keys = list(flat_trajs[0]["obs"].keys())
-            for key in obs_keys:
-                per_step_values = [step["obs"][key] for step in flat_trajs]
-                batch_dict[key] = torch.stack(per_step_values, dim=1)
 
         return DataProto.from_single_dict(batch_dict, meta_info=meta_info)
