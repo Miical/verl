@@ -70,7 +70,24 @@ class PI0ForActionPrediction(PreTrainedModel, SupportSACTraining):
 
         ##### SAC Algorithm Support #####
         if getattr(self.config, "sac_enable", False):
-            head_num = 2 if getattr(self.config, "double_q", True) else 1
+            head_num = int(getattr(self.config, "critic_head_num", 10))
+            attn_heads = int(getattr(self.config, "critic_prefix_attn_heads", 8))
+
+            self.critic_state_token = nn.Parameter(torch.zeros(1, 1, 2048))
+            self.target_state_token = nn.Parameter(torch.zeros(1, 1, 2048))
+            nn.init.normal_(self.critic_state_token, mean=0.0, std=0.02)
+            self.target_state_token.data.copy_(self.critic_state_token.data)
+
+            self.critic_prefix_cross_attn = nn.MultiheadAttention(
+                embed_dim=2048,
+                num_heads=attn_heads,
+                batch_first=True,
+            )
+            self.target_prefix_cross_attn = nn.MultiheadAttention(
+                embed_dim=2048,
+                num_heads=attn_heads,
+                batch_first=True,
+            )
 
             self.critic_heads = nn.ModuleList(
                 [
@@ -99,6 +116,7 @@ class PI0ForActionPrediction(PreTrainedModel, SupportSACTraining):
             )
 
             self.target_network_heads.load_state_dict(self.critic_heads.state_dict())
+            self.target_prefix_cross_attn.load_state_dict(self.critic_prefix_cross_attn.state_dict())
 
     def _to(self, device: torch.device | str):
         self.state_normalize_transform.to(device)
@@ -214,6 +232,14 @@ class PI0ForActionPrediction(PreTrainedModel, SupportSACTraining):
         policy.model = PI0Model.from_pretrained(pretrained_model_name_or_path)
         return policy
 
+    def load_state_dict(self, state_dict, strict: bool = True, assign: bool = False):
+        filtered_state_dict = {
+            key: value
+            for key, value in state_dict.items()
+            if key.startswith("model.")
+        }
+        return super().load_state_dict(filtered_state_dict, strict=False, assign=assign)
+
     def freeze_vision_tower(self) -> None:
         """Freeze the vision tower parameters."""
 
@@ -275,6 +301,28 @@ class PI0ForActionPrediction(PreTrainedModel, SupportSACTraining):
             raise ValueError(f"Unknown method: {method}")
 
         return q_values
+
+    def _cross_attention_pool_prefix(
+        self,
+        prefix_embs: torch.Tensor,
+        prefix_pad_masks: torch.Tensor,
+        use_target_network: bool,
+    ) -> torch.Tensor:
+        cross_attn = self.target_prefix_cross_attn if use_target_network else self.critic_prefix_cross_attn
+        state_token = self.target_state_token if use_target_network else self.critic_state_token
+
+        batch_size = prefix_embs.shape[0]
+        query = state_token.expand(batch_size, -1, -1)
+        key_padding_mask = ~prefix_pad_masks.to(dtype=torch.bool)
+
+        pooled, _ = cross_attn(
+            query=query,
+            key=prefix_embs,
+            value=prefix_embs,
+            key_padding_mask=key_padding_mask,
+            need_weights=False,
+        )
+        return pooled.squeeze(1)
 
     def _build_kv_cache_from_prefix(
         self,
@@ -377,13 +425,24 @@ class PI0ForActionPrediction(PreTrainedModel, SupportSACTraining):
         critic_head = self.target_network_heads if use_target_network else self.critic_heads
         for p in critic_head.parameters():
             p.requires_grad_(requires_grad)
+        prefix_cross_attn = self.target_prefix_cross_attn if use_target_network else self.critic_prefix_cross_attn
+        for p in prefix_cross_attn.parameters():
+            p.requires_grad_(requires_grad)
+        if use_target_network:
+            self.target_state_token.requires_grad_(requires_grad)
+        else:
+            self.critic_state_token.requires_grad_(requires_grad)
 
         prefix_features, states = state_features
-        prefix_embs, _, _ = prefix_features
-        mean_prefix_embs = prefix_embs.mean(dim=1, keepdim=False)  # (B, 2048)
+        prefix_embs, prefix_pad_masks, _ = prefix_features
+        pooled_prefix_embs = self._cross_attention_pool_prefix(
+            prefix_embs=prefix_embs,
+            prefix_pad_masks=prefix_pad_masks,
+            use_target_network=use_target_network,
+        )  # (B, 2048)
         actions = a["full_action"][:, :10, :7]  # (B, 10, 7)
         flattened_actions = actions.reshape(actions.shape[0], -1)  # (B, 70)
-        critic_input = torch.cat([mean_prefix_embs, states, flattened_actions], dim=-1)  # (B, 2150)
+        critic_input = torch.cat([pooled_prefix_embs, states, flattened_actions], dim=-1)
 
         q_values = self._multi_heads_value(critic_head, critic_input, method=method)
 
@@ -392,7 +451,8 @@ class PI0ForActionPrediction(PreTrainedModel, SupportSACTraining):
     @override
     def sac_get_critic_parameters(self) -> list[torch.nn.Parameter]:
         critic_head_params = [p for head in self.critic_heads for p in head.parameters()]
-        return critic_head_params
+        critic_prefix_cross_attn_params = list(self.critic_prefix_cross_attn.parameters())
+        return critic_head_params + critic_prefix_cross_attn_params + [self.critic_state_token]
 
     @override
     def sac_get_named_actor_parameters(self) -> list[tuple[str, torch.nn.Parameter]]:
@@ -424,3 +484,11 @@ class PI0ForActionPrediction(PreTrainedModel, SupportSACTraining):
             for k in t_sd.keys():
                 t_sd[k].mul_(1.0 - tau).add_(h_sd[k], alpha=tau)
             t_head.load_state_dict(t_sd, strict=True)
+
+        t_cross_attn_sd = self.target_prefix_cross_attn.state_dict()
+        cross_attn_sd = self.critic_prefix_cross_attn.state_dict()
+        for k in t_cross_attn_sd.keys():
+            t_cross_attn_sd[k].mul_(1.0 - tau).add_(cross_attn_sd[k], alpha=tau)
+        self.target_prefix_cross_attn.load_state_dict(t_cross_attn_sd, strict=True)
+
+        self.target_state_token.data.mul_(1.0 - tau).add_(self.critic_state_token.data, alpha=tau)

@@ -43,14 +43,12 @@ actor_rollout_ref:
   model:
     override_config:
       sac_enable: True
-      double_q: True
   actor:
     sac:
       gamma: 0.99
       tau: 1.0
       bc_loss_coef: 0
       initial_alpha: 0
-      replay_positive_sample_ratio: 0.9
       critic_replay_positive_sample_ratio: 0.5
       actor_replay_positive_sample_ratio: 0.8
       auto_entropy: False
