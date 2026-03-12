@@ -80,9 +80,18 @@ if [ "$RL_DEBUG_DUMP" = "1" ]; then
     RL_DEBUG_DUMP_INTERVAL=1
 fi
 
+# BC-mode temporary rollout/video switch.
+# Default keeps BC pure-offline behavior (no extra rollout for video).
+BC_ENABLE_ROLLOUT_VIDEO=${BC_ENABLE_ROLLOUT_VIDEO:-0}
+BC_VIDEO_INTERVAL=${BC_VIDEO_INTERVAL:-100}
+if [ "${BC_ENABLE_ROLLOUT_VIDEO}" = "1" ]; then
+    # 1 means run rollout for video every rollout step in BC mode.
+    BC_VIDEO_INTERVAL=1
+fi
 echo "[run_pi05_libero_sac] Using rlpd_files=${rlpd_files}"
 echo "[run_pi05_libero_sac] Using export_rollout_hdf5_dir=${EXPORT_ROLLOUT_HDF5_DIR}"
 echo "[run_pi05_libero_sac] actor_loss_type=${ACTOR_LOSS_TYPE}, export_rollout_max_demos=${EXPORT_ROLLOUT_MAX_DEMOS}, rl_debug_dump=${RL_DEBUG_DUMP}"
+echo "[run_pi05_libero_sac] bc_enable_rollout_video=${BC_ENABLE_ROLLOUT_VIDEO}, bc_video_interval=${BC_VIDEO_INTERVAL}"
 
 $PYTHON -m verl.experimental.vla.main_sac \
     data.train_files="$train_files" \
@@ -156,6 +165,7 @@ $PYTHON -m verl.experimental.vla.main_sac \
     trainer.val_only=False \
     trainer.val_before_train=False \
     actor_rollout_ref.actor.sac.actor_loss_type=${ACTOR_LOSS_TYPE} \
+    +trainer.bc_video_interval=${BC_VIDEO_INTERVAL} \
     +trainer.export_rollout_hdf5_dir=${EXPORT_ROLLOUT_HDF5_DIR} \
     +trainer.export_rollout_max_demos=${EXPORT_ROLLOUT_MAX_DEMOS} \
     +trainer.export_rollout_exit_after_dump=${EXPORT_ROLLOUT_EXIT_AFTER_DUMP}
