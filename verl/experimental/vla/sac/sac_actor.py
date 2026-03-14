@@ -398,6 +398,9 @@ class RobDataParallelSACActor(BaseSACActor):
 
     @override
     def update_policy(self, data: DataProto):
+        if not self.actor_ema_initialized:
+            self._init_actor_ema()
+
         if "empty_batch" not in data.meta_info:
             task_ids = data.batch["task_ids"]
             self.replay_pool.add_batch(data.select([
