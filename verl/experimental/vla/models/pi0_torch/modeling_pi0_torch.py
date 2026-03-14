@@ -41,6 +41,12 @@ from .pi0_utils import (
 from .policy.base import Pi0Output
 
 
+def beta_schedule(step, beta0, beta_min, T):
+    progress = min(step / T, 1.0)
+    beta = beta_min + (beta0 - beta_min) * 0.5 * (1 + math.cos(math.pi * progress))
+    return beta
+
+
 class PI0ForActionPrediction(PreTrainedModel, SupportSACTraining):
     config_class = PI0TorchConfig
     base_model_prefix = "pi0_torch"
@@ -67,11 +73,16 @@ class PI0ForActionPrediction(PreTrainedModel, SupportSACTraining):
         self.state_unnormalize_transform = Unnormalize(self.state_norm_stats, use_quantiles=self.pi05_enabled)
         self.action_unnormalize_transform = Unnormalize(self.action_norm_stats, use_quantiles=self.pi05_enabled)
 
+        # Flow SDE parameters
         self._to(get_device_name())
         self.flow_sde_enable = bool(getattr(config, "flow_sde_enable", True))
         self.flow_sde_noise_level = float(getattr(config, "flow_sde_noise_level", 0.5))
         self.flow_sde_rollout_noise_scale = float(getattr(config, "flow_sde_rollout_noise_scale", 1.0))
         self.flow_sde_train_noise_scale = float(getattr(config, "flow_sde_train_noise_scale", 1.0))
+        self.flow_sde_initial_beta = float(getattr(config, "flow_sde_initial_beta", 1.0))
+        self.flow_sde_beta_min = float(getattr(config, "flow_sde_beta_min", 0.02))
+        self.flow_sde_beta_schedule_T = int(getattr(config, "flow_sde_beta_schedule_T", 2000))
+        self.register_buffer("flow_sde_step", torch.zeros((), dtype=torch.long))
 
         ##### SAC Algorithm Support #####
         if getattr(self.config, "sac_enable", False):
@@ -352,9 +363,16 @@ class PI0ForActionPrediction(PreTrainedModel, SupportSACTraining):
     ) -> torch.Tensor:
         std_safe = std.clamp_min(1e-6)
         log_prob = -0.5 * (((sample - mean) / std_safe) ** 2 + 2.0 * torch.log(std_safe) + math.log(2.0 * math.pi))
-        zero_mask = std <= 0
-        log_prob = torch.where(zero_mask, torch.zeros_like(log_prob), log_prob)
         return log_prob.mean(dim=(-1, -2))
+
+    def flow_sde_beta(self) -> torch.Tensor:
+        beta = beta_schedule(
+            int(self.flow_sde_step.item()),
+            beta0=self.flow_sde_initial_beta,
+            beta_min=self.flow_sde_beta_min,
+            T=self.flow_sde_beta_schedule_T,
+        )
+        return torch.tensor(beta, device=self.flow_sde_step.device, dtype=torch.float32)
 
     def _sample_actions_flow_sde(
         self,
@@ -367,10 +385,11 @@ class PI0ForActionPrediction(PreTrainedModel, SupportSACTraining):
         prefix_embs, prefix_pad_masks, _ = prefix_features
         batch_size = prefix_embs.shape[0]
         device = prefix_embs.device
+        beta = self.flow_sde_beta().to(device=device, dtype=prefix_embs.dtype)
 
         past_key_values = self._build_kv_cache_from_prefix(prefix_features)
         actions_shape = (batch_size, self.model.n_action_steps, self.model.max_action_dim)
-        x_t = self.model.sample_noise(actions_shape, device=device)
+        x_t = torch.randn(actions_shape, device=device, dtype=prefix_embs.dtype)
 
         timesteps = torch.linspace(1.0, 0.0, self.model.num_steps + 1, dtype=torch.float32, device=device)
         step_log_probs: list[torch.Tensor] = []
@@ -407,25 +426,26 @@ class PI0ForActionPrediction(PreTrainedModel, SupportSACTraining):
             x1_pred = x_t + v_t * (1.0 - t_cur_exp)
 
             if noise_scale > 0:
-                sigma = self.flow_sde_noise_level * noise_scale * torch.sqrt(t_cur_safe / (1.0 - t_cur_safe))
+                sigma_schedule = self.flow_sde_noise_level * noise_scale * torch.sqrt(t_cur_safe / (1.0 - t_cur_safe))
+                sigma = beta * sigma_schedule
                 sigma_exp = sigma.view(1, 1, 1)
                 x0_weight = 1.0 - t_next_exp
                 x1_weight = t_next_exp - sigma_exp.pow(2) * delta_exp / (2.0 * t_cur_exp)
                 x_mean = x0_pred * x0_weight + x1_pred * x1_weight
-                x_std = torch.sqrt(delta_exp) * sigma_exp
-                eps = self.model.sample_noise(x_t.shape, device=device)
-                x_next = x_mean + eps * x_std
+                sigma_t = torch.sqrt(delta_exp) * sigma_exp
+                eps = torch.randn_like(x_t)
+                x_prev = x_mean + sigma_t * eps
             else:
                 x0_weight = 1.0 - t_next_exp
                 x1_weight = t_next_exp
                 x_mean = x0_pred * x0_weight + x1_pred * x1_weight
-                x_std = torch.zeros_like(x_mean)
-                x_next = x_mean
+                sigma_t = torch.zeros_like(x_mean)
+                x_prev = x_mean
 
             if return_log_prob:
-                step_log_probs.append(self._gaussian_log_prob(x_next, x_mean, x_std))
+                step_log_probs.append(self._gaussian_log_prob(x_prev, x_mean, sigma_t))
 
-            x_t = x_next
+            x_t = x_prev
 
         if return_log_prob:
             log_probs = torch.stack(step_log_probs, dim=1).sum(dim=1)
@@ -530,11 +550,12 @@ class PI0ForActionPrediction(PreTrainedModel, SupportSACTraining):
 
     @override
     def sac_get_named_actor_parameters(self) -> list[tuple[str, torch.nn.Parameter]]:
-        return [
+        named_parameters = [
             (name, param)
             for name, param in self.model.named_parameters()
             if param.requires_grad
         ]
+        return named_parameters
 
     @override
     def sac_forward_state_features(
