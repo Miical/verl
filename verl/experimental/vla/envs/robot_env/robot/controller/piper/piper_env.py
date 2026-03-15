@@ -227,6 +227,13 @@ class PiperJointRobot:
                 force_print(f"[PiperJointRobot] teleop connect failed: {exc}")
         self.is_connected = True
 
+    def reset_to_home(self, wait_s: float = 2.0):
+        """复位到电机层定义的 home 位姿。"""
+        if not self.is_connected:
+            return
+        self.bus_left.reset_pos(wait_s=wait_s)
+        self.bus_right.reset_pos(wait_s=wait_s)
+
     def disconnect(self):
         for cam in [self.cam_front, self.cam_left, self.cam_right]:
             if cam is not None and getattr(cam, "is_connected", False):
@@ -239,8 +246,9 @@ class PiperJointRobot:
                 self.teleop.disconnect()
             except Exception:
                 pass
-        self.bus_left.disconnect()
-        self.bus_right.disconnect()
+        # ⚠️ 安全策略：默认不下发 DisableArm，避免停进程时机械臂掉电下坠
+        self.bus_left.disconnect(disable_torque=False)
+        self.bus_right.disconnect(disable_torque=False)
         self.is_connected = False
 
     @staticmethod
@@ -338,6 +346,8 @@ class PiperJointEnv(gym.Env):
         self.current_step = 0
         if not self.robot.is_connected:
             self.robot.connect()
+        # 每次 reset 时先回到安全初始位
+        self.robot.reset_to_home(wait_s=2.0)
         obs = self.robot.get_observation()
         return obs, {"is_intervention": False}
 

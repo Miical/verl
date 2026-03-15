@@ -165,13 +165,17 @@ class PiperMotorsBus:
             logging.error(f"Exception during connect: {format_exc()}")
             return False
 
-    def disconnect(self, reset_pos: bool = False, disable_torque: bool = True):
+    def disconnect(self, reset_pos: bool = False, disable_torque: bool = False):
         if self.interface and self.is_connected:
             try:
                 if reset_pos:
                     self.reset_pos()
                 if disable_torque:
                     self.sync_write("Torque_Enable", 0)
+                else:
+                    logging.warning(
+                        f"[{self.can_name}] Disconnect without DisableArm for safety (avoid arm drop)."
+                    )
                 self.interface.DisconnectPort()
                 self.is_connected = False
                 logging.info("Disconnected from Piper robot")
