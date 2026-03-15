@@ -77,28 +77,27 @@ try:
     from lerobot.rl.gym_manipulator_bipiper import (
         RobotEnv,
         make_robot_env as _make_robot_env_base,
-        make_processors as _make_processors_base,
-        step_env_and_process_transition as _step_env_and_process_transition_base,
         reset_follower_position,
         control_loop,
         replay_trajectory,
     )
-except ImportError as e:
+except ImportError:
     # 尝试直接导入模块然后访问
     import lerobot.rl.gym_manipulator_bipiper as gym_manipulator_bipiper_module
     RobotEnv = gym_manipulator_bipiper_module.RobotEnv
     _make_robot_env_base = gym_manipulator_bipiper_module.make_robot_env
-    _make_processors_base = gym_manipulator_bipiper_module.make_processors
-    _step_env_and_process_transition_base = gym_manipulator_bipiper_module.step_env_and_process_transition
     reset_follower_position = gym_manipulator_bipiper_module.reset_follower_position
     control_loop = gym_manipulator_bipiper_module.control_loop
     replay_trajectory = gym_manipulator_bipiper_module.replay_trajectory
 # 导入processor 类
 from lerobot.processor import (
     AddBatchDimensionProcessorStep,
+    AddTeleopActionAsComplimentaryDataStep,
+    AddTeleopEventsAsInfoStep,
     DataProcessorPipeline,
     DeviceProcessorStep,
     EnvTransition,
+    InterventionActionProcessorStep,
     Numpy2TorchActionProcessorStep,
     Torch2NumpyActionProcessorStep,
     TransitionKey,
@@ -759,41 +758,45 @@ def make_processors(
     DataProcessorPipeline[EnvTransition, EnvTransition], DataProcessorPipeline[EnvTransition, EnvTransition]
 ]:
     """Create environment and action processors.
-    
-    扩展版本，支持 gym_testenv 模式。
-    对于其他环境类型，复用 gym_manipulator_bipiper 中的基础实现。
 
-    Args:
-        env: Robot environment instance.
-        teleop_device: Teleoperator device for intervention.
-        cfg: Processor configuration.
-        device: Target device for computations.
-
-    Returns:
-        Tuple of (environment processor, action processor).
+    这里不再复用 gym_manipulator_bipiper 的 end-pose action pipeline，
+    统一按 joint action 直接下发到电机总线（Goal_Position）。
     """
-    # 处理 gym_testenv（测试环境，无真实硬件）
     if cfg.name == "gym_testenv":
-        # 简单的处理管道，不需要介入检测
+        action_pipeline_steps = [Torch2NumpyActionProcessorStep()]
+    elif cfg.name == "gym_hil":
         action_pipeline_steps = [
+            InterventionActionProcessorStep(
+                terminate_on_success=(cfg.processor.reset.terminate_on_success if cfg.processor.reset is not None else True)
+            ),
+            Torch2NumpyActionProcessorStep(),
+        ]
+    else:
+        terminate_on_success = (
+            cfg.processor.reset.terminate_on_success if cfg.processor.reset is not None else True
+        )
+        action_pipeline_steps = [
+            AddTeleopActionAsComplimentaryDataStep(teleop_device=teleop_device),
+            AddTeleopEventsAsInfoStep(teleop_device=teleop_device),
+            InterventionActionProcessorStep(
+                use_gripper=cfg.processor.gripper.use_gripper if cfg.processor.gripper is not None else False,
+                terminate_on_success=terminate_on_success,
+            ),
             Torch2NumpyActionProcessorStep(),
         ]
 
-        env_pipeline_steps = [
-            Numpy2TorchActionProcessorStep(),
-            VanillaObservationProcessorStep(),
-            AddBatchDimensionProcessorStep(),
-            DeviceProcessorStep(device=device),
-        ]
+    env_pipeline_steps = [
+        Numpy2TorchActionProcessorStep(),
+        VanillaObservationProcessorStep(),
+        AddBatchDimensionProcessorStep(),
+        DeviceProcessorStep(device=device),
+    ]
 
-        return DataProcessorPipeline(
-            steps=env_pipeline_steps, to_transition=identity_transition, to_output=identity_transition
-        ), DataProcessorPipeline(
-            steps=action_pipeline_steps, to_transition=identity_transition, to_output=identity_transition
-        )
-
-    # 对于其他环境类型，复用基础实现
-    return _make_processors_base(env, teleop_device, cfg, device)
+    return DataProcessorPipeline(
+        steps=env_pipeline_steps, to_transition=identity_transition, to_output=identity_transition
+    ), DataProcessorPipeline(
+        steps=action_pipeline_steps, to_transition=identity_transition, to_output=identity_transition
+    )
 
 
 def step_env_and_process_transition(
@@ -804,31 +807,61 @@ def step_env_and_process_transition(
     action_processor: DataProcessorPipeline[EnvTransition, EnvTransition],
     save_images: bool = False,
 ) -> EnvTransition:
-    """
-    Execute one step with processor pipeline.
-    
-    扩展版本，复用 gym_manipulator_bipiper 中的基础实现。
-    save_images 参数当前未使用（基础实现中已包含图像保存逻辑）。
+    """Execute one step with processor pipeline.
 
-    Args:
-        env: The robot environment
-        transition: Current transition state
-        action: Action to execute
-        env_processor: Environment processor
-        action_processor: Action processor
-        save_images: Whether to save processed images to disk (default False, 已弃用)
-
-    Returns:
-        Processed transition with updated state.
+    real_robot 场景下直接走 joint 控制：
+      - 左臂 7 维 -> bus_left Goal_Position
+      - 右臂 7 维 -> bus_right Goal_Position
     """
-    # 复用基础实现（基础实现中已包含图像保存逻辑）
-    return _step_env_and_process_transition_base(
-        env=env,
-        transition=transition,
-        action=action,
-        env_processor=env_processor,
-        action_processor=action_processor,
+    del save_images
+
+    transition[TransitionKey.ACTION] = action
+    processed_action_transition = action_processor(transition)
+    processed_action = processed_action_transition[TransitionKey.ACTION]
+    transition_info = processed_action_transition[TransitionKey.INFO]
+
+    if hasattr(env, "robot") and hasattr(env.robot, "bus_left") and hasattr(env.robot, "bus_right"):
+        is_intervention = bool(transition_info.get(TeleopEvents.IS_INTERVENTION, False))
+
+        pa_np = np.asarray(processed_action, dtype=np.float32)
+        pa_np = pa_np.reshape(-1)
+        if pa_np.shape[0] < 14:
+            pa_np = np.pad(pa_np, (0, 14 - pa_np.shape[0]), mode="constant")
+        elif pa_np.shape[0] > 14:
+            pa_np = pa_np[:14]
+
+        if not is_intervention:
+            left_targets = dict(zip(env.robot.bus_left.motors, pa_np[:7], strict=False))
+            right_targets = dict(zip(env.robot.bus_right.motors, pa_np[7:14], strict=False))
+            env.robot.bus_left.sync_write("Goal_Position", left_targets)
+            env.robot.bus_right.sync_write("Goal_Position", right_targets)
+
+        obs = env._get_observation() if hasattr(env, "_get_observation") else env.get_observation()
+        if hasattr(env, "current_step"):
+            env.current_step += 1
+        reward, terminated, truncated = 0.0, False, False
+        info = {TeleopEvents.IS_INTERVENTION: is_intervention}
+    else:
+        # gym_hil / 其他环境保持原生 step
+        obs, reward, terminated, truncated, info = env.step(processed_action)
+
+    reward = reward + processed_action_transition[TransitionKey.REWARD]
+    terminated = terminated or processed_action_transition[TransitionKey.DONE]
+    truncated = truncated or processed_action_transition[TransitionKey.TRUNCATED]
+    complementary_data = processed_action_transition[TransitionKey.COMPLEMENTARY_DATA].copy()
+    new_info = processed_action_transition[TransitionKey.INFO].copy()
+    new_info.update(info)
+
+    new_transition = create_transition(
+        observation=obs,
+        action=processed_action,
+        reward=reward,
+        done=terminated,
+        truncated=truncated,
+        info=new_info,
+        complementary_data=complementary_data,
     )
+    return env_processor(new_transition)
 
 
 class RealRobotEnvWrapper:
