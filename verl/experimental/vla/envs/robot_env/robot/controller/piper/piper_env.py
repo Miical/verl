@@ -372,4 +372,58 @@ def step_env_and_process_transition(env, transition, action, env_processor=None,
 
 
 if __name__ == "__main__":
-    force_print("piper_env.py loaded (joint-only minimal environment)")
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Piper joint env loader test")
+    parser.add_argument("--can-left", default="can0", help="Left arm CAN interface")
+    parser.add_argument("--can-right", default="can1", help="Right arm CAN interface")
+    parser.add_argument("--baud-rate", type=int, default=1_000_000, help="CAN baud rate")
+    parser.add_argument(
+        "--run-reset-step",
+        action="store_true",
+        help="Run reset()+one zero-action step (requires real hardware)",
+    )
+    args = parser.parse_args()
+
+    cfg = _DefaultCfg(
+        can_name_left=args.can_left,
+        can_name_right=args.can_right,
+        baud_rate=args.baud_rate,
+    )
+
+    force_print("=" * 80)
+    force_print("[PiperEnv Test] Start loading environment")
+    force_print(f"[PiperEnv Test] cfg={{left:{cfg.can_name_left}, right:{cfg.can_name_right}, baud:{cfg.baud_rate}}}")
+
+    wrapper = None
+    try:
+        wrapper = RealRobotEnvWrapper(cfg=cfg, rank=0, world_size=1)
+        force_print("[PiperEnv Test] ✅ RealRobotEnvWrapper initialized successfully")
+
+        if args.run_reset_step:
+            force_print("[PiperEnv Test] Running reset() and one step() ...")
+            obs = wrapper.reset()
+            force_print(
+                f"[PiperEnv Test] reset ok: keys={list(obs.keys())}, image_keys={list(obs['images'].keys())}"
+            )
+            zero_action = np.zeros((14,), dtype=np.float32)
+            obs, reward, terminated, truncated, info = wrapper.step(zero_action)
+            force_print(
+                "[PiperEnv Test] step ok: "
+                f"reward={reward}, terminated={terminated}, truncated={truncated}, intervene={info.get('intervene_flag')}"
+            )
+        else:
+            force_print("[PiperEnv Test] Skip reset/step. Use --run-reset-step to test real hardware path.")
+
+        force_print("[PiperEnv Test] ✅ Environment load test passed")
+    except Exception as exc:
+        force_print(f"[PiperEnv Test] ❌ Failed: {exc}")
+        raise
+    finally:
+        if wrapper is not None:
+            try:
+                wrapper.close()
+                force_print("[PiperEnv Test] wrapper closed")
+            except Exception as close_exc:
+                force_print(f"[PiperEnv Test] close warning: {close_exc}")
+        force_print("=" * 80)
