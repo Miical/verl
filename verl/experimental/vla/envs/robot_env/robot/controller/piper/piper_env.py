@@ -860,10 +860,9 @@ class RealRobotEnvWrapper:
         self.device = getattr(cfg, 'device', 'cpu')
         self.num_envs = getattr(cfg, 'num_envs', 1)
         
-        # 初始化运动学求解器(缓存,避免每次step都创建)
+        # Piper 直接走关节控制，不再在 wrapper 中做 joint->endpose FK 转换
         self.left_kin = None
         self.right_kin = None
-        self._init_kinematics()
         
         # 创建机器人环境和遥操作设备
         # 如果提供了 robot_config_path,则从JSON文件加载完整配置
@@ -1112,60 +1111,8 @@ class RealRobotEnvWrapper:
                 action_np = np.concatenate([action_np, np.zeros(padding_size, dtype=np.float32)])
                 force_print(f"[RealRobotEnvWrapper] Action padded from {original_dim} to 14 dims")
             
-            # 检查是否已初始化运动学求解器
-            if self.left_kin is None or self.right_kin is None:
-                force_print(f"[RealRobotEnvWrapper] WARNING: Kinematics not initialized, skipping FK conversion")
-                # 直接使用原始action,不做转换
-                action = torch.from_numpy(action_np).to(self.device)
-            else:
-                # 机器人运动学 FK: joint -> end-effector pose
-                # 先转回 tensor 以便索引
-                action_tensor = torch.from_numpy(action_np).to(self.device)
-                
-                left_joint_idx = [0, 1, 2, 3, 4, 5]
-                left_grip_idx = 6
-                right_joint_idx = [7, 8, 9, 10, 11, 12]
-                right_grip_idx = 13
-                
-                # 取出关节（rad）-> numpy
-                ql_rad = action_tensor[left_joint_idx].detach().cpu().numpy().astype(float)
-                qr_rad = action_tensor[right_joint_idx].detach().cpu().numpy().astype(float)
-
-                # RobotKinematics.forward_kinematics 接口使用"度"
-                ql_deg = np.rad2deg(ql_rad)
-                qr_deg = np.rad2deg(qr_rad)
-
-                # 做 FK (使用缓存的kinematics对象)
-                T_l = self.left_kin.forward_kinematics(ql_deg)   # 4x4
-                T_r = self.right_kin.forward_kinematics(qr_deg)  # 4x4
-
-                # 位置：米
-                lx, ly, lz = T_l[:3, 3].tolist()
-                rx, ry, rz = T_r[:3, 3].tolist()
-
-                # 姿态：旋转矩阵 -> RPY（弧度）
-                lrx, lry, lrz = rotmat_to_rpy_zyx(T_l[:3, :3])
-                rrx, rry, rrz = rotmat_to_rpy_zyx(T_r[:3, :3])
-
-                # 夹爪：从 action 中获取
-                l_grip = float(action_tensor[left_grip_idx].item())
-                r_grip = float(action_tensor[right_grip_idx].item())
-
-                # 构建 end-effector pose action (14维)
-                # [L_x, L_y, L_z, L_rx, L_ry, L_rz, L_grip,
-                #  R_x, R_y, R_z, R_rx, R_ry, R_rz, R_grip]
-                endpose_action = torch.tensor(
-                    [
-                        lx, ly, lz, lrx, lry, lrz, l_grip,
-                        rx, ry, rz, rrx, rry, rrz, r_grip,
-                    ],
-                    device=self.device,
-                    dtype=torch.float32,
-                )
-                
-                # 使用转换后的 end-effector pose action
-                force_print(f"[RealRobotEnvWrapper] End-effector pose action: {endpose_action}")
-                action = endpose_action
+            # 直接使用关节动作（14维）
+            action = torch.from_numpy(action_np).to(self.device)
         
         # 通过处理器管道执行步骤（处理人工介入）
         self.current_transition = step_env_and_process_transition(
