@@ -1,10 +1,12 @@
 # !/usr/bin/env python
 
+import json
 import logging
 import os
 import sys
 import time
 from dataclasses import dataclass, field
+from types import SimpleNamespace
 from typing import Any
 
 import cv2
@@ -88,6 +90,68 @@ def _default_camera_mapping() -> dict[str, str]:
     }
 
 
+def _get_attr(obj: Any, key: str, default=None):
+    if obj is None:
+        return default
+    if isinstance(obj, dict):
+        return obj.get(key, default)
+    return getattr(obj, key, default)
+
+
+def _normalize_runtime_cfg(cfg: Any) -> Any:
+    """兼容旧配置入口：
+    1) cfg.robot_config_path -> json(包含 env)
+    2) cfg.env.robot/teleop (Hydra/namespace)
+    3) 扁平字段 can_name_left/can_name_right
+    """
+    if cfg is None:
+        cfg = _DefaultCfg()
+
+    # 若传入 config 文件路径，优先读取
+    robot_config_path = _get_attr(cfg, "robot_config_path", None)
+    if robot_config_path:
+        with open(robot_config_path, "r", encoding="utf-8") as f:
+            loaded = json.load(f)
+        cfg_env = loaded.get("env", loaded)
+    else:
+        cfg_env = _get_attr(cfg, "env", None)
+
+    robot_cfg = _get_attr(cfg_env, "robot", None)
+    teleop_cfg = _get_attr(cfg_env, "teleop", None)
+    cameras_cfg = _get_attr(robot_cfg, "cameras", {}) or {}
+
+    can_name_left = _get_attr(cfg, "can_name_left", None) or _get_attr(robot_cfg, "can_name_left", "can_left")
+    can_name_right = _get_attr(cfg, "can_name_right", None) or _get_attr(robot_cfg, "can_name_right", "can_right")
+    baud_rate = _get_attr(cfg, "baud_rate", None) or _get_attr(robot_cfg, "baud_rate", 1_000_000)
+
+    task_description = _get_attr(cfg, "task_description", None) or _get_attr(cfg_env, "task", "catch_bowl")
+    device = _get_attr(cfg, "device", "cpu")
+    num_envs = _get_attr(cfg, "num_envs", 1)
+
+    camera_mapping = _get_attr(cfg, "camera_mapping", None)
+    if camera_mapping is None:
+        camera_mapping = _default_camera_mapping()
+
+    # 转换 camera 配置到当前实现字段
+    dabai_camera = _get_attr(cameras_cfg, "front", None)
+    realsense_left_camera = _get_attr(cameras_cfg, "left", None)
+    realsense_right_camera = _get_attr(cameras_cfg, "right", None)
+
+    return SimpleNamespace(
+        can_name_left=can_name_left,
+        can_name_right=can_name_right,
+        baud_rate=baud_rate,
+        task_description=task_description,
+        device=device,
+        num_envs=num_envs,
+        camera_mapping=camera_mapping,
+        dabai_camera=dabai_camera,
+        realsense_left_camera=realsense_left_camera,
+        realsense_right_camera=realsense_right_camera,
+        pico_vr=teleop_cfg,
+    )
+
+
 class PiperJointRobot:
     """最小双臂 Piper 机器人封装：joint 控制 + 3 相机 + pico_vr 干预信号。"""
 
@@ -109,7 +173,8 @@ class PiperJointRobot:
         cam_cfg = getattr(cfg, "dabai_camera", None)
         if cam_cfg is None:
             return None
-        return OrbbecDabaiCamera(OrbbecDabaiCameraConfig(**cam_cfg))
+        cam_cfg_dict = cam_cfg if isinstance(cam_cfg, dict) else getattr(cam_cfg, "__dict__", {})
+        return OrbbecDabaiCamera(OrbbecDabaiCameraConfig(**cam_cfg_dict))
 
     def _build_realsense_camera(self, cfg: Any, side: str):
         if RealSenseCamera is None or RealSenseCameraConfig is None:
@@ -118,7 +183,8 @@ class PiperJointRobot:
         cam_cfg = getattr(cfg, key, None)
         if cam_cfg is None:
             return None
-        return RealSenseCamera(RealSenseCameraConfig(**cam_cfg))
+        cam_cfg_dict = cam_cfg if isinstance(cam_cfg, dict) else getattr(cam_cfg, "__dict__", {})
+        return RealSenseCamera(RealSenseCameraConfig(**cam_cfg_dict))
 
     def _build_teleop(self, cfg: Any):
         if PicoVrTeleop is None or PicoVrTeleopConfig is None:
@@ -126,7 +192,8 @@ class PiperJointRobot:
         teleop_cfg = getattr(cfg, "pico_vr", None)
         if teleop_cfg is None:
             return None
-        return PicoVrTeleop(PicoVrTeleopConfig(**teleop_cfg))
+        teleop_cfg_dict = teleop_cfg if isinstance(teleop_cfg, dict) else getattr(teleop_cfg, "__dict__", {})
+        return PicoVrTeleop(PicoVrTeleopConfig(**teleop_cfg_dict))
 
     def connect(self):
         if self.is_connected:
@@ -289,20 +356,17 @@ class RealRobotEnvWrapper:
         self.rank = rank
         self.world_size = world_size
 
-        if cfg is None:
-            cfg = _DefaultCfg()
-        if not hasattr(cfg, "can_name_left"):
-            cfg = _DefaultCfg(**getattr(cfg, "__dict__", {}))
+        runtime_cfg = _normalize_runtime_cfg(cfg)
 
-        self.device = getattr(cfg, "device", "cpu")
-        self.num_envs = getattr(cfg, "num_envs", 1)
-        self.task_description = getattr(cfg, "task_description", "catch_bowl")
-        camera_mapping = getattr(cfg, "camera_mapping", None)
+        self.device = getattr(runtime_cfg, "device", "cpu")
+        self.num_envs = getattr(runtime_cfg, "num_envs", 1)
+        self.task_description = getattr(runtime_cfg, "task_description", "catch_bowl")
+        camera_mapping = getattr(runtime_cfg, "camera_mapping", None)
         if camera_mapping is None:
             camera_mapping = _default_camera_mapping()
         self.camera_mapping = camera_mapping
 
-        self.robot = PiperJointRobot(cfg)
+        self.robot = PiperJointRobot(runtime_cfg)
         self.env = PiperJointEnv(self.robot)
 
     def _convert_obs_to_test_env_format(self, obs: dict[str, Any]) -> dict[str, Any]:
@@ -370,7 +434,8 @@ class RealRobotEnvWrapper:
 
 
 def make_robot_env(cfg) -> tuple[gym.Env, Any]:
-    robot = PiperJointRobot(cfg)
+    runtime_cfg = _normalize_runtime_cfg(cfg)
+    robot = PiperJointRobot(runtime_cfg)
     env = PiperJointEnv(robot)
     return env, robot.teleop
 
@@ -393,6 +458,7 @@ if __name__ == "__main__":
     parser.add_argument("--can-left", default="can_left", help="Left arm CAN interface")
     parser.add_argument("--can-right", default="can_right", help="Right arm CAN interface")
     parser.add_argument("--baud-rate", type=int, default=1_000_000, help="CAN baud rate")
+    parser.add_argument("--robot-config-path", default=None, help="Path to legacy lerobot json config")
     parser.add_argument(
         "--dry-run",
         action="store_true",
@@ -408,15 +474,25 @@ if __name__ == "__main__":
     )
     args = parser.parse_args()
 
-    cfg = _DefaultCfg(
-        can_name_left=args.can_left,
-        can_name_right=args.can_right,
-        baud_rate=args.baud_rate,
-    )
+    if args.robot_config_path:
+        cfg = SimpleNamespace(
+            robot_config_path=args.robot_config_path,
+            device="cpu",
+            num_envs=1,
+        )
+    else:
+        cfg = _DefaultCfg(
+            can_name_left=args.can_left,
+            can_name_right=args.can_right,
+            baud_rate=args.baud_rate,
+        )
 
+    runtime_cfg_preview = _normalize_runtime_cfg(cfg)
     force_print("=" * 80)
     force_print("[PiperEnv Test] Start loading environment")
-    force_print(f"[PiperEnv Test] cfg={{left:{cfg.can_name_left}, right:{cfg.can_name_right}, baud:{cfg.baud_rate}}}")
+    force_print(
+        f"[PiperEnv Test] cfg={{left:{runtime_cfg_preview.can_name_left}, right:{runtime_cfg_preview.can_name_right}, baud:{runtime_cfg_preview.baud_rate}}}"
+    )
 
     wrapper = None
     try:
