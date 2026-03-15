@@ -452,40 +452,73 @@ def step_env_and_process_transition(env, transition, action, env_processor=None,
 
 
 if __name__ == "__main__":
-    import argparse
-
-    parser = argparse.ArgumentParser(description="Piper joint env real hardware smoke test")
-    parser.add_argument("--can-left", default="can_left", help="Left arm CAN interface")
-    parser.add_argument("--can-right", default="can_right", help="Right arm CAN interface")
-    parser.add_argument("--baud-rate", type=int, default=1_000_000, help="CAN baud rate")
-    parser.add_argument("--robot-config-path", default=None, help="Path to legacy lerobot json config")
-    parser.add_argument(
-        "--dry-run",
-        action="store_true",
-        help="Only instantiate wrapper without connecting/reset/step",
+    # 直接在代码中写死一份可运行的配置（不走外部命令行传参）
+    # 如需调整，请直接修改下面这份配置。
+    cfg = SimpleNamespace(
+        env=SimpleNamespace(
+            name="real_robot",
+            fps=50,
+            robot=SimpleNamespace(
+                type="piper_follower_end_effector",
+                can_name_left="can_left",
+                can_name_right="can_right",
+                baud_rate=1000000,
+                cameras={
+                    "front": {
+                        "type": "orbbec_dabai",
+                        "serial_number_or_name": "CC1B25100EM",
+                        "width": 640,
+                        "height": 480,
+                        "fps": 30,
+                    },
+                    "left": {
+                        "type": "intelrealsense",
+                        "serial_number_or_name": "242522071187",
+                        "width": 640,
+                        "height": 480,
+                        "fps": 30,
+                    },
+                    "right": {
+                        "type": "intelrealsense",
+                        "serial_number_or_name": "327122075682",
+                        "width": 640,
+                        "height": 480,
+                        "fps": 30,
+                    },
+                },
+            ),
+            teleop=SimpleNamespace(
+                type="pico_vr",
+                left_pose_source="left_controller",
+                right_pose_source="right_controller",
+                translation_scale=1,
+                rotation_scale=1,
+                rotation_yaw_gain=0.1,
+                translation_clip=1.0,
+                rotation_clip=2.0,
+                translation_deadband=1e-4,
+                rotation_deadband=5e-3,
+                gripper_open=0.07,
+                gripper_close=0.0,
+                gripper_delta_gain=1.0,
+                gripper_deadband=1e-3,
+            ),
+        ),
+        device="cpu",
+        num_envs=1,
+        task_description="real_robot_hardware_smoke_test",
+        camera_mapping={
+            "front": "head_image",
+            "left": "left_wrist_image",
+            "right": "right_wrist_image",
+        },
     )
-    parser.add_argument("--steps", type=int, default=40, help="Control steps for motor motion test")
-    parser.add_argument("--hz", type=float, default=10.0, help="Control frequency in Hz")
-    parser.add_argument(
-        "--delta",
-        type=float,
-        default=0.03,
-        help="Small sinusoidal delta (rad) applied to joint_2/joint_3 for both arms",
-    )
-    args = parser.parse_args()
 
-    if args.robot_config_path:
-        cfg = SimpleNamespace(
-            robot_config_path=args.robot_config_path,
-            device="cpu",
-            num_envs=1,
-        )
-    else:
-        cfg = _DefaultCfg(
-            can_name_left=args.can_left,
-            can_name_right=args.can_right,
-            baud_rate=args.baud_rate,
-        )
+    # 测试开关（按需在代码里改）
+    RUN_RESET_AND_MOTION = True
+    MOTION_STEPS = 40
+    MOTION_HZ = 10.0
+    MOTION_DELTA_RAD = 0.03
 
     runtime_cfg_preview = _normalize_runtime_cfg(cfg)
     force_print("=" * 80)
@@ -499,8 +532,8 @@ if __name__ == "__main__":
         wrapper = RealRobotEnvWrapper(cfg=cfg, rank=0, world_size=1)
         force_print("[PiperEnv Test] ✅ RealRobotEnvWrapper initialized successfully")
 
-        if args.dry_run:
-            force_print("[PiperEnv Test] Dry-run mode: skip real hardware connect/reset/step.")
+        if not RUN_RESET_AND_MOTION:
+            force_print("[PiperEnv Test] RUN_RESET_AND_MOTION=False, skip hardware reset/step")
         else:
             force_print("[PiperEnv Test] Running REAL hardware reset() + motion test ...")
             obs = wrapper.reset()
@@ -509,33 +542,31 @@ if __name__ == "__main__":
                 f"[PiperEnv Test] reset ok: keys={list(obs.keys())}, image_keys={list(obs['images'].keys())}, state_shape={state.shape}"
             )
 
-            # 从当前关节作为基线，做小幅正弦运动（更安全，且能明显看到电机在动）
             base = np.asarray(state, dtype=np.float32).copy()
             if base.shape[0] != 14:
                 raise RuntimeError(f"Unexpected state dim {base.shape[0]}, expected 14")
 
-            dt = 1.0 / max(args.hz, 1e-3)
-            for i in range(args.steps):
+            dt = 1.0 / max(MOTION_HZ, 1e-3)
+            for i in range(MOTION_STEPS):
                 t = i * dt
                 action = base.copy()
-                s = float(np.sin(2.0 * np.pi * 0.2 * t))  # 0.2Hz 慢速摆动
-                d = float(args.delta * s)
+                s = float(np.sin(2.0 * np.pi * 0.2 * t))
+                d = float(MOTION_DELTA_RAD * s)
 
-                # 左臂 joint_2/joint_3 与右臂 joint_2/joint_3 做对称小幅动作
+                # 双臂 joint_2 / joint_3 对称小幅运动
                 action[1] = base[1] + d
                 action[2] = base[2] - d
                 action[8] = base[8] + d
                 action[9] = base[9] - d
 
                 obs, reward, terminated, truncated, info = wrapper.step(action)
-                if i % max(1, args.steps // 10) == 0:
+                if i % max(1, MOTION_STEPS // 10) == 0:
                     force_print(
-                        f"[PiperEnv Test] step={i:03d}/{args.steps}, d={d:.4f}, "
+                        f"[PiperEnv Test] step={i:03d}/{MOTION_STEPS}, d={d:.4f}, "
                         f"intervene={info.get('intervene_flag')}, reward={reward}, term={terminated}, trunc={truncated}"
                     )
                 time.sleep(dt)
 
-            # 最后回到基线
             wrapper.step(base)
             force_print("[PiperEnv Test] Motion test finished and returned to base pose")
 
