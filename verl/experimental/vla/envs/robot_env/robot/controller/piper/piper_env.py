@@ -4,7 +4,7 @@ import logging
 import os
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 import cv2
@@ -71,7 +71,21 @@ class _DefaultCfg:
     device: str = "cpu"
     num_envs: int = 1
     task_description: str = "catch_bowl"
-    camera_mapping: dict[str, str] | None = None
+    camera_mapping: dict[str, str] = field(
+        default_factory=lambda: {
+            "front": "head_image",
+            "left": "left_wrist_image",
+            "right": "right_wrist_image",
+        }
+    )
+
+
+def _default_camera_mapping() -> dict[str, str]:
+    return {
+        "front": "head_image",
+        "left": "left_wrist_image",
+        "right": "right_wrist_image",
+    }
 
 
 class PiperJointRobot:
@@ -285,11 +299,7 @@ class RealRobotEnvWrapper:
         self.task_description = getattr(cfg, "task_description", "catch_bowl")
         camera_mapping = getattr(cfg, "camera_mapping", None)
         if camera_mapping is None:
-            camera_mapping = {
-                "front": "head_image",
-                "left": "left_wrist_image",
-                "right": "right_wrist_image",
-            }
+            camera_mapping = _default_camera_mapping()
         self.camera_mapping = camera_mapping
 
         self.robot = PiperJointRobot(cfg)
@@ -299,11 +309,7 @@ class RealRobotEnvWrapper:
         images_list = []
         camera_names = []
         if not isinstance(self.camera_mapping, dict):
-            self.camera_mapping = {
-                "front": "head_image",
-                "left": "left_wrist_image",
-                "right": "right_wrist_image",
-            }
+            self.camera_mapping = _default_camera_mapping()
         for robot_cam_name, test_cam_name in self.camera_mapping.items():
             if robot_cam_name in obs:
                 images_list.append(obs[robot_cam_name])
