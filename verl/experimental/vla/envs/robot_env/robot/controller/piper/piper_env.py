@@ -283,11 +283,14 @@ class RealRobotEnvWrapper:
         self.device = getattr(cfg, "device", "cpu")
         self.num_envs = getattr(cfg, "num_envs", 1)
         self.task_description = getattr(cfg, "task_description", "catch_bowl")
-        self.camera_mapping = getattr(
-            cfg,
-            "camera_mapping",
-            {"front": "head_image", "left": "left_wrist_image", "right": "right_wrist_image"},
-        )
+        camera_mapping = getattr(cfg, "camera_mapping", None)
+        if camera_mapping is None:
+            camera_mapping = {
+                "front": "head_image",
+                "left": "left_wrist_image",
+                "right": "right_wrist_image",
+            }
+        self.camera_mapping = camera_mapping
 
         self.robot = PiperJointRobot(cfg)
         self.env = PiperJointEnv(self.robot)
@@ -295,6 +298,12 @@ class RealRobotEnvWrapper:
     def _convert_obs_to_test_env_format(self, obs: dict[str, Any]) -> dict[str, Any]:
         images_list = []
         camera_names = []
+        if not isinstance(self.camera_mapping, dict):
+            self.camera_mapping = {
+                "front": "head_image",
+                "left": "left_wrist_image",
+                "right": "right_wrist_image",
+            }
         for robot_cam_name, test_cam_name in self.camera_mapping.items():
             if robot_cam_name in obs:
                 images_list.append(obs[robot_cam_name])
