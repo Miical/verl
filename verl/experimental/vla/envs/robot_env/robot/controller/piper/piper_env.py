@@ -374,14 +374,22 @@ def step_env_and_process_transition(env, transition, action, env_processor=None,
 if __name__ == "__main__":
     import argparse
 
-    parser = argparse.ArgumentParser(description="Piper joint env loader test")
-    parser.add_argument("--can-left", default="can0", help="Left arm CAN interface")
-    parser.add_argument("--can-right", default="can1", help="Right arm CAN interface")
+    parser = argparse.ArgumentParser(description="Piper joint env real hardware smoke test")
+    parser.add_argument("--can-left", default="can_left", help="Left arm CAN interface")
+    parser.add_argument("--can-right", default="can_right", help="Right arm CAN interface")
     parser.add_argument("--baud-rate", type=int, default=1_000_000, help="CAN baud rate")
     parser.add_argument(
-        "--run-reset-step",
+        "--dry-run",
         action="store_true",
-        help="Run reset()+one zero-action step (requires real hardware)",
+        help="Only instantiate wrapper without connecting/reset/step",
+    )
+    parser.add_argument("--steps", type=int, default=40, help="Control steps for motor motion test")
+    parser.add_argument("--hz", type=float, default=10.0, help="Control frequency in Hz")
+    parser.add_argument(
+        "--delta",
+        type=float,
+        default=0.03,
+        help="Small sinusoidal delta (rad) applied to joint_2/joint_3 for both arms",
     )
     args = parser.parse_args()
 
@@ -400,20 +408,45 @@ if __name__ == "__main__":
         wrapper = RealRobotEnvWrapper(cfg=cfg, rank=0, world_size=1)
         force_print("[PiperEnv Test] ✅ RealRobotEnvWrapper initialized successfully")
 
-        if args.run_reset_step:
-            force_print("[PiperEnv Test] Running reset() and one step() ...")
-            obs = wrapper.reset()
-            force_print(
-                f"[PiperEnv Test] reset ok: keys={list(obs.keys())}, image_keys={list(obs['images'].keys())}"
-            )
-            zero_action = np.zeros((14,), dtype=np.float32)
-            obs, reward, terminated, truncated, info = wrapper.step(zero_action)
-            force_print(
-                "[PiperEnv Test] step ok: "
-                f"reward={reward}, terminated={terminated}, truncated={truncated}, intervene={info.get('intervene_flag')}"
-            )
+        if args.dry_run:
+            force_print("[PiperEnv Test] Dry-run mode: skip real hardware connect/reset/step.")
         else:
-            force_print("[PiperEnv Test] Skip reset/step. Use --run-reset-step to test real hardware path.")
+            force_print("[PiperEnv Test] Running REAL hardware reset() + motion test ...")
+            obs = wrapper.reset()
+            state = obs["state"]
+            force_print(
+                f"[PiperEnv Test] reset ok: keys={list(obs.keys())}, image_keys={list(obs['images'].keys())}, state_shape={state.shape}"
+            )
+
+            # 从当前关节作为基线，做小幅正弦运动（更安全，且能明显看到电机在动）
+            base = np.asarray(state, dtype=np.float32).copy()
+            if base.shape[0] != 14:
+                raise RuntimeError(f"Unexpected state dim {base.shape[0]}, expected 14")
+
+            dt = 1.0 / max(args.hz, 1e-3)
+            for i in range(args.steps):
+                t = i * dt
+                action = base.copy()
+                s = float(np.sin(2.0 * np.pi * 0.2 * t))  # 0.2Hz 慢速摆动
+                d = float(args.delta * s)
+
+                # 左臂 joint_2/joint_3 与右臂 joint_2/joint_3 做对称小幅动作
+                action[1] = base[1] + d
+                action[2] = base[2] - d
+                action[8] = base[8] + d
+                action[9] = base[9] - d
+
+                obs, reward, terminated, truncated, info = wrapper.step(action)
+                if i % max(1, args.steps // 10) == 0:
+                    force_print(
+                        f"[PiperEnv Test] step={i:03d}/{args.steps}, d={d:.4f}, "
+                        f"intervene={info.get('intervene_flag')}, reward={reward}, term={terminated}, trunc={truncated}"
+                    )
+                time.sleep(dt)
+
+            # 最后回到基线
+            wrapper.step(base)
+            force_print("[PiperEnv Test] Motion test finished and returned to base pose")
 
         force_print("[PiperEnv Test] ✅ Environment load test passed")
     except Exception as exc:
