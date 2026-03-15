@@ -567,11 +567,11 @@ if __name__ == "__main__":
                 s = float(np.sin(2.0 * np.pi * 0.2 * t))
                 d = float(MOTION_DELTA_RAD * s)
 
-                # 双臂 joint_2 / joint_3 对称小幅运动
-                action[1] = base[1] + d
-                action[2] = base[2] - d
-                action[8] = base[8] + d
-                action[9] = base[9] - d
+                # 双臂 joint_1 / joint_4 对称小幅运动（更容易观察，且不易触发 joint_2/joint_3 边界裁剪）
+                action[0] = base[0] + d
+                action[3] = base[3] - d
+                action[7] = base[7] + d
+                action[10] = base[10] - d
 
                 obs, reward, terminated, truncated, info = wrapper.step(action)
                 if i % max(1, MOTION_STEPS // 10) == 0:

@@ -70,6 +70,7 @@ class PiperMotorsBus:
             f"{motor_prefix}_end_gripper"  # 新增：末端模式中的夹爪
         ]
         self._current_end_pose = {k: 0.0 for k in self.end_pose_keys}
+        self._current_move_mode: int | None = None
 
         logging.info(f"Initialized PiperMotorsBus V2 with {len(self.motors)} motors")
         logging.info(f"CAN interface: {can_name}, Baud rate: {baud_rate}")
@@ -207,11 +208,14 @@ class PiperMotorsBus:
     def _set_move_mode(self, move_mode: int = 0x00, move_spd_rate_ctrl: Optional[int] = None):
         """0x00:P, 0x01:J, 0x02:L, 0x03:C"""
         try:
+            if self._current_move_mode == move_mode and move_spd_rate_ctrl is None:
+                return
             # ctrl_mode=0x01: 使用 CAN 指令控制（和 _initialize_robot 保持一致）
             kwargs = dict(ctrl_mode=0x01, move_mode=move_mode, is_mit_mode=0x00)
             if move_spd_rate_ctrl is not None:
                 kwargs["move_spd_rate_ctrl"] = move_spd_rate_ctrl
             self.interface.ModeCtrl(**kwargs)
+            self._current_move_mode = move_mode
         except Exception:
             logging.error(f"Failed to set move mode: {format_exc()}")
 
@@ -413,11 +417,19 @@ class PiperMotorsBus:
               '<prefix>_end_gripper'
         """
         try:
+            if not (self.interface and self.is_connected):
+                logging.warning(f"sync_write({parameter}) called while bus is not connected on {self.can_name}")
+                return
+
             #print(f"[{self.can_name}] sync_write ")
             if parameter == "Goal_Position":
                 if not isinstance(values, dict):
                     logging.warning("Goal_Position expects a dict.")
                     return
+
+                # 关节控制前确保在 MOVE J 模式
+                self._set_move_mode(move_mode=0x01)
+
                 joint_angles = []
                 # 6关节
                 for motor in self.motors[:-1]:
