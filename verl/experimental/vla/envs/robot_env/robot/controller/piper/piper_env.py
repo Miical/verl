@@ -98,6 +98,20 @@ def _get_attr(obj: Any, key: str, default=None):
     return getattr(obj, key, default)
 
 
+def _sanitize_component_cfg(cfg_obj: Any) -> dict[str, Any]:
+    """把 dict/namespace 配置转为可用于 dataclass(**kwargs) 的参数字典。
+
+    会移除上层路由字段（例如 `type`），避免传入具体 config dataclass 时触发
+    `unexpected keyword argument 'type'`。
+    """
+    cfg_dict = cfg_obj if isinstance(cfg_obj, dict) else getattr(cfg_obj, "__dict__", {})
+    if cfg_dict is None:
+        return {}
+    cfg_dict = dict(cfg_dict)
+    cfg_dict.pop("type", None)
+    return cfg_dict
+
+
 def _normalize_runtime_cfg(cfg: Any) -> Any:
     """兼容旧配置入口：
     1) cfg.robot_config_path -> json(包含 env)
@@ -173,7 +187,7 @@ class PiperJointRobot:
         cam_cfg = getattr(cfg, "dabai_camera", None)
         if cam_cfg is None:
             return None
-        cam_cfg_dict = cam_cfg if isinstance(cam_cfg, dict) else getattr(cam_cfg, "__dict__", {})
+        cam_cfg_dict = _sanitize_component_cfg(cam_cfg)
         return OrbbecDabaiCamera(OrbbecDabaiCameraConfig(**cam_cfg_dict))
 
     def _build_realsense_camera(self, cfg: Any, side: str):
@@ -183,7 +197,7 @@ class PiperJointRobot:
         cam_cfg = getattr(cfg, key, None)
         if cam_cfg is None:
             return None
-        cam_cfg_dict = cam_cfg if isinstance(cam_cfg, dict) else getattr(cam_cfg, "__dict__", {})
+        cam_cfg_dict = _sanitize_component_cfg(cam_cfg)
         return RealSenseCamera(RealSenseCameraConfig(**cam_cfg_dict))
 
     def _build_teleop(self, cfg: Any):
@@ -192,7 +206,7 @@ class PiperJointRobot:
         teleop_cfg = getattr(cfg, "pico_vr", None)
         if teleop_cfg is None:
             return None
-        teleop_cfg_dict = teleop_cfg if isinstance(teleop_cfg, dict) else getattr(teleop_cfg, "__dict__", {})
+        teleop_cfg_dict = _sanitize_component_cfg(teleop_cfg)
         return PicoVrTeleop(PicoVrTeleopConfig(**teleop_cfg_dict))
 
     def connect(self):
