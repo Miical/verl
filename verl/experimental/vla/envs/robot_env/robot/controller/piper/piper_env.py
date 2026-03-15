@@ -1,11 +1,9 @@
 # !/usr/bin/env python
 
-import json
 import logging
 import os
 import sys
 import time
-from dataclasses import dataclass, field
 from types import SimpleNamespace
 from typing import Any
 
@@ -16,34 +14,39 @@ import torch
 
 logging.getLogger("can.interfaces.socketcan").setLevel(logging.ERROR)
 
-# 仅把 piper 本地目录加入 path，避免依赖外部安装的整套 lerobot 包
 _CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
 if _CURRENT_DIR not in sys.path:
     sys.path.insert(0, _CURRENT_DIR)
 
-# ===== 仅依赖三部分：camera / motor / teleop =====
 from lerobot.motors.piper.piper import PiperMotorsBus
 
 try:
     from lerobot.cameras.dabai.camera_dabai import OrbbecDabaiCamera
     from lerobot.cameras.dabai.configuration_dabai import OrbbecDabaiCameraConfig
-except Exception:  # pragma: no cover - 运行环境可能没装 dabai SDK
+except Exception:
     OrbbecDabaiCamera = None
     OrbbecDabaiCameraConfig = None
 
 try:
     from lerobot.cameras.realsense.camera_realsense import RealSenseCamera
     from lerobot.cameras.realsense.configuration_realsense import RealSenseCameraConfig
-except Exception:  # pragma: no cover - 运行环境可能没装 realsense SDK
+except Exception:
     RealSenseCamera = None
     RealSenseCameraConfig = None
 
 try:
     from lerobot.teleoperators.pico_vr.teleop_pico_vr import PicoVrTeleop
     from lerobot.teleoperators.pico_vr.config_pico_vr import PicoVrTeleopConfig
-except Exception:  # pragma: no cover - 运行环境可能没装 zmq 或 teleop 依赖
+except Exception:
     PicoVrTeleop = None
     PicoVrTeleopConfig = None
+
+
+DEFAULT_CAMERA_MAPPING = {
+    "front": "head_image",
+    "left": "left_wrist_image",
+    "right": "right_wrist_image",
+}
 
 
 def force_print(*args, **kwargs):
@@ -53,161 +56,109 @@ def force_print(*args, **kwargs):
 
 
 def images_encoding(imgs: list[np.ndarray]):
-    encode_data = []
+    encoded = []
     max_len = 0
     for img in imgs:
-        success, encoded_image = cv2.imencode(".jpg", img)
-        if not success:
-            encoded_image = np.zeros((1,), dtype=np.uint8)
-        jpeg_data = encoded_image.tobytes()
-        encode_data.append(jpeg_data)
-        max_len = max(max_len, len(jpeg_data))
-    return encode_data, max_len
+        ok, enc = cv2.imencode(".jpg", img)
+        if not ok:
+            enc = np.zeros((1,), dtype=np.uint8)
+        b = enc.tobytes()
+        encoded.append(b)
+        max_len = max(max_len, len(b))
+    return encoded, max_len
 
 
-@dataclass
-class _DefaultCfg:
-    can_name_left: str = "can0"
-    can_name_right: str = "can1"
-    baud_rate: int = 1_000_000
-    device: str = "cpu"
-    num_envs: int = 1
-    task_description: str = "catch_bowl"
-    camera_mapping: dict[str, str] = field(
-        default_factory=lambda: {
-            "front": "head_image",
-            "left": "left_wrist_image",
-            "right": "right_wrist_image",
-        }
-    )
-
-
-def _default_camera_mapping() -> dict[str, str]:
-    return {
-        "front": "head_image",
-        "left": "left_wrist_image",
-        "right": "right_wrist_image",
-    }
-
-
-def _get_attr(obj: Any, key: str, default=None):
-    if obj is None:
-        return default
-    if isinstance(obj, dict):
-        return obj.get(key, default)
-    return getattr(obj, key, default)
-
-
-def _sanitize_component_cfg(cfg_obj: Any) -> dict[str, Any]:
-    """把 dict/namespace 配置转为可用于 dataclass(**kwargs) 的参数字典。
-
-    会移除上层路由字段（例如 `type`），避免传入具体 config dataclass 时触发
-    `unexpected keyword argument 'type'`。
-    """
-    cfg_dict = cfg_obj if isinstance(cfg_obj, dict) else getattr(cfg_obj, "__dict__", {})
-    if cfg_dict is None:
+def _to_dict(cfg_obj: Any) -> dict[str, Any]:
+    if cfg_obj is None:
         return {}
-    cfg_dict = dict(cfg_dict)
-    cfg_dict.pop("type", None)
-    return cfg_dict
-
-
-def _normalize_runtime_cfg(cfg: Any) -> Any:
-    """兼容旧配置入口：
-    1) cfg.robot_config_path -> json(包含 env)
-    2) cfg.env.robot/teleop (Hydra/namespace)
-    3) 扁平字段 can_name_left/can_name_right
-    """
-    if cfg is None:
-        cfg = _DefaultCfg()
-
-    # 若传入 config 文件路径，优先读取
-    robot_config_path = _get_attr(cfg, "robot_config_path", None)
-    if robot_config_path:
-        with open(robot_config_path, "r", encoding="utf-8") as f:
-            loaded = json.load(f)
-        cfg_env = loaded.get("env", loaded)
+    if isinstance(cfg_obj, dict):
+        d = dict(cfg_obj)
     else:
-        cfg_env = _get_attr(cfg, "env", None)
+        d = dict(getattr(cfg_obj, "__dict__", {}))
+    d.pop("type", None)
+    return d
 
-    robot_cfg = _get_attr(cfg_env, "robot", None)
-    teleop_cfg = _get_attr(cfg_env, "teleop", None)
-    cameras_cfg = _get_attr(robot_cfg, "cameras", {}) or {}
 
-    can_name_left = _get_attr(cfg, "can_name_left", None) or _get_attr(robot_cfg, "can_name_left", "can_left")
-    can_name_right = _get_attr(cfg, "can_name_right", None) or _get_attr(robot_cfg, "can_name_right", "can_right")
-    baud_rate = _get_attr(cfg, "baud_rate", None) or _get_attr(robot_cfg, "baud_rate", 1_000_000)
-
-    task_description = _get_attr(cfg, "task_description", None) or _get_attr(cfg_env, "task", "catch_bowl")
-    device = _get_attr(cfg, "device", "cpu")
-    num_envs = _get_attr(cfg, "num_envs", 1)
-
-    camera_mapping = _get_attr(cfg, "camera_mapping", None)
-    if camera_mapping is None:
-        camera_mapping = _default_camera_mapping()
-
-    # 转换 camera 配置到当前实现字段
-    dabai_camera = _get_attr(cameras_cfg, "front", None)
-    realsense_left_camera = _get_attr(cameras_cfg, "left", None)
-    realsense_right_camera = _get_attr(cameras_cfg, "right", None)
-
+def build_fixed_test_cfg() -> SimpleNamespace:
     return SimpleNamespace(
-        can_name_left=can_name_left,
-        can_name_right=can_name_right,
-        baud_rate=baud_rate,
-        task_description=task_description,
-        device=device,
-        num_envs=num_envs,
-        camera_mapping=camera_mapping,
-        dabai_camera=dabai_camera,
-        realsense_left_camera=realsense_left_camera,
-        realsense_right_camera=realsense_right_camera,
-        pico_vr=teleop_cfg,
+        env=SimpleNamespace(
+            name="real_robot",
+            fps=50,
+            robot=SimpleNamespace(
+                can_name_left="can_left",
+                can_name_right="can_right",
+                baud_rate=1000000,
+                cameras={
+                    "front": {
+                        "serial_number_or_name": "CC1B25100EM",
+                        "width": 640,
+                        "height": 480,
+                        "fps": 30,
+                    },
+                    "left": {
+                        "serial_number_or_name": "242522071187",
+                        "width": 640,
+                        "height": 480,
+                        "fps": 30,
+                    },
+                    "right": {
+                        "serial_number_or_name": "327122075682",
+                        "width": 640,
+                        "height": 480,
+                        "fps": 30,
+                    },
+                },
+            ),
+            teleop=SimpleNamespace(
+                zmq_host="127.0.0.1",
+                zmq_port=5555,
+                left_pose_source="left_controller",
+                right_pose_source="right_controller",
+            ),
+        ),
+        device="cpu",
+        num_envs=1,
+        task_description="real_robot_hardware_smoke_test",
+        camera_mapping=DEFAULT_CAMERA_MAPPING.copy(),
     )
 
 
 class PiperJointRobot:
-    """最小双臂 Piper 机器人封装：joint 控制 + 3 相机 + pico_vr 干预信号。"""
+    def __init__(self, robot_cfg: Any, teleop_cfg: Any):
+        self.bus_left = PiperMotorsBus(robot_cfg.can_name_left, robot_cfg.baud_rate, motor_prefix="left")
+        self.bus_right = PiperMotorsBus(robot_cfg.can_name_right, robot_cfg.baud_rate, motor_prefix="right")
 
-    def __init__(self, cfg: Any):
-        self.cfg = cfg
-        self.bus_left = PiperMotorsBus(cfg.can_name_left, cfg.baud_rate, motor_prefix="left")
-        self.bus_right = PiperMotorsBus(cfg.can_name_right, cfg.baud_rate, motor_prefix="right")
+        cams = getattr(robot_cfg, "cameras", {}) or {}
+        self.cam_front = self._build_dabai_camera(cams.get("front"))
+        self.cam_left = self._build_realsense_camera(cams.get("left"))
+        self.cam_right = self._build_realsense_camera(cams.get("right"))
+        self.teleop = self._build_teleop(teleop_cfg)
 
-        self.cam_front = self._build_dabai_camera(cfg)
-        self.cam_left = self._build_realsense_camera(cfg, side="left")
-        self.cam_right = self._build_realsense_camera(cfg, side="right")
-
-        self.teleop = self._build_teleop(cfg)
         self.is_connected = False
 
     def _build_dabai_camera(self, cfg: Any):
         if OrbbecDabaiCamera is None or OrbbecDabaiCameraConfig is None:
             return None
-        cam_cfg = getattr(cfg, "dabai_camera", None)
-        if cam_cfg is None:
+        d = _to_dict(cfg)
+        if not d:
             return None
-        cam_cfg_dict = _sanitize_component_cfg(cam_cfg)
-        return OrbbecDabaiCamera(OrbbecDabaiCameraConfig(**cam_cfg_dict))
+        return OrbbecDabaiCamera(OrbbecDabaiCameraConfig(**d))
 
-    def _build_realsense_camera(self, cfg: Any, side: str):
+    def _build_realsense_camera(self, cfg: Any):
         if RealSenseCamera is None or RealSenseCameraConfig is None:
             return None
-        key = f"realsense_{side}_camera"
-        cam_cfg = getattr(cfg, key, None)
-        if cam_cfg is None:
+        d = _to_dict(cfg)
+        if not d:
             return None
-        cam_cfg_dict = _sanitize_component_cfg(cam_cfg)
-        return RealSenseCamera(RealSenseCameraConfig(**cam_cfg_dict))
+        return RealSenseCamera(RealSenseCameraConfig(**d))
 
     def _build_teleop(self, cfg: Any):
         if PicoVrTeleop is None or PicoVrTeleopConfig is None:
             return None
-        teleop_cfg = getattr(cfg, "pico_vr", None)
-        if teleop_cfg is None:
+        d = _to_dict(cfg)
+        if not d:
             return None
-        teleop_cfg_dict = _sanitize_component_cfg(teleop_cfg)
-        return PicoVrTeleop(PicoVrTeleopConfig(**teleop_cfg_dict))
+        return PicoVrTeleop(PicoVrTeleopConfig(**d))
 
     def connect(self):
         if self.is_connected:
@@ -228,7 +179,6 @@ class PiperJointRobot:
         self.is_connected = True
 
     def reset_to_home(self, wait_s: float = 2.0):
-        """复位到电机层定义的 home 位姿。"""
         if not self.is_connected:
             return
         self.bus_left.reset_pos(wait_s=wait_s)
@@ -246,7 +196,6 @@ class PiperJointRobot:
                 self.teleop.disconnect()
             except Exception:
                 pass
-        # ⚠️ 安全策略：默认不下发 DisableArm，避免停进程时机械臂掉电下坠
         self.bus_left.disconnect(disable_torque=False)
         self.bus_right.disconnect(disable_torque=False)
         self.is_connected = False
@@ -269,13 +218,12 @@ class PiperJointRobot:
 
         left_state = [left_pos.get(k, 0.0) for k in self.bus_left.motors]
         right_state = [right_pos.get(k, 0.0) for k in self.bus_right.motors]
-        state = np.asarray(left_state + right_state, dtype=np.float32)
 
         return {
             "front": self._safe_read_image(self.cam_front),
             "left": self._safe_read_image(self.cam_left),
             "right": self._safe_read_image(self.cam_right),
-            "state": state,
+            "state": np.asarray(left_state + right_state, dtype=np.float32),
         }
 
     def apply_joint_action(self, action_14: np.ndarray):
@@ -293,16 +241,13 @@ class PiperJointRobot:
     def get_intervention_action(self) -> tuple[bool, np.ndarray | None]:
         if self.teleop is None or not getattr(self.teleop, "is_connected", False):
             return False, None
-
         try:
             events = self.teleop.get_teleop_events()
             is_intervention = bool(events.get("is_intervention", False))
         except Exception:
-            is_intervention = False
-
+            return False, None
         if not is_intervention:
             return False, None
-
         try:
             teleop_action = self.teleop.get_action()
         except Exception:
@@ -312,21 +257,10 @@ class PiperJointRobot:
             return True, teleop_action.astype(np.float32)
         if isinstance(teleop_action, torch.Tensor):
             return True, teleop_action.detach().cpu().numpy().astype(np.float32)
-        if isinstance(teleop_action, dict):
-            # 兼容 dict 格式，按已有 14 维 joint 顺序抽取
-            ordered_keys = [
-                "left_joint_1", "left_joint_2", "left_joint_3", "left_joint_4", "left_joint_5", "left_joint_6", "left_gripper",
-                "right_joint_1", "right_joint_2", "right_joint_3", "right_joint_4", "right_joint_5", "right_joint_6", "right_gripper",
-            ]
-            arr = np.asarray([float(teleop_action.get(k, 0.0)) for k in ordered_keys], dtype=np.float32)
-            return True, arr
-
         return True, None
 
 
 class PiperJointEnv(gym.Env):
-    """极简 gym 环境：action 为 14 维双臂 joint，obs 为 state + 三路图像。"""
-
     def __init__(self, robot: PiperJointRobot):
         super().__init__()
         self.robot = robot
@@ -346,21 +280,17 @@ class PiperJointEnv(gym.Env):
         self.current_step = 0
         if not self.robot.is_connected:
             self.robot.connect()
-        # 每次 reset 时先回到安全初始位
         self.robot.reset_to_home(wait_s=2.0)
         obs = self.robot.get_observation()
         return obs, {"is_intervention": False}
 
     def step(self, action):
         action = np.asarray(action, dtype=np.float32).reshape(-1)
-
         intervene_flag, intervene_action = self.robot.get_intervention_action()
         final_action = intervene_action if (intervene_flag and intervene_action is not None) else action
-
         self.robot.apply_joint_action(final_action)
         obs = self.robot.get_observation()
         self.current_step += 1
-
         info = {
             "is_intervention": intervene_flag,
             "intervene_action": intervene_action,
@@ -373,31 +303,24 @@ class PiperJointEnv(gym.Env):
 
 
 class RealRobotEnvWrapper:
-    """对外兼容封装：reset/step 输出 test_env 侧预期字段。"""
-
-    def __init__(self, cfg, rank: int = 0, world_size: int = 1):
-        force_print(f"[RealRobotEnvWrapper] init rank={rank}, world_size={world_size}")
+    def __init__(self, cfg=None, rank: int = 0, world_size: int = 1):
         self.rank = rank
         self.world_size = world_size
+        if cfg is None:
+            cfg = build_fixed_test_cfg()
 
-        runtime_cfg = _normalize_runtime_cfg(cfg)
+        self.device = getattr(cfg, "device", "cpu")
+        self.num_envs = getattr(cfg, "num_envs", 1)
+        self.task_description = getattr(cfg, "task_description", "catch_bowl")
+        self.camera_mapping = getattr(cfg, "camera_mapping", DEFAULT_CAMERA_MAPPING.copy())
 
-        self.device = getattr(runtime_cfg, "device", "cpu")
-        self.num_envs = getattr(runtime_cfg, "num_envs", 1)
-        self.task_description = getattr(runtime_cfg, "task_description", "catch_bowl")
-        camera_mapping = getattr(runtime_cfg, "camera_mapping", None)
-        if camera_mapping is None:
-            camera_mapping = _default_camera_mapping()
-        self.camera_mapping = camera_mapping
-
-        self.robot = PiperJointRobot(runtime_cfg)
+        robot_cfg = cfg.env.robot
+        teleop_cfg = cfg.env.teleop
+        self.robot = PiperJointRobot(robot_cfg=robot_cfg, teleop_cfg=teleop_cfg)
         self.env = PiperJointEnv(self.robot)
 
     def _convert_obs_to_test_env_format(self, obs: dict[str, Any]) -> dict[str, Any]:
-        images_list = []
-        camera_names = []
-        if not isinstance(self.camera_mapping, dict):
-            self.camera_mapping = _default_camera_mapping()
+        images_list, camera_names = [], []
         for robot_cam_name, test_cam_name in self.camera_mapping.items():
             if robot_cam_name in obs:
                 images_list.append(obs[robot_cam_name])
@@ -413,8 +336,7 @@ class RealRobotEnvWrapper:
         images_dict = {}
         for i, cam_name in enumerate(camera_names):
             padded_bytes = encoded_data[i].ljust(max_len, b"\0")
-            img_array = np.array(np.frombuffer(padded_bytes, dtype=np.uint8))
-            images_dict[cam_name] = torch.from_numpy(img_array).unsqueeze(0)
+            images_dict[cam_name] = torch.from_numpy(np.array(np.frombuffer(padded_bytes, dtype=np.uint8))).unsqueeze(0)
 
         return {
             "images": images_dict,
@@ -424,11 +346,7 @@ class RealRobotEnvWrapper:
 
     @staticmethod
     def _normalize_action(action: Any) -> np.ndarray:
-        if isinstance(action, torch.Tensor):
-            action_np = action.detach().cpu().numpy().astype(np.float32)
-        else:
-            action_np = np.asarray(action, dtype=np.float32)
-
+        action_np = action.detach().cpu().numpy().astype(np.float32) if isinstance(action, torch.Tensor) else np.asarray(action, dtype=np.float32)
         action_np = action_np.reshape(-1)
         if action_np.shape[0] == 7:
             action_np = np.concatenate([action_np, np.zeros(7, dtype=np.float32)])
@@ -445,28 +363,22 @@ class RealRobotEnvWrapper:
     def step(self, action):
         action_np = self._normalize_action(action)
         obs, reward, terminated, truncated, info = self.env.step(action_np)
-
-        obs_converted = self._convert_obs_to_test_env_format(obs)
-        info_dict = {
-            "intervene_action": info.get("intervene_action", None),
+        return self._convert_obs_to_test_env_format(obs), float(reward), bool(terminated), bool(truncated), {
+            "intervene_action": info.get("intervene_action"),
             "intervene_flag": info.get("is_intervention", False),
         }
-        return obs_converted, float(reward), bool(terminated), bool(truncated), info_dict
 
     def close(self):
         self.env.close()
 
 
-def make_robot_env(cfg) -> tuple[gym.Env, Any]:
-    runtime_cfg = _normalize_runtime_cfg(cfg)
-    robot = PiperJointRobot(runtime_cfg)
-    env = PiperJointEnv(robot)
-    return env, robot.teleop
+def make_robot_env(cfg=None) -> tuple[gym.Env, Any]:
+    wrapper = RealRobotEnvWrapper(cfg=cfg)
+    return wrapper.env, wrapper.robot.teleop
 
 
 def make_processors(env, teleop_device, cfg, device: str = "cpu"):
     del env, teleop_device, cfg, device
-    # 新实现不再依赖 lerobot processor pipeline，保留函数仅为了兼容调用
     return None, None
 
 
@@ -476,79 +388,17 @@ def step_env_and_process_transition(env, transition, action, env_processor=None,
 
 
 if __name__ == "__main__":
-    # 直接在代码中写死一份可运行的配置（不走外部命令行传参）
-    # 如需调整，请直接修改下面这份配置。
-    cfg = SimpleNamespace(
-        env=SimpleNamespace(
-            name="real_robot",
-            fps=50,
-            robot=SimpleNamespace(
-                type="piper_follower_end_effector",
-                can_name_left="can_left",
-                can_name_right="can_right",
-                baud_rate=1000000,
-                cameras={
-                    "front": {
-                        "type": "orbbec_dabai",
-                        "serial_number_or_name": "CC1B25100EM",
-                        "width": 640,
-                        "height": 480,
-                        "fps": 30,
-                    },
-                    "left": {
-                        "type": "intelrealsense",
-                        "serial_number_or_name": "242522071187",
-                        "width": 640,
-                        "height": 480,
-                        "fps": 30,
-                    },
-                    "right": {
-                        "type": "intelrealsense",
-                        "serial_number_or_name": "327122075682",
-                        "width": 640,
-                        "height": 480,
-                        "fps": 30,
-                    },
-                },
-            ),
-            teleop=SimpleNamespace(
-                type="pico_vr",
-                left_pose_source="left_controller",
-                right_pose_source="right_controller",
-                translation_scale=1,
-                rotation_scale=1,
-                rotation_yaw_gain=0.1,
-                translation_clip=1.0,
-                rotation_clip=2.0,
-                translation_deadband=1e-4,
-                rotation_deadband=5e-3,
-                gripper_open=0.07,
-                gripper_close=0.0,
-                gripper_delta_gain=1.0,
-                gripper_deadband=1e-3,
-            ),
-        ),
-        device="cpu",
-        num_envs=1,
-        task_description="real_robot_hardware_smoke_test",
-        camera_mapping={
-            "front": "head_image",
-            "left": "left_wrist_image",
-            "right": "right_wrist_image",
-        },
-    )
+    cfg = build_fixed_test_cfg()
 
-    # 测试开关（按需在代码里改）
     RUN_RESET_AND_MOTION = True
     MOTION_STEPS = 40
     MOTION_HZ = 10.0
     MOTION_DELTA_RAD = 0.03
 
-    runtime_cfg_preview = _normalize_runtime_cfg(cfg)
     force_print("=" * 80)
     force_print("[PiperEnv Test] Start loading environment")
     force_print(
-        f"[PiperEnv Test] cfg={{left:{runtime_cfg_preview.can_name_left}, right:{runtime_cfg_preview.can_name_right}, baud:{runtime_cfg_preview.baud_rate}}}"
+        f"[PiperEnv Test] cfg={{left:{cfg.env.robot.can_name_left}, right:{cfg.env.robot.can_name_right}, baud:{cfg.env.robot.baud_rate}}}"
     )
 
     wrapper = None
@@ -556,41 +406,28 @@ if __name__ == "__main__":
         wrapper = RealRobotEnvWrapper(cfg=cfg, rank=0, world_size=1)
         force_print("[PiperEnv Test] ✅ RealRobotEnvWrapper initialized successfully")
 
-        if not RUN_RESET_AND_MOTION:
-            force_print("[PiperEnv Test] RUN_RESET_AND_MOTION=False, skip hardware reset/step")
-        else:
+        if RUN_RESET_AND_MOTION:
             force_print("[PiperEnv Test] Running REAL hardware reset() + motion test ...")
             obs = wrapper.reset()
             state = obs["state"]
-            force_print(
-                f"[PiperEnv Test] reset ok: keys={list(obs.keys())}, image_keys={list(obs['images'].keys())}, state_shape={state.shape}"
-            )
-
             base = np.asarray(state, dtype=np.float32).copy()
-            if base.shape[0] != 14:
-                raise RuntimeError(f"Unexpected state dim {base.shape[0]}, expected 14")
-
             dt = 1.0 / max(MOTION_HZ, 1e-3)
+
             for i in range(MOTION_STEPS):
                 t = i * dt
                 action = base.copy()
-                s = float(np.sin(2.0 * np.pi * 0.2 * t))
-                d = float(MOTION_DELTA_RAD * s)
-
-                # 双臂 joint_1 / joint_4 对称小幅运动（更容易观察，且不易触发 joint_2/joint_3 边界裁剪）
+                d = float(MOTION_DELTA_RAD * np.sin(2.0 * np.pi * 0.2 * t))
                 action[0] = base[0] + d
                 action[3] = base[3] - d
                 action[7] = base[7] + d
                 action[10] = base[10] - d
-
-                obs, reward, terminated, truncated, info = wrapper.step(action)
+                _, reward, terminated, truncated, info = wrapper.step(action)
                 if i % max(1, MOTION_STEPS // 10) == 0:
                     force_print(
                         f"[PiperEnv Test] step={i:03d}/{MOTION_STEPS}, d={d:.4f}, "
                         f"intervene={info.get('intervene_flag')}, reward={reward}, term={terminated}, trunc={truncated}"
                     )
                 time.sleep(dt)
-
             wrapper.step(base)
             force_print("[PiperEnv Test] Motion test finished and returned to base pose")
 
