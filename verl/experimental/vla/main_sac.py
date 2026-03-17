@@ -24,6 +24,7 @@ from omegaconf import OmegaConf
 
 from verl import DataProto
 from verl.experimental.vla.sac.sac_ray_trainer import RobRaySACTrainer
+from verl.experimental.vla.dataloader import build_dataloader_components
 from verl.trainer.constants_ppo import get_ppo_ray_runtime_env
 from verl.trainer.ppo.ray_trainer import ResourcePoolManager
 from verl.trainer.ppo.utils import Role
@@ -103,6 +104,12 @@ def main_task(config):
     # create datasets
     train_dataset = datasets.load_dataset("parquet", data_files=config.data.train_files)["train"]
     val_dataset = datasets.load_dataset("parquet", data_files=config.data.val_files)["train"]
+    if config.trainer.rlpd_enable:
+        rlpd_dataset, rlpd_sampler, rlpd_collate_fn = build_dataloader_components(
+            dataset_type=config.actor_rollout_ref.model.override_config.dataset_type,
+            repo_id="parquet",
+            root=config.data.rlpd_files,
+        )
 
     # instantiate trainer and start training
     trainer = RobRaySACTrainer(
@@ -115,6 +122,9 @@ def main_task(config):
         val_reward_fn=calculate_reward,
         train_dataset=train_dataset,
         val_dataset=val_dataset,
+        rlpd_dataset=rlpd_dataset if config.trainer.rlpd_enable else None,
+        rlpd_sampler=rlpd_sampler if config.trainer.rlpd_enable else None,
+        rlpd_collate_fn=rlpd_collate_fn if config.trainer.rlpd_enable else None,
     )
 
     trainer.init_workers()

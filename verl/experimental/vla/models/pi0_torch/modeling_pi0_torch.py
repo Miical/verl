@@ -318,6 +318,71 @@ class PI0ForActionPrediction(PreTrainedModel, SupportSACTraining):
         valid_f = valids.float().to(loss.device)
         return (loss * valid_f).sum() / valid_f.sum().clamp_min(1.0)
 
+    def process_dataset_batch(
+        self, 
+        dataset_batch: DataProto,
+        tokenizer,
+    ) -> dict[str, torch.Tensor]:
+
+        if self.config.dataset_type == "lerobot":
+            from .datasets.lerobot_dataset import LeRobotPi0DatasetInput
+            batch = LeRobotPi0DatasetInput.from_dataset_batch(dataset_batch)
+        elif self.config.dataset_type == "libero":
+            from .datasets.libero_dataset import LiberoPi0DatasetInput
+            batch = LiberoPi0DatasetInput.from_dataset_batch(dataset_batch)
+        else:
+            raise ValueError(f"Unknown dataset_type: {self.config.dataset_type}")
+
+        out = {}
+
+        # Process images
+        # s0
+        images, _ = self.image_transform.call_batch(batch.s0['images'])
+        out['s0.images'] = torch.stack(images, dim=1)
+        out['s0.image_masks'] = torch.stack(batch.s0['img_masks'], dim=1)
+        # s1
+        images, _ = self.image_transform.call_batch(batch.s1['images'])
+        out['s1.images'] = torch.stack(images, dim=1)
+        out['s1.image_masks'] = torch.stack(batch.s1['img_masks'], dim=1)
+
+        # Process language
+        # s0
+        lang_tokens, lang_masks = self.prompt_tokenizer_transform.call_batch(
+            {'task': batch.s0['task'], 'observation.state': batch.s0['state']},
+            tokenizer=tokenizer
+        )
+        out['s0.lang_tokens'] = lang_tokens
+        out['s0.lang_masks'] = lang_masks
+
+        # s1
+        lang_tokens, lang_masks = self.prompt_tokenizer_transform.call_batch(
+            {'task': batch.s1['task'], 'observation.state': batch.s1['state']},
+            tokenizer=tokenizer
+        )
+        out['s1.lang_tokens'] = lang_tokens
+        out['s1.lang_masks'] = lang_masks
+
+        # Process states
+        out['s0.states'] = self.state_normalize_transform(batch.s0['state'])
+        out['s1.states'] = self.state_normalize_transform(batch.s1['state'])
+
+        # Process actions
+        out['a0.full_action'] = self.action_normalize_transform(batch.a0['action'])
+        out['a1.full_action'] = self.action_normalize_transform(batch.a1['action'])
+
+        # Process other information
+        out['rewards'] = batch.rewards
+        out['valids'] = batch.valids
+        out['dones'] = batch.dones
+        out['positive_sample_mask'] = batch.positive_sample_mask
+        out["task_ids"] = torch.tensor(
+        [_stable_task_id(t) for t in batch.s0["task"]],
+        dtype=torch.long,
+        device=device,
+        )
+
+        return out
+
     # --- SAC Algorithm Support ---
 
     def _multi_heads_value(
@@ -596,3 +661,5 @@ class PI0ForActionPrediction(PreTrainedModel, SupportSACTraining):
         self.target_prefix_cross_attn.load_state_dict(t_cross_attn_sd, strict=True)
 
         self.target_state_token.data.mul_(1.0 - tau).add_(self.critic_state_token.data, alpha=tau)
+
+    
