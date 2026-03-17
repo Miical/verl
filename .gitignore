@@ -1,0 +1,8 @@
+/tmp/
+*.pt
+*.tar
+*.h5
+/datasets/
+/replay_pools/
+__pycache__/
+.ipynb_checkpoints/
