@@ -47,6 +47,31 @@ def beta_schedule(step, beta0, beta_min, T):
     return beta
 
 
+def _resolve_rlpd_task_ids(tasks, config, device: torch.device) -> torch.Tensor:
+    """Resolve offline RLPD task ids.
+
+    Real-robot training is usually single-task, so we default to a fixed placeholder
+    task id 0. For multi-task offline data, users can pass either:
+      - config.rlpd_task_to_id: dict[str, int]
+      - config.rlpd_single_task = False together with consistent task strings
+    """
+    tasks = [str(t) for t in tasks]
+
+    single_task = getattr(config, "rlpd_single_task", True)
+    single_task_id = int(getattr(config, "rlpd_single_task_id", 0))
+
+    if single_task:
+        return torch.full((len(tasks),), single_task_id, dtype=torch.long, device=device)
+
+    task_to_id = getattr(config, "rlpd_task_to_id", None)
+    if task_to_id is not None:
+        return torch.tensor([int(task_to_id[str(t)]) for t in tasks], dtype=torch.long, device=device)
+
+    unique_tasks = sorted(set(tasks))
+    inferred = {task: idx for idx, task in enumerate(unique_tasks)}
+    return torch.tensor([inferred[t] for t in tasks], dtype=torch.long, device=device)
+
+
 class PI0ForActionPrediction(PreTrainedModel, SupportSACTraining):
     config_class = PI0TorchConfig
     base_model_prefix = "pi0_torch"
@@ -371,14 +396,14 @@ class PI0ForActionPrediction(PreTrainedModel, SupportSACTraining):
         out['a1.full_action'] = self.action_normalize_transform(batch.a1['action'])
 
         # Process other information
-        out['rewards'] = batch.rewards
-        out['valids'] = batch.valids
-        out['dones'] = batch.dones
-        out['positive_sample_mask'] = batch.positive_sample_mask
-        out["task_ids"] = torch.tensor(
-        [_stable_task_id(t) for t in batch.s0["task"]],
-        dtype=torch.long,
-        device=device,
+        out['rewards'] = batch.rewards.to(out['s0.states'].device)
+        out['valids'] = batch.valids.to(out['s0.states'].device)
+        out['dones'] = batch.dones.to(out['s0.states'].device)
+        out['positive_sample_mask'] = batch.positive_sample_mask.to(out['s0.states'].device)
+        out['task_ids'] = _resolve_rlpd_task_ids(
+            tasks=batch.s0['task'],
+            config=self.config,
+            device=out['s0.states'].device,
         )
 
         return out

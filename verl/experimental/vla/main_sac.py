@@ -14,6 +14,7 @@
 
 
 import logging
+import os
 from pprint import pprint
 
 import datasets
@@ -68,48 +69,80 @@ def main_task(config):
     # instantiate tokenizer
     tokenizer = hf_tokenizer(local_path)
 
+    offline_only = bool(config.trainer.get("offline_only", False))
+
     # define worker classes
     if config.actor_rollout_ref.actor.strategy in ["fsdp", "fsdp2"]:
         assert config.actor_rollout_ref.actor.strategy == config.critic.strategy
-        from verl.experimental.vla.workers.env.env_worker import EnvWorker
         from verl.single_controller.ray import RayWorkerGroup
 
         from .fsdp_workers import RobActorRolloutRefWorker
 
         ray_worker_group_cls = RayWorkerGroup
+        EnvWorker = None
+        if not offline_only:
+            from verl.experimental.vla.workers.env.env_worker import EnvWorker
     else:
         raise NotImplementedError
 
     role_worker_mapping = {
         Role.ActorRollout: ray.remote(RobActorRolloutRefWorker),
-        Role.Env: ray.remote(EnvWorker),
     }
+    if not offline_only:
+        role_worker_mapping[Role.Env] = ray.remote(EnvWorker)
 
     # setup resource pool manager
     train_rollout_gpu_num = config.trainer.n_rollout_gpus_per_node
     train_rollout_nodes_num = config.trainer.nnodes
-    env_gpu_num = config.trainer.n_env_gpus_per_node
-    env_nodes_num = config.env.disagg_sim.nnodes if config.env.disagg_sim.enable else config.trainer.nnodes
 
     resource_pool_spec = {
         "train_rollout_pool": [train_rollout_gpu_num] * train_rollout_nodes_num,
-        "env_gpu_pool": [env_gpu_num] * env_nodes_num,
     }
     mapping = {
         Role.ActorRollout: "train_rollout_pool",
-        Role.Env: "env_gpu_pool",
     }
+
+    if not offline_only:
+        env_gpu_num = config.trainer.n_env_gpus_per_node
+        env_nodes_num = config.env.disagg_sim.nnodes if config.env.disagg_sim.enable else config.trainer.nnodes
+        resource_pool_spec["env_gpu_pool"] = [env_gpu_num] * env_nodes_num
+        mapping[Role.Env] = "env_gpu_pool"
+
     resource_pool_manager = ResourcePoolManager(resource_pool_spec=resource_pool_spec, mapping=mapping)
 
     # create datasets
-    train_dataset = datasets.load_dataset("parquet", data_files=config.data.train_files)["train"]
-    val_dataset = datasets.load_dataset("parquet", data_files=config.data.val_files)["train"]
+    rlpd_dataset = None
+    rlpd_sampler = None
+    rlpd_collate_fn = None
+    collate_fn = None
+    train_sampler = None
+
     if config.trainer.rlpd_enable:
+        dataset_type = config.actor_rollout_ref.model.override_config.dataset_type
+        rlpd_root = config.data.rlpd_files
+        rlpd_repo_id = OmegaConf.select(config, "data.rlpd_repo_id")
+        if rlpd_repo_id is None:
+            if dataset_type == "lerobot":
+                rlpd_repo_id = os.path.basename(str(rlpd_root).rstrip("/")) or "lerobot"
+            else:
+                rlpd_repo_id = "parquet"
+
         rlpd_dataset, rlpd_sampler, rlpd_collate_fn = build_dataloader_components(
-            dataset_type=config.actor_rollout_ref.model.override_config.dataset_type,
-            repo_id="parquet",
-            root=config.data.rlpd_files,
+            dataset_type=dataset_type,
+            repo_id=rlpd_repo_id,
+            root=rlpd_root,
         )
+
+    if offline_only:
+        assert config.trainer.rlpd_enable, "offline_only=True requires trainer.rlpd_enable=True"
+        assert rlpd_dataset is not None, "offline_only=True requires a valid rlpd_dataset"
+        train_dataset = rlpd_dataset
+        val_dataset = rlpd_dataset
+        collate_fn = rlpd_collate_fn
+        train_sampler = rlpd_sampler
+    else:
+        train_dataset = datasets.load_dataset("parquet", data_files=config.data.train_files)["train"]
+        val_dataset = datasets.load_dataset("parquet", data_files=config.data.val_files)["train"]
 
     # instantiate trainer and start training
     trainer = RobRaySACTrainer(
@@ -122,6 +155,8 @@ def main_task(config):
         val_reward_fn=calculate_reward,
         train_dataset=train_dataset,
         val_dataset=val_dataset,
+        collate_fn=collate_fn,
+        train_sampler=train_sampler,
         rlpd_dataset=rlpd_dataset if config.trainer.rlpd_enable else None,
         rlpd_sampler=rlpd_sampler if config.trainer.rlpd_enable else None,
         rlpd_collate_fn=rlpd_collate_fn if config.trainer.rlpd_enable else None,

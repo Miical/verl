@@ -229,7 +229,9 @@ class RobRaySACTrainer(RayPPOTrainer):
     def init_workers(self):
         self.resource_pool_manager.create_resource_pool()
 
-        if self.config.env.disagg_sim.enable:
+        offline_only = bool(self.config.trainer.get("offline_only", False))
+
+        if (not offline_only) and self.config.env.disagg_sim.enable:
             # pin EnvWorker to Simulator GPU nodes
             self.resource_pool_manager.get_resource_pool(Role.Env).accelerator_type = "sim"
             self.resource_pool_manager.get_resource_pool(Role.ActorRollout).accelerator_type = "train_rollout"
@@ -244,11 +246,12 @@ class RobRaySACTrainer(RayPPOTrainer):
         )
         self.resource_pool_to_cls[resource_pool]["actor_rollout"] = actor_rollout_cls
 
-        assert Role.Env in self.role_worker_mapping
-        if Role.Env in self.role_worker_mapping:
-            resource_pool = self.resource_pool_manager.get_resource_pool(Role.Env)
-            env_cls = RayClassWithInitArgs(self.role_worker_mapping[Role.Env], config=self.config.env)
-            self.resource_pool_to_cls[resource_pool]["env"] = env_cls
+        if not offline_only:
+            assert Role.Env in self.role_worker_mapping
+            if Role.Env in self.role_worker_mapping:
+                resource_pool = self.resource_pool_manager.get_resource_pool(Role.Env)
+                env_cls = RayClassWithInitArgs(self.role_worker_mapping[Role.Env], config=self.config.env)
+                self.resource_pool_to_cls[resource_pool]["env"] = env_cls
 
         all_wg = {}
         wg_kwargs = {}
@@ -281,10 +284,10 @@ class RobRaySACTrainer(RayPPOTrainer):
 
         self.actor_rollout_wg = all_wg["actor_rollout"]
         self.actor_rollout_wg.init_model()
-        self.env_wg = all_wg["env"]
+        self.env_wg = all_wg["env"] if "env" in all_wg else None
 
         self.async_rollout_mode = False
-        if self.config.actor_rollout_ref.rollout.mode == "async_envloop":
+        if (not offline_only) and self.config.actor_rollout_ref.rollout.mode == "async_envloop":
             from verl.experimental.vla.env_loop import EnvLoop
 
             self.async_rollout_mode = True
@@ -325,8 +328,10 @@ class RobRaySACTrainer(RayPPOTrainer):
         # load checkpoint before doing anything
         self._load_checkpoint()
 
+        offline_only = bool(self.config.trainer.get("offline_only", False))
+
         # perform validation before training
-        if self.val_reward_fn is not None and self.config.trainer.get("val_before_train", True):
+        if (not offline_only) and self.val_reward_fn is not None and self.config.trainer.get("val_before_train", True):
             val_metrics = self._validate()
             assert val_metrics, f"{val_metrics=}"
             pprint(f"Initial validation metrics: {val_metrics}")
@@ -334,11 +339,15 @@ class RobRaySACTrainer(RayPPOTrainer):
             if self.config.trainer.get("val_only", False):
                 return
 
-        self.total_training_steps = (
-            self.config.trainer.total_epochs
-            * len(self.train_dataloader)
-            * self.config.trainer.rollout_interval
-        )
+        if offline_only:
+            assert self.rlpd_dataloader is not None, "offline_only=True requires rlpd_dataloader"
+            self.total_training_steps = self.config.trainer.total_epochs * len(self.rlpd_dataloader)
+        else:
+            self.total_training_steps = (
+                self.config.trainer.total_epochs
+                * len(self.train_dataloader)
+                * self.config.trainer.rollout_interval
+            )
         progress_bar = tqdm(total=self.total_training_steps, initial=self.global_steps, desc="Training Progress")
 
         self.global_steps += 1
@@ -359,6 +368,100 @@ class RobRaySACTrainer(RayPPOTrainer):
             rlpd_dataloader_iter = itertools.cycle(self.rlpd_dataloader)
 
         for epoch in range(self.config.trainer.total_epochs):
+            if offline_only:
+                assert self.rlpd_dataloader is not None
+                print(f"Starting offline-only epoch {epoch}, rlpd dataloader length: {len(self.rlpd_dataloader)}")
+
+                for offline_step, rlpd_batch_raw in enumerate(self.rlpd_dataloader):
+                    metrics = {}
+                    timing_raw = {}
+                    is_last_step = self.global_steps >= self.total_training_steps
+
+                    with marked_timer("start_profile", timing_raw):
+                        self._start_profiling(
+                            (not prev_step_profile and curr_step_profile)
+                            if self.config.global_profiler.profile_continuous_steps
+                            else curr_step_profile
+                        )
+
+                    with marked_timer("step", timing_raw):
+                        rlpd_batch = DataProto.from_single_dict(rlpd_batch_raw)
+                        rlpd_batch = self.actor_rollout_wg.process_dataset_batch(rlpd_batch).get()
+                        rlpd_batch = select_required_train_fields(rlpd_batch, tag="offline-only RLPD batch")
+
+                        rlpd_batch.meta_info["global_token_num"] = [0]
+                        rlpd_batch.meta_info["global_steps"] = self.global_steps
+
+                        metrics["data/offline_reward_mean"] = rlpd_batch.batch["rewards"].float().mean().item()
+                        metrics["data/offline_done_ratio"] = rlpd_batch.batch["dones"].float().mean().item()
+                        metrics["data/offline_positive_ratio"] = rlpd_batch.batch["positive_sample_mask"].float().mean().item()
+
+                        with marked_timer("update_actor", timing_raw, color="red"):
+                            actor_output = self.actor_rollout_wg.update_actor(rlpd_batch)
+
+                        actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
+                        metrics.update(actor_output_metrics)
+
+                    esi_close_to_expiration = should_save_ckpt_esi(
+                        max_steps_duration=self.max_steps_duration,
+                        redundant_time=self.config.trainer.esi_redundant_time,
+                    )
+
+                    if self.config.trainer.save_freq > 0 and (
+                        is_last_step
+                        or self.global_steps % self.config.trainer.save_freq == 0
+                        or esi_close_to_expiration
+                    ):
+                        if esi_close_to_expiration:
+                            print("Force saving checkpoint: ESI instance expiration approaching.")
+                        with marked_timer("save_checkpoint", timing_raw, color="green"):
+                            self._save_checkpoint()
+
+                    with marked_timer("stop_profile", timing_raw):
+                        next_step_profile = (
+                            self.global_steps + 1 in self.config.global_profiler.steps
+                            if self.config.global_profiler.steps is not None
+                            else False
+                        )
+                        self._stop_profiling(
+                            (curr_step_profile and not next_step_profile)
+                            if self.config.global_profiler.profile_continuous_steps
+                            else curr_step_profile
+                        )
+                        prev_step_profile = curr_step_profile
+                        curr_step_profile = next_step_profile
+
+                    steps_duration = timing_raw["step"]
+                    self.max_steps_duration = max(self.max_steps_duration, steps_duration)
+
+                    metrics.update(
+                        {
+                            "training/global_step": self.global_steps,
+                            "training/epoch": epoch,
+                            "training/offline_step": offline_step,
+                        }
+                    )
+
+                    logger.log(data=metrics, step=self.global_steps)
+                    progress_bar.update(1)
+                    self.global_steps += 1
+
+                    if (
+                        hasattr(self.config.actor_rollout_ref.actor, "profiler")
+                        and self.config.actor_rollout_ref.actor.profiler.tool == "torch_memory"
+                    ):
+                        self.actor_rollout_wg.dump_memory_snapshot(
+                            tag=f"post_update_step{self.global_steps}",
+                            sub_dir=f"step{self.global_steps}",
+                        )
+
+                    if is_last_step:
+                        pprint(f"Final validation metrics: {last_val_metrics}")
+                        progress_bar.close()
+                        return
+
+                continue
+
             train_iter = iter(self.train_dataloader)
             next_batch_dict = next(train_iter)
             dataloader_len = len(self.train_dataloader)
