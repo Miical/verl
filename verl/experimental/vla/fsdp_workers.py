@@ -314,7 +314,8 @@ class RobActorRolloutRefWorker(ActorRolloutRefWorker):
                     config=self.config.actor, actor_module=self.actor_module_fsdp, actor_optimizer=self.actor_optimizer
                 )
 
-        if self._is_rollout:
+        offline_only = bool(self.config.get("offline_only", False))
+        if self._is_rollout and not offline_only:
             self._build_rollout(trust_remote_code=self.config.model.get("trust_remote_code", False))
 
         if self._is_actor:

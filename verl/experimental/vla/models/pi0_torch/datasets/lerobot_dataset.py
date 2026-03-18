@@ -4,7 +4,7 @@ from typing_extensions import override
 from verl.protocol import DataProto
 
 from .base import Pi0DatasetInput
-from .utils import pad_last_dim_to
+from .utils import pad_last_dim_to, pad_dim_to
 
 
 def _get_required_image(batch: DataProto, key: str) -> torch.Tensor:
@@ -36,6 +36,7 @@ class LeRobotPi0DatasetInput(Pi0DatasetInput):
         device = batch.batch["t0.observation.state"].device
         batch_size = batch.batch["t0.observation.state"].shape[0]
 
+        # state
         input.s0 = {
             "images": {
                 "observation.images.cam_high": cam_high_t0,
@@ -45,9 +46,9 @@ class LeRobotPi0DatasetInput(Pi0DatasetInput):
             "img_masks": [
                 torch.ones((batch_size,), dtype=torch.bool, device=device),
                 torch.ones((batch_size,), dtype=torch.bool, device=device),
-                torch.zeros((batch_size,), dtype=torch.bool, device=device),
+                torch.ones((batch_size,), dtype=torch.bool, device=device),
             ],
-            "task": list(batch.non_tensor_batch["t0.task"]),
+            "task": ["catch_bowl"] * batch_size,
             "state": pad_last_dim_to(batch.batch["t0.observation.state"], 32),
         }
 
@@ -60,21 +61,40 @@ class LeRobotPi0DatasetInput(Pi0DatasetInput):
             "img_masks": [
                 torch.ones((batch_size,), dtype=torch.bool, device=device),
                 torch.ones((batch_size,), dtype=torch.bool, device=device),
-                torch.zeros((batch_size,), dtype=torch.bool, device=device),
+                torch.ones((batch_size,), dtype=torch.bool, device=device),
             ],
-            "task": list(batch.non_tensor_batch["t1.task"]),
+            "task": ["catch_bowl"] * batch_size,
             "state": pad_last_dim_to(batch.batch["t1.observation.state"], 32),
         }
 
-        input.a0 = {
-            "action": pad_last_dim_to(batch.batch["t0.action"], 32),
-        }
-        input.a1 = {
-            "action": pad_last_dim_to(batch.batch["t1.action"], 32),
-        }
+        # action
+        a0 = batch.batch["t0.action"]
+        a1 = batch.batch["t1.action"]
 
-        done_key = "t1.next.done" if "t1.next.done" in batch.batch else "t0.next.done"
-        done = batch.batch[done_key].bool()
+        if a0.ndim == 2:
+            a0 = a0.unsqueeze(1)
+        if a1.ndim == 2:
+            a1 = a1.unsqueeze(1)
+
+        a0 = pad_last_dim_to(a0, 32)
+        a1 = pad_last_dim_to(a1, 32)
+        a0 = pad_dim_to(a0, dim=1, target_size=50)
+        a1 = pad_dim_to(a1, dim=1, target_size=50)
+
+        input.a0 = {"action": a0}
+        input.a1 = {"action": a1}
+
+        # done / reward
+        done = None
+        for done_key in ["t1.next.done", "t0.next.done", "next.done"]:
+            if done_key in batch.batch:
+                done = batch.batch[done_key].bool()
+                break
+
+        if done is None:
+            done = torch.zeros((batch_size,), dtype=torch.bool, device=device)
+
+        done = done.view(batch_size)
 
         input.rewards = done.float()
         input.valids = torch.ones((batch_size,), dtype=torch.bool, device=device)

@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-
 import logging
 import os
 from pprint import pprint
@@ -21,11 +20,11 @@ import datasets
 import hydra
 import ray
 import torch
-from omegaconf import OmegaConf
+from omegaconf import OmegaConf, open_dict
 
 from verl import DataProto
-from verl.experimental.vla.sac.sac_ray_trainer import RobRaySACTrainer
 from verl.experimental.vla.dataloader import build_dataloader_components
+from verl.experimental.vla.sac.sac_ray_trainer import RobRaySACTrainer
 from verl.trainer.constants_ppo import get_ppo_ray_runtime_env
 from verl.trainer.ppo.ray_trainer import ResourcePoolManager
 from verl.trainer.ppo.utils import Role
@@ -40,8 +39,7 @@ def calculate_reward(data: DataProto, return_dict: bool = False) -> torch.Tensor
     reward_per_step = complete_tensor.float()
     if return_dict:
         return {"reward_tensor": reward_per_step}
-    else:
-        return reward_per_step
+    return reward_per_step
 
 
 @hydra.main(config_path="config", config_name="rob_sac_trainer", version_base=None)
@@ -59,23 +57,24 @@ def main(config):
 
 @ray.remote
 def main_task(config):
-    # print initial config
-    pprint(OmegaConf.to_container(config, resolve=True))  # resolve=True will eval symbol values
+    pprint(OmegaConf.to_container(config, resolve=True))
     OmegaConf.resolve(config)
-
-    # download the checkpoint from hdfs
-    local_path = copy_local_path_from_hdfs(config.actor_rollout_ref.model.path)
-
-    # instantiate tokenizer
-    tokenizer = hf_tokenizer(local_path)
 
     offline_only = bool(config.trainer.get("offline_only", False))
 
-    # define worker classes
+    # propagate offline flag into actor_rollout worker config so worker-side code can branch on it
+    with open_dict(config.actor_rollout_ref):
+        config.actor_rollout_ref.offline_only = offline_only
+        if offline_only:
+            # rollout should never be built in offline-only mode, but keep TP conservative anyway
+            config.actor_rollout_ref.rollout.tensor_model_parallel_size = 1
+
+    local_path = copy_local_path_from_hdfs(config.actor_rollout_ref.model.path)
+    tokenizer = hf_tokenizer(local_path)
+
     if config.actor_rollout_ref.actor.strategy in ["fsdp", "fsdp2"]:
         assert config.actor_rollout_ref.actor.strategy == config.critic.strategy
         from verl.single_controller.ray import RayWorkerGroup
-
         from .fsdp_workers import RobActorRolloutRefWorker
 
         ray_worker_group_cls = RayWorkerGroup
@@ -85,22 +84,15 @@ def main_task(config):
     else:
         raise NotImplementedError
 
-    role_worker_mapping = {
-        Role.ActorRollout: ray.remote(RobActorRolloutRefWorker),
-    }
+    role_worker_mapping = {Role.ActorRollout: ray.remote(RobActorRolloutRefWorker)}
     if not offline_only:
         role_worker_mapping[Role.Env] = ray.remote(EnvWorker)
 
-    # setup resource pool manager
     train_rollout_gpu_num = config.trainer.n_rollout_gpus_per_node
     train_rollout_nodes_num = config.trainer.nnodes
 
-    resource_pool_spec = {
-        "train_rollout_pool": [train_rollout_gpu_num] * train_rollout_nodes_num,
-    }
-    mapping = {
-        Role.ActorRollout: "train_rollout_pool",
-    }
+    resource_pool_spec = {"train_rollout_pool": [train_rollout_gpu_num] * train_rollout_nodes_num}
+    mapping = {Role.ActorRollout: "train_rollout_pool"}
 
     if not offline_only:
         env_gpu_num = config.trainer.n_env_gpus_per_node
@@ -110,7 +102,6 @@ def main_task(config):
 
     resource_pool_manager = ResourcePoolManager(resource_pool_spec=resource_pool_spec, mapping=mapping)
 
-    # create datasets
     rlpd_dataset = None
     rlpd_sampler = None
     rlpd_collate_fn = None
@@ -144,7 +135,6 @@ def main_task(config):
         train_dataset = datasets.load_dataset("parquet", data_files=config.data.train_files)["train"]
         val_dataset = datasets.load_dataset("parquet", data_files=config.data.val_files)["train"]
 
-    # instantiate trainer and start training
     trainer = RobRaySACTrainer(
         config=config,
         tokenizer=tokenizer,

@@ -2,41 +2,25 @@
 set -x
 set -e
 
-# =========================
-# Paths
-# =========================
 RLPD_FILES="/shared_disk/users/yejun.zeng/datasets/huggingface/lerobot/catch_bowl"
 SFT_MODEL_PATH="/shared_disk/users/weijie.ke/weight/giga-openpi/pick_catch_bowl_new_yag"
 TOKENIZER_PATH="$SFT_MODEL_PATH"
 
 OUTPUT_DIR="/shared_disk/users/weijie.ke/offline_rlpd_runs/catch_bowl_offline_only"
-VIDEO_OUTPUT="${OUTPUT_DIR}/video"
 
-# =========================
-# Cluster / GPU
-# =========================
 NUM_NODES=1
 NUM_GPUS=4
-
-# 纯离线：不给 env GPU
 NUM_ENV_GPUS=0
-NUM_ROLLOUT_GPUS=$NUM_GPUS
+NUM_ROLLOUT_GPUS=4
 
-# =========================
-# Training
-# =========================
 RLPD_BATCH_SIZE=64
 TOTAL_EPOCHS=50
 MICRO_BATCH_SIZE=8
 LR=1e-5
-BC_LOSS_COEF=0.2
 
 PROJECT_NAME="offline_rlpd"
 EXPERIMENT_NAME="catch_bowl_offline_only"
 
-# =========================
-# Python
-# =========================
 ISSC_PYTHON="/workspace/isaaclab/_isaac_sim/python.sh"
 PYTHON=python
 if [ -f "$ISSC_PYTHON" ]; then
@@ -45,11 +29,8 @@ fi
 
 export VERL_LOGGING_LEVEL=INFO
 mkdir -p "$OUTPUT_DIR"
-mkdir -p "$VIDEO_OUTPUT"
 
 gpu_name=$(nvidia-smi --query-gpu=name --format=csv,noheader,nounits | head -n 1)
-
-# Hopper 上避免 mujoco 警告；纯离线其实基本不会用到 env，但保留无妨
 if echo "$gpu_name" | grep "NVIDIA H"; then
     echo "enable MUJOCO_GL=osmesa in Hopper"
     export MUJOCO_GL=osmesa
@@ -86,7 +67,7 @@ $PYTHON -m verl.experimental.vla.main_sac \
     actor_rollout_ref.actor.grad_clip=1.0 \
     actor_rollout_ref.actor.entropy_coeff=0.0 \
     actor_rollout_ref.actor.fsdp_config.model_dtype=bfloat16 \
+    actor_rollout_ref.actor.fsdp_config.wrap_policy.transformer_layer_cls_to_wrap=[SiglipEncoderLayer,GemmaDecoderLayerWithExpert] \
     actor_rollout_ref.model.enable_gradient_checkpointing=False \
     actor_rollout_ref.model.use_remove_padding=False \
-    actor_rollout_ref.model.trust_remote_code=False \
-    +actor_rollout_ref.actor.sac.bc_loss_coef=$BC_LOSS_COEF
+    actor_rollout_ref.model.trust_remote_code=False
