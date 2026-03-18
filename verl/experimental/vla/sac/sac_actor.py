@@ -405,8 +405,8 @@ class RobDataParallelSACActor(BaseSACActor):
         if not self.actor_ema_initialized:
             self._init_actor_ema()
 
-        self._force_set_lr(self.actor_optimizer, 5e-6)
-        self._force_set_lr(self.critic_optimizer, 1e-4)
+        # self._force_set_lr(self.actor_optimizer, 5e-6)
+        # self._force_set_lr(self.critic_optimizer, 1e-4)
 
         if "empty_batch" not in data.meta_info:
             task_ids = data.batch["task_ids"]

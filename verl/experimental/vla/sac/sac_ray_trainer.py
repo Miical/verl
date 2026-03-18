@@ -285,7 +285,6 @@ class RobRaySACTrainer(RayPPOTrainer):
         self.total_training_steps = self.config.trainer.total_epochs * len(self.train_dataloader) * self.config.trainer.rollout_interval
         progress_bar = tqdm(total=self.total_training_steps, initial=self.global_steps, desc="Training Progress")
 
-        # we start from step 1
         self.global_steps += 1
         last_val_metrics = None
         self.max_steps_duration = 0
@@ -327,6 +326,8 @@ class RobRaySACTrainer(RayPPOTrainer):
                         need_rollout = (training_step == 0) or self.global_steps < warm_rollout_steps
                         if warm_rollout_steps <= self.global_steps < self.config.actor_rollout_ref.actor.critic_warmup_steps:
                             need_rollout = False
+                        if need_rollout and next_rollout_batch is None:
+                            break
 
                         actor_input = None
                         if need_rollout:
