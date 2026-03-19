@@ -58,9 +58,10 @@ The JAX inference path requires the OpenPI source code (not installed as a packa
 
 ```bash
 git clone https://github.com/Physical-Intelligence/openpi.git /root/openpi
+cd /root/openpi && git checkout e6b0441
 ```
 
-No modifications to OpenPI source are needed. The run script adds it to PYTHONPATH automatically.
+Verified working commit: `e6b0441` (Implement gsutil download for GCS URLs (#901)). No modifications to OpenPI source are needed. The run script adds it to PYTHONPATH automatically.
 
 ### Required Data Files
 
