@@ -67,6 +67,9 @@ class PI0RolloutRob(NaiveRolloutRob):
                 requires_grad=False,
             ).detach().float().reshape(-1)
 
+        raw_state = prompts.batch["state"]  # (B, 7) raw env state: pos(3)+axisangle(3)+gripper(1)
+        output.action[:, :, :6] += raw_state[:, :6].unsqueeze(1)
+
         tensor_batch = {
             "action": output.action,
             "full_action": a["full_action"],
