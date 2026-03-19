@@ -53,7 +53,7 @@ NUM_STAGE=2                                    # number of pipeline stages
 NUM_ENV=1                                      # number of envs per env worker
 
 NUM_ACTION_CHUNKS=10                           # number of action chunks
-MAX_EPISODE_STEPS=510                          # max episode steps for each env
+MAX_EPISODE_STEPS=300                          # max episode steps for each env
                                                # max_interactions = MAX_EPISODE_STEPS / num_action_chunks
 
 # Training Config

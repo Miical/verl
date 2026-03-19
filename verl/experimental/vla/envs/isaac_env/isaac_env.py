@@ -13,7 +13,10 @@
 # limitations under the License.
 
 import logging
+import math
 import os
+import re
+from pathlib import Path
 from typing import Optional
 
 import gymnasium as gym
@@ -29,6 +32,11 @@ from verl.experimental.vla.envs.action_utils import (
 )
 
 logger = logging.getLogger(__name__)
+
+HDF5_SEARCH_PATHS = [
+    Path("/root/data/IsaacLabPlayGround_Dataset/libero/assembled_hdf5"),
+    Path("/root/RobotLearningLab/benchmarks/datasets/libero/assembled_hdf5"),
+]
 
 
 class IsaacEnv(gym.Env):
@@ -380,23 +388,93 @@ class IsaacEnv(gym.Env):
     def get_state(self):
         return None
 
+    def _find_hdf5_file(self, task_suite_name: str, task_id: int) -> Optional[Path]:
+        """Locate the HDF5 demo file for the given task suite and task id."""
+        pattern = f"{task_suite_name}_task{task_id}_*_demo.hdf5"
+        for search_dir in HDF5_SEARCH_PATHS:
+            if not search_dir.exists():
+                continue
+            matches = list(search_dir.glob(pattern))
+            if matches:
+                logger.info(f"Found HDF5 file: {matches[0]}")
+                return matches[0]
+        logger.warning(f"No HDF5 file found for {task_suite_name} task {task_id}")
+        return None
+
+    def _load_hdf5_initial_state(self, task_id: int, episode_hint: int = 0):
+        """Load initial state from the HDF5 demo dataset.
+
+        Returns the initial_state dict (on self.device) or None if not available.
+        """
+        from isaaclab.utils.datasets import HDF5DatasetFileHandler
+
+        hdf5_path = self._find_hdf5_file(self.task_suite_name, task_id)
+        if hdf5_path is None:
+            return None
+
+        handler = HDF5DatasetFileHandler()
+        handler.open(str(hdf5_path))
+        try:
+            num_episodes = handler.get_num_episodes()
+            if num_episodes == 0:
+                return None
+
+            episode_names = list(handler.get_episode_names())
+            episode_map = {}
+            for name in episode_names:
+                m = re.search(r"(\d+)", name)
+                if m:
+                    episode_map[int(m.group(1))] = name
+
+            ep_idx = episode_hint % num_episodes
+            sorted_indices = sorted(episode_map.keys())
+            if ep_idx < len(sorted_indices):
+                ep_name = episode_map[sorted_indices[ep_idx]]
+            else:
+                ep_name = episode_names[0]
+
+            episode_data = handler.load_episode(ep_name, self.device)
+            if episode_data is None:
+                return None
+
+            initial_state = episode_data.get_initial_state()
+            if initial_state is None:
+                logger.warning(f"No initial_state in episode {ep_name}")
+            else:
+                logger.info(f"Loaded initial state from {hdf5_path.name} episode {ep_name}")
+            return initial_state
+        finally:
+            handler.close()
+
     def reset_envs_to_state_ids(self, state_ids_list, task_ids_list):
         logger.info(f"IsaacEnv reset_envs_to_state_ids task_ids_list: {task_ids_list}")
         assert len(set(task_ids_list)) == 1, "Isaac env only support single task"
 
-        self._init_env(task_ids_list[0])
+        task_id = task_ids_list[0]
+        self._init_env(task_id)
 
         raw_obs, infos = self.env.reset()
         env_idx = np.arange(self.num_envs)
+
+        episode_hint = int(state_ids_list[0]) if state_ids_list else 0
+        initial_state = self._load_hdf5_initial_state(task_id, episode_hint=episode_hint)
+
+        if initial_state is not None:
+            env_ids_tensor = torch.arange(self.num_envs, device=self.device)
+            raw_obs, infos = self.env.reset_to(initial_state, env_ids_tensor, is_relative=True)
+            logger.info("Reset environment to HDF5 initial state")
+        else:
+            logger.warning("No HDF5 initial state available, using default reset")
+
         self._reset_metrics(env_idx)
         self.elapsed_steps = np.zeros(self.num_envs, dtype=np.int32)
 
         is_abs_action = "IK-Abs" in (self.task_name or "")
         for _ in range(10):
             if is_abs_action:
-                eef_pose = raw_obs["policy"]["eef_pose"].to(self.device)
-                gripper_pos = raw_obs["policy"]["gripper_pos"].to(self.device)
-                hold_action = torch.cat([eef_pose, gripper_pos[..., 0:1]], dim=-1)
+                eef_pose = raw_obs["policy"]["eef_pose"].to(self.device)     # (num_envs, 7): pos3 + quat_wxyz4
+                gripper_pos = raw_obs["policy"]["gripper_pos"].to(self.device)  # (num_envs, 2)
+                hold_action = torch.cat([eef_pose, gripper_pos[..., 0:1]], dim=-1)  # (num_envs, 8)
             else:
                 env_action_dim = self.env.action_space.shape[-1]
                 hold_action = torch.zeros((self.num_envs, env_action_dim), device=self.device)
