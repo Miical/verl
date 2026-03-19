@@ -36,7 +36,6 @@ class LeRobotPi0DatasetInput(Pi0DatasetInput):
         device = batch.batch["t0.observation.state"].device
         batch_size = batch.batch["t0.observation.state"].shape[0]
 
-        # state
         input.s0 = {
             "images": {
                 "observation.images.cam_high": cam_high_t0,
@@ -67,14 +66,13 @@ class LeRobotPi0DatasetInput(Pi0DatasetInput):
             "state": pad_last_dim_to(batch.batch["t1.observation.state"], 32),
         }
 
-        # action
         a0 = batch.batch["t0.action"]
         a1 = batch.batch["t1.action"]
 
-        if a0.ndim == 2:
-            a0 = a0.unsqueeze(1)
-        if a1.ndim == 2:
-            a1 = a1.unsqueeze(1)
+        if a0.ndim != 3:
+            raise ValueError(f"Expected t0.action to be chunk action [B, T, A], got shape={tuple(a0.shape)}")
+        if a1.ndim != 3:
+            raise ValueError(f"Expected t1.action to be chunk action [B, T, A], got shape={tuple(a1.shape)}")
 
         a0 = pad_last_dim_to(a0, 32)
         a1 = pad_last_dim_to(a1, 32)
@@ -84,7 +82,6 @@ class LeRobotPi0DatasetInput(Pi0DatasetInput):
         input.a0 = {"action": a0}
         input.a1 = {"action": a1}
 
-        # done / reward
         done = None
         for done_key in ["t1.next.done", "t0.next.done", "next.done"]:
             if done_key in batch.batch:
@@ -96,9 +93,13 @@ class LeRobotPi0DatasetInput(Pi0DatasetInput):
 
         done = done.view(batch_size)
 
+        # Chunk-horizon semantics:
+        # - reward/done stay sparse and mark whether the chunk reaches terminal
+        # - positive_sample_mask is aligned with online rollout semantics for
+        #   successful demonstrations: all transitions from successful demos are positive
         input.rewards = done.float()
-        input.valids = torch.ones((batch_size,), dtype=torch.bool, device=device)
-        input.dones = done
-        input.positive_sample_mask = done
+        input.valids = torch.ones((batch_size,), dtype=torch.float32, device=device)
+        input.dones = done.float()
+        input.positive_sample_mask = torch.ones((batch_size,), dtype=torch.float32, device=device)
 
         return input

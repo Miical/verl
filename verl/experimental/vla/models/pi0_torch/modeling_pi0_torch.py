@@ -72,6 +72,37 @@ def _resolve_rlpd_task_ids(tasks, config, device: torch.device) -> torch.Tensor:
     return torch.tensor([inferred[t] for t in tasks], dtype=torch.long, device=device)
 
 
+def _infer_effective_action_dim_from_stats(action_norm_stats: dict, max_action_dim: int) -> int:
+    """Infer the effective action dimension from normalization stats.
+
+    PI0 pads actions/states to 32 dims, while many robot datasets only use the
+    first N dims (e.g. 7 for single-arm, 14 for dual-arm). The padded trailing
+    dims usually have zero std / zero quantile range. This helper recovers N so
+    the SAC critic does not silently ignore or over-consume action dims.
+    """
+    if not action_norm_stats:
+        return max_action_dim
+
+    if "std" in action_norm_stats:
+        values = list(action_norm_stats["std"])
+        active = [i for i, v in enumerate(values[:max_action_dim]) if abs(float(v)) > 1e-8]
+        if active:
+            return active[-1] + 1
+
+    if "q01" in action_norm_stats and "q99" in action_norm_stats:
+        q01 = list(action_norm_stats["q01"])
+        q99 = list(action_norm_stats["q99"])
+        active = [
+            i
+            for i, (lo, hi) in enumerate(zip(q01[:max_action_dim], q99[:max_action_dim], strict=False))
+            if abs(float(hi) - float(lo)) > 1e-8
+        ]
+        if active:
+            return active[-1] + 1
+
+    return max_action_dim
+
+
 class PI0ForActionPrediction(PreTrainedModel, SupportSACTraining):
     config_class = PI0TorchConfig
     base_model_prefix = "pi0_torch"
@@ -114,6 +145,13 @@ class PI0ForActionPrediction(PreTrainedModel, SupportSACTraining):
             head_num = int(getattr(self.config, "critic_head_num", 10))
             attn_heads = int(getattr(self.config, "critic_prefix_attn_heads", 8))
 
+            self.critic_action_steps = int(getattr(self.config, "critic_action_steps", getattr(self.config, "n_action_steps", 50)))
+            inferred_action_dim = _infer_effective_action_dim_from_stats(
+                self.action_norm_stats, int(getattr(self.config, "max_action_dim", 32))
+            )
+            self.critic_action_dim = int(getattr(self.config, "critic_action_dim", inferred_action_dim))
+            self.critic_input_dim = 2048 + 32 + self.critic_action_steps * self.critic_action_dim
+
             self.critic_state_token = nn.Parameter(torch.zeros(1, 1, 2048))
             self.target_state_token = nn.Parameter(torch.zeros(1, 1, 2048))
             nn.init.normal_(self.critic_state_token, mean=0.0, std=0.02)
@@ -133,7 +171,7 @@ class PI0ForActionPrediction(PreTrainedModel, SupportSACTraining):
             self.critic_heads = nn.ModuleList(
                 [
                     MLP(
-                        input_dim=2150,
+                        input_dim=self.critic_input_dim,
                         hidden_dims=[2048, 1024, 256],
                         output_dim=1,
                         activation="relu",
@@ -146,7 +184,7 @@ class PI0ForActionPrediction(PreTrainedModel, SupportSACTraining):
             self.target_network_heads = nn.ModuleList(
                 [
                     MLP(
-                        input_dim=2150,
+                        input_dim=self.critic_input_dim,
                         hidden_dims=[2048, 1024, 256],
                         output_dim=1,
                         activation="relu",
@@ -633,8 +671,8 @@ class PI0ForActionPrediction(PreTrainedModel, SupportSACTraining):
             prefix_pad_masks=prefix_pad_masks,
             use_target_network=use_target_network,
         )  # (B, 2048)
-        actions = a["full_action"][:, :10, :7]  # (B, 10, 7)
-        flattened_actions = actions.reshape(actions.shape[0], -1)  # (B, 70)
+        actions = a["full_action"][:, : self.critic_action_steps, : self.critic_action_dim]
+        flattened_actions = actions.reshape(actions.shape[0], -1)
         critic_input = torch.cat([pooled_prefix_embs, states, flattened_actions], dim=-1)
 
         q_values = self._multi_heads_value(critic_head, critic_input, method=method)

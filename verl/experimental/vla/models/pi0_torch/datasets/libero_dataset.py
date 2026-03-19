@@ -88,8 +88,8 @@ class LiberoPi0DatasetInput(Pi0DatasetInput):
         input.a0 = {"action": pad_dim_to(pad_last_dim_to(batch.batch["t0.actions"], 32), dim=1, target_size=50)}
         input.a1 = {"action": pad_dim_to(pad_last_dim_to(batch.batch["t1.actions"], 32), dim=1, target_size=50)}
         input.rewards = batch.batch["t1.chunk_dones"].float()
-        input.valids = torch.ones((batch_size,), dtype=torch.bool, device=device)
-        input.dones = batch.batch["t1.chunk_dones"].bool()
-        input.positive_sample_mask = torch.ones((batch_size,), dtype=torch.bool, device=device)
+        input.valids = torch.ones((batch_size,), dtype=torch.float32, device=device)
+        input.dones = batch.batch["t1.chunk_dones"].float()
+        input.positive_sample_mask = torch.ones((batch_size,), dtype=torch.float32, device=device)
 
         return input

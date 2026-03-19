@@ -164,7 +164,12 @@ class RobRaySACTrainer(RayPPOTrainer):
             train_sampler=train_sampler,
             device_name=device_name,
         )
+        # SAC 的 critic 在 actor_module 内部，不存在独立 critic worker group
+        self.use_critic = False
 
+        # 工程兜底：即使有人误访问也不会 AttributeError
+        self.critic_wg = None
+        
         self.rlpd_dataloader = None
         if self.config.trainer.rlpd_enable:
             assert rlpd_dataset is not None, "rlpd_dataset must be provided when rlpd_enable is True"

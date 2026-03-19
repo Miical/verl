@@ -6,7 +6,7 @@ RLPD_FILES="/shared_disk/users/yejun.zeng/datasets/huggingface/lerobot/catch_bow
 SFT_MODEL_PATH="/shared_disk/users/weijie.ke/weight/giga-openpi/pick_catch_bowl_new_yag"
 TOKENIZER_PATH="$SFT_MODEL_PATH"
 
-OUTPUT_DIR="/shared_disk/users/weijie.ke/offline_rlpd_runs/catch_bowl_offline_only"
+OUTPUT_DIR="/shared_disk/users/weijie.ke/offline_rlpd_runs/catch_bowl_offline_only_319"
 
 NUM_NODES=1
 NUM_GPUS=4
@@ -70,4 +70,8 @@ $PYTHON -m verl.experimental.vla.main_sac \
     actor_rollout_ref.actor.fsdp_config.wrap_policy.transformer_layer_cls_to_wrap=[SiglipEncoderLayer,GemmaDecoderLayerWithExpert] \
     actor_rollout_ref.model.enable_gradient_checkpointing=False \
     actor_rollout_ref.model.use_remove_padding=False \
-    actor_rollout_ref.model.trust_remote_code=False
+    actor_rollout_ref.model.trust_remote_code=False \
+    +actor_rollout_ref.algorithm='sac' \
+    actor_rollout_ref.actor.replay_pool_save_dir="$OUTPUT_DIR/replay_pools" \
+    # +actor_rollout_ref.model.override_config.critic_action_steps=50 \
+    # +actor_rollout_ref.model.override_config.critic_action_dim=14
