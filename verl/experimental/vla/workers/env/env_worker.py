@@ -224,7 +224,7 @@ class EnvWorker(Worker, DistProfilerExtension):
         output_tensor_dict = {}
         output_non_tensor_dict = {}
 
-        # Handle. nested 'images_and_states'
+        # Handle nested 'images_and_states'
         images_and_states_list = [d[0]["images_and_states"] for d in result_list]
         if images_and_states_list:
             # Assuming all dicts in the list have the same keys

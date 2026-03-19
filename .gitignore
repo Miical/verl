@@ -6,3 +6,4 @@
 /replay_pools/
 __pycache__/
 .ipynb_checkpoints/
+outputs/

@@ -26,7 +26,7 @@ env:
       video_base_dir: /tmp/videos
     num_envs: 16
     seed: 42
-    task_suite_name: libero_spatial
+    task_suite_name: libero_object
     init_params:
       camera_depths: False
       camera_heights: 256
