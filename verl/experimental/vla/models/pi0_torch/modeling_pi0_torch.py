@@ -21,7 +21,6 @@ import torch
 from onnx_ir import Tensor
 from torch import nn
 from torch.distributed.fsdp import register_fsdp_forward_method
-from torch.distributions import Normal
 from transformers import PreTrainedModel
 from typing_extensions import override
 
@@ -129,16 +128,36 @@ class PI0ForActionPrediction(PreTrainedModel, SupportSACTraining):
         self.state_unnormalize_transform = Unnormalize(self.state_norm_stats, use_quantiles=self.pi05_enabled)
         self.action_unnormalize_transform = Unnormalize(self.action_norm_stats, use_quantiles=self.pi05_enabled)
 
-        # Flow SDE parameters
+        # Stochastic flow parameters (ReinFlow-lite style)
         self._to(get_device_name())
         self.flow_sde_enable = bool(getattr(config, "flow_sde_enable", True))
-        self.flow_sde_noise_level = float(getattr(config, "flow_sde_noise_level", 0.5))
         self.flow_sde_rollout_noise_scale = float(getattr(config, "flow_sde_rollout_noise_scale", 1.0))
         self.flow_sde_train_noise_scale = float(getattr(config, "flow_sde_train_noise_scale", 1.0))
-        self.flow_sde_initial_beta = float(getattr(config, "flow_sde_initial_beta", 1.0))
-        self.flow_sde_beta_min = float(getattr(config, "flow_sde_beta_min", 0.02))
-        self.flow_sde_beta_schedule_T = int(getattr(config, "flow_sde_beta_schedule_T", 2000))
+        self.flow_logprob_mode = str(getattr(config, "flow_logprob_mode", "path_exact"))
+        self.flow_sigma_head_hidden_dim = int(getattr(config, "flow_sigma_head_hidden_dim", 512))
+        self.flow_sigma_min = float(getattr(config, "flow_sigma_min", 1e-3))
+        self.flow_sigma_max = float(getattr(config, "flow_sigma_max", 5e-1))
+        self.flow_sigma_init = float(getattr(config, "flow_sigma_init", 5e-2))
+        self.flow_sigma_use_latent_stats = bool(getattr(config, "flow_sigma_use_latent_stats", True))
         self.register_buffer("flow_sde_step", torch.zeros((), dtype=torch.long))
+
+        if self.flow_sde_enable:
+            latent_stats_dim = 2 if self.flow_sigma_use_latent_stats else 0
+            self.flow_sigma_feature_dim = 2048 + 32 + latent_stats_dim + 1
+            self.flow_sigma_head = MLP(
+                input_dim=self.flow_sigma_feature_dim,
+                hidden_dims=[self.flow_sigma_head_hidden_dim, self.flow_sigma_head_hidden_dim // 2],
+                output_dim=1,
+                activation="relu",
+                init_method="kaiming",
+            )
+            init_log_sigma = math.log(max(self.flow_sigma_init, self.flow_sigma_min))
+            log_sigma_min = math.log(self.flow_sigma_min)
+            log_sigma_max = math.log(self.flow_sigma_max)
+            init_ratio = (init_log_sigma - log_sigma_min) / max(log_sigma_max - log_sigma_min, 1e-6)
+            init_ratio = min(max(init_ratio, 1e-4), 1.0 - 1e-4)
+            init_bias = math.log(init_ratio / (1.0 - init_ratio))
+            self.flow_sigma_head.network[-1].bias.data.fill_(init_bias)
 
         ##### SAC Algorithm Support #####
         if getattr(self.config, "sac_enable", False):
@@ -285,7 +304,7 @@ class PI0ForActionPrediction(PreTrainedModel, SupportSACTraining):
                 lang_tokens=lang_tokens,
                 lang_masks=lang_masks,
             )
-            pred_action, rollout_log_probs = self._sample_actions_flow_sde(
+            pred_action, rollout_log_probs, _ = self._sample_actions_flow_sde(
                 state_features=(prefix_features, state),
                 noise_scale=self.flow_sde_rollout_noise_scale,
                 requires_grad=False,
@@ -483,7 +502,7 @@ class PI0ForActionPrediction(PreTrainedModel, SupportSACTraining):
         )
         return pooled.squeeze(1)
 
-    def _gaussian_log_prob(
+    def _diag_gaussian_log_prob_sum(
         self,
         sample: torch.Tensor,
         mean: torch.Tensor,
@@ -491,16 +510,41 @@ class PI0ForActionPrediction(PreTrainedModel, SupportSACTraining):
     ) -> torch.Tensor:
         std_safe = std.clamp_min(1e-6)
         log_prob = -0.5 * (((sample - mean) / std_safe) ** 2 + 2.0 * torch.log(std_safe) + math.log(2.0 * math.pi))
-        return log_prob.mean(dim=(-1, -2))
+        return log_prob.sum(dim=(-1, -2))
 
-    def flow_sde_beta(self) -> torch.Tensor:
-        beta = beta_schedule(
-            int(self.flow_sde_step.item()),
-            beta0=self.flow_sde_initial_beta,
-            beta_min=self.flow_sde_beta_min,
-            T=self.flow_sde_beta_schedule_T,
-        )
-        return torch.tensor(beta, device=self.flow_sde_step.device, dtype=torch.float32)
+    def _diag_gaussian_entropy_sum(self, std: torch.Tensor) -> torch.Tensor:
+        std_safe = std.clamp_min(1e-6)
+        entropy = 0.5 * (1.0 + math.log(2.0 * math.pi)) + torch.log(std_safe)
+        return entropy.sum(dim=(-1, -2))
+
+    def _masked_mean_prefix(self, prefix_embs: torch.Tensor, prefix_pad_masks: torch.Tensor) -> torch.Tensor:
+        weights = prefix_pad_masks.to(dtype=prefix_embs.dtype).unsqueeze(-1)
+        denom = weights.sum(dim=1).clamp_min(1.0)
+        return (prefix_embs * weights).sum(dim=1) / denom
+
+    def _predict_flow_sigma(
+        self,
+        prefix_context: torch.Tensor,
+        states: torch.Tensor,
+        x_t: torch.Tensor,
+        t_cur: torch.Tensor,
+        noise_scale: float,
+    ) -> torch.Tensor:
+        if noise_scale <= 0:
+            return torch.zeros((x_t.shape[0], 1, 1), device=x_t.device, dtype=x_t.dtype)
+
+        features = [prefix_context.to(dtype=x_t.dtype), states.to(dtype=x_t.dtype), t_cur.expand(x_t.shape[0], 1).to(dtype=x_t.dtype)]
+        if self.flow_sigma_use_latent_stats:
+            latent_mean = x_t.mean(dim=(-1, -2), keepdim=False).unsqueeze(-1)
+            latent_std = x_t.std(dim=(-1, -2), keepdim=False, unbiased=False).unsqueeze(-1)
+            features.extend([latent_mean.to(dtype=x_t.dtype), latent_std.to(dtype=x_t.dtype)])
+        sigma_features = torch.cat(features, dim=-1)
+        sigma_gate = torch.sigmoid(self.flow_sigma_head(sigma_features))
+        log_sigma_min = math.log(self.flow_sigma_min)
+        log_sigma_max = math.log(self.flow_sigma_max)
+        log_sigma = log_sigma_min + (log_sigma_max - log_sigma_min) * sigma_gate
+        sigma = torch.exp(log_sigma) * float(noise_scale)
+        return sigma.unsqueeze(-1)
 
     def _sample_actions_flow_sde(
         self,
@@ -508,19 +552,23 @@ class PI0ForActionPrediction(PreTrainedModel, SupportSACTraining):
         noise_scale: float,
         requires_grad: bool,
         return_log_prob: bool,
-    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+    ) -> tuple[torch.Tensor, torch.Tensor | None, dict[str, float]]:
         prefix_features, states = state_features
         prefix_embs, prefix_pad_masks, _ = prefix_features
         batch_size = prefix_embs.shape[0]
         device = prefix_embs.device
-        beta = self.flow_sde_beta().to(device=device, dtype=prefix_embs.dtype)
 
         past_key_values = self._build_kv_cache_from_prefix(prefix_features)
+        prefix_context = self._masked_mean_prefix(prefix_embs, prefix_pad_masks)
+
         actions_shape = (batch_size, self.model.n_action_steps, self.model.max_action_dim)
         x_t = torch.randn(actions_shape, device=device, dtype=prefix_embs.dtype)
 
         timesteps = torch.linspace(1.0, 0.0, self.model.num_steps + 1, dtype=torch.float32, device=device)
         step_log_probs: list[torch.Tensor] = []
+        step_entropies: list[torch.Tensor] = []
+        step_sigma_means: list[torch.Tensor] = []
+        step_sigma_stds: list[torch.Tensor] = []
 
         for idx in range(self.model.num_steps):
             t_cur = timesteps[idx]
@@ -548,39 +596,55 @@ class PI0ForActionPrediction(PreTrainedModel, SupportSACTraining):
             t_cur_safe = t_cur.clamp(min=1e-4, max=1.0 - 1e-4)
             t_cur_exp = t_cur_safe.view(1, 1, 1)
             t_next_exp = t_next.view(1, 1, 1)
-            delta_exp = delta.view(1, 1, 1)
 
             x0_pred = x_t - v_t * t_cur_exp
             x1_pred = x_t + v_t * (1.0 - t_cur_exp)
+            x_mean = x0_pred * (1.0 - t_next_exp) + x1_pred * t_next_exp
+
+            sigma_scalar = self._predict_flow_sigma(
+                prefix_context=prefix_context,
+                states=states,
+                x_t=x_t,
+                t_cur=t_cur.expand(batch_size, 1),
+                noise_scale=noise_scale,
+            )
+            sigma_t = sigma_scalar * torch.sqrt(delta).view(1, 1, 1)
 
             if noise_scale > 0:
-                sigma_schedule = self.flow_sde_noise_level * noise_scale * torch.sqrt(t_cur_safe / (1.0 - t_cur_safe))
-                sigma = beta * sigma_schedule
-                sigma_exp = sigma.view(1, 1, 1)
-                x0_weight = 1.0 - t_next_exp
-                x1_weight = t_next_exp - sigma_exp.pow(2) * delta_exp / (2.0 * t_cur_exp)
-                x_mean = x0_pred * x0_weight + x1_pred * x1_weight
-                sigma_t = torch.sqrt(delta_exp) * sigma_exp
                 eps = torch.randn_like(x_t)
                 x_prev = x_mean + sigma_t * eps
             else:
-                x0_weight = 1.0 - t_next_exp
-                x1_weight = t_next_exp
-                x_mean = x0_pred * x0_weight + x1_pred * x1_weight
-                sigma_t = torch.zeros_like(x_mean)
                 x_prev = x_mean
 
             if return_log_prob:
-                step_log_probs.append(self._gaussian_log_prob(x_prev, x_mean, sigma_t))
+                step_log_probs.append(self._diag_gaussian_log_prob_sum(x_prev, x_mean, sigma_t))
+                step_entropies.append(self._diag_gaussian_entropy_sum(sigma_t))
 
+            step_sigma_means.append(sigma_t.mean())
+            step_sigma_stds.append(sigma_t.std(unbiased=False))
             x_t = x_prev
 
-        if return_log_prob:
+        if return_log_prob and self.flow_logprob_mode == "path_exact":
             log_probs = torch.stack(step_log_probs, dim=1).sum(dim=1)
+            path_entropy = torch.stack(step_entropies, dim=1).sum(dim=1)
+        elif return_log_prob:
+            log_probs = None
+            path_entropy = None
         else:
             log_probs = None
+            path_entropy = None
 
-        return x_t, log_probs
+        metrics = {
+            "flow_sigma_mean": float(torch.stack(step_sigma_means).mean().item()),
+            "flow_sigma_std": float(torch.stack(step_sigma_stds).mean().item()),
+            "flow_logprob_mode": 1.0 if self.flow_logprob_mode == "path_exact" else 0.0,
+        }
+        if path_entropy is not None:
+            metrics["flow_path_entropy_mean"] = float(path_entropy.mean().item())
+        if log_probs is not None:
+            metrics["flow_path_logprob_mean"] = float(log_probs.mean().item())
+
+        return x_t, log_probs, metrics
 
     def _build_kv_cache_from_prefix(
         self,
@@ -624,7 +688,7 @@ class PI0ForActionPrediction(PreTrainedModel, SupportSACTraining):
         ],
         is_first_micro_batch: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor | None, dict[str, float]]:
-        actions, log_probs = self._sample_actions_flow_sde(
+        actions, log_probs, actor_metrics = self._sample_actions_flow_sde(
             state_features=state_features,
             noise_scale=self.flow_sde_train_noise_scale,
             requires_grad=True,
@@ -632,12 +696,10 @@ class PI0ForActionPrediction(PreTrainedModel, SupportSACTraining):
         )
         if is_first_micro_batch:
             self.flow_sde_step.add_(1)
-        actor_metrics: dict[str, float] = {}
         if self.flow_sde_enable:
-            actor_metrics = {
-                "flow_sde_beta": float(self.flow_sde_beta().item()),
+            actor_metrics.update({
                 "flow_sde_step": float(self.flow_sde_step.item()),
-            }
+            })
         return actions, log_probs, actor_metrics
 
     @override

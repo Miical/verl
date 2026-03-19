@@ -388,7 +388,7 @@ class RobDataParallelSACActor(BaseSACActor):
             if self.bc_loss_coef > 0:
                 bc_loss = self.actor_module.bc_loss(
                     state_features=s0_state_features,
-                    actions={"full_action": a0_actions},
+                    actions={"full_action": micro_batch["a0.full_action"]},
                     valids=micro_batch["valids"],
                 )
                 actor_loss = sac_loss + self.bc_loss_coef * bc_loss
