@@ -93,6 +93,11 @@ class IsaacEnv(gym.Env):
             if not self.task_name:
                 self.task_name = "Isaac-Libero-Franka-IK-Abs-v0"
 
+            # For OSC-based tasks, set the controller type env var that
+            # OscPoseLiberoCameraEnvCfg reads during __post_init__.
+            if "OscPose" in self.task_name:
+                os.environ.setdefault("LIBERO_OSC_TYPE", "pose_rel")
+
         from isaaclab_tasks.utils import parse_env_cfg
 
         self.env_cfg = parse_env_cfg(self.task_name, num_envs=self.num_envs)
@@ -209,20 +214,24 @@ class IsaacEnv(gym.Env):
         if isinstance(actions, np.ndarray):
             actions = torch.from_numpy(actions)
 
+        is_ik_abs = "IK-Abs" in (self.task_name or "")
+
         if self._elapsed_steps[0] < 3:
             logger.info(
-                f"[step {self._elapsed_steps[0]}] VLA absolute action (pos|aa|grip): "
+                f"[step {self._elapsed_steps[0]}] VLA action (pos|aa|grip): "
                 f"{actions[0, :3].tolist()} | {actions[0, 3:6].tolist()} | {actions[0, 6:].tolist()}"
             )
 
-        actions = self._convert_actions_for_ik_abs(actions.to(self.device))
+        if is_ik_abs:
+            actions = self._convert_actions_for_ik_abs(actions.to(self.device))
+        else:
+            actions = actions.to(self.device)
 
         if self._elapsed_steps[0] < 3:
             eef = self.env.unwrapped.scene["robot"].data.body_state_w[:, -1, :7]
             logger.info(
                 f"[step {self._elapsed_steps[0]}] Current EEF pos: {eef[0, :3].tolist()}, "
-                f"Converted action (pos|quat|grip): {actions[0, :3].tolist()} | "
-                f"{actions[0, 3:7].tolist()} | {actions[0, 7:].tolist()}"
+                f"Action to env: {actions[0].tolist()}"
             )
 
         self._elapsed_steps += 1
