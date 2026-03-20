@@ -130,6 +130,20 @@ class EnvWorker(Worker, DistProfilerExtension):
                         stage_id=stage_id,
                     )
                 )
+
+        elif self.cfg.train.simulator_type == "robot":
+            from verl.experimental.vla.envs.robot_env.robot_env import RealRobotEnv
+
+            for stage_id in range(self.stage_num):
+                self.simulator_list.append(
+                    EnvManager(
+                        self.cfg.train,
+                        rank=self._rank,
+                        world_size=self._world_size,
+                        env_cls=RealRobotEnv,
+                        stage_id=stage_id,
+                    )
+                )
         else:
             raise NotImplementedError(f"Simulator type {self.cfg.train.simulator_type} not implemented")
 
@@ -161,9 +175,14 @@ class EnvWorker(Worker, DistProfilerExtension):
 
         env_info_list = {}
 
-        extracted_obs, chunk_rewards, chunk_terminations, chunk_truncations, infos = self.simulator_list[
-            stage_id
-        ].chunk_step(chunk_actions, chunk_values=chunk_values)
+        if self.cfg.train.simulator_type == "robot":
+            extracted_obs, chunk_rewards, chunk_terminations, chunk_truncations, infos = self.simulator_list[
+                stage_id
+            ].chunk_step(chunk_actions)
+        else:
+            extracted_obs, chunk_rewards, chunk_terminations, chunk_truncations, infos = self.simulator_list[
+                stage_id
+            ].chunk_step(chunk_actions, chunk_values=chunk_values)
         chunk_dones = torch.logical_or(chunk_terminations, chunk_truncations)
 
         if chunk_dones.any():
