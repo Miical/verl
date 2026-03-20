@@ -182,7 +182,7 @@ class PiperMotorsBus:
             self.interface.EnableArm(motor_num=7, enable_flag=0x02)
             self.interface.ModeCtrl(
                 ctrl_mode=0x01,     # CAN command
-                move_mode=0x00,     # MOVE P
+                move_mode=0x01,     # MOVE J
                 move_spd_rate_ctrl=move_spd_rate_ctrl,
                 is_mit_mode=0x00
             )
@@ -302,7 +302,7 @@ class PiperMotorsBus:
           1. 临时切到关节控制模式 (MOVE J, 0x01)
           2. 下发关节空间绝对目标位姿 self.arm_reset_rad_pos
           3. 等待一小段时间
-          4. 切回末端位姿控制模式 (MOVE P, 0x00)
+          4. 保持关节控制模式 (MOVE J, 0x01)
         """
         if not (self.interface and self.is_connected):
             logging.warning(f"reset_pos called while not connected on {self.can_name}.")
@@ -332,13 +332,13 @@ class PiperMotorsBus:
         except Exception:
             logging.error(f"Failed to reset position on {self.can_name}: {format_exc()}")
         finally:
-            # 4. 切回末端位姿控制模式 MOVE P（CAN 控制）
+            # 4. 保持关节模式 MOVE J（CAN 控制）
             try:
-                logging.info(f"[{self.can_name}] Switch back to end-pose mode (MOVE P).")
+                logging.info(f"[{self.can_name}] Keep joint mode (MOVE J) after reset.")
                 # pdb.set_trace()
-                self._set_move_mode(move_mode=0x00, move_spd_rate_ctrl=move_spd_rate_ctrl)
+                self._set_move_mode(move_mode=0x01, move_spd_rate_ctrl=move_spd_rate_ctrl)
             except Exception:
-                logging.error(f"Failed to switch back to end-pose mode on {self.can_name}: {format_exc()}")
+                logging.error(f"Failed to keep joint mode on {self.can_name}: {format_exc()}")
 
 
     def end_pose_ctrl(
@@ -427,6 +427,8 @@ class PiperMotorsBus:
                     else:
                         cur = self._current_positions[motor]
                         joint_angles.append(int(np.rad2deg(cur) * 1000))
+                # 确保 Piper 处于关节控制模式（MOVE J）后再发送 JointCtrl
+                self._set_move_mode(move_mode=0x01)
                 self.interface.JointCtrl(
                     joint_1=joint_angles[0],
                     joint_2=joint_angles[1],
@@ -472,6 +474,9 @@ class PiperMotorsBus:
                 g_val = float(pose[kgr])
                 g_low, g_high = self.joint_limits[self.motors[-1]]
                 g_val = float(np.clip(g_val, g_low, g_high))
+
+                # 确保 Piper 处于末端位姿控制模式（MOVE P）后再发送 EndPoseCtrl
+                self._set_move_mode(move_mode=0x00)
 
                 # 下发：EndPoseCtrl + 可选夹爪（总是一起下，便于原子化）
                 self.end_pose_ctrl(

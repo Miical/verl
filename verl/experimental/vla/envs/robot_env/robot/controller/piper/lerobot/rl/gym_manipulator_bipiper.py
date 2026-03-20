@@ -208,8 +208,9 @@ def reset_follower_position(robot_arm: Robot, target_position: np.ndarray, joint
         robot_arm.bus_right.sync_write("Goal_Position", action_dict_right)
         busy_wait(0.015)
 
-    robot_arm.bus_left.interface.ModeCtrl(ctrl_mode=0x01, move_mode=0x00, move_spd_rate_ctrl=50, is_mit_mode=0x00)
-    robot_arm.bus_right.interface.ModeCtrl(ctrl_mode=0x01, move_mode=0x00, move_spd_rate_ctrl=50, is_mit_mode=0x00)
+    # 复位结束后保持在关节控制模式，避免后续 policy 的 JointCtrl 被 MOVE P 模式吞掉。
+    robot_arm.bus_left.interface.ModeCtrl(ctrl_mode=0x01, move_mode=0x01, move_spd_rate_ctrl=50, is_mit_mode=0x00)
+    robot_arm.bus_right.interface.ModeCtrl(ctrl_mode=0x01, move_mode=0x01, move_spd_rate_ctrl=50, is_mit_mode=0x00)
     busy_wait(0.1)
 
 
@@ -370,9 +371,10 @@ class RobotEnv(gym.Env):
             is_intervention = transition_info[TeleopEvents.IS_INTERVENTION]
 
         if not is_intervention:
-            self.robot.bus_left.interface.ModeCtrl(ctrl_mode=0x01, move_mode=0x00, move_spd_rate_ctrl=50, is_mit_mode=0x00)
-            self.robot.bus_right.interface.ModeCtrl(ctrl_mode=0x01, move_mode=0x00, move_spd_rate_ctrl=50, is_mit_mode=0x00)
-            print("不在干预")
+            # Joint policy -> joint control: 每一步都明确保持在 MOVE J，避免底层残留在 MOVE P。
+            self.robot.bus_left.interface.ModeCtrl(ctrl_mode=0x01, move_mode=0x01, move_spd_rate_ctrl=50, is_mit_mode=0x00)
+            self.robot.bus_right.interface.ModeCtrl(ctrl_mode=0x01, move_mode=0x01, move_spd_rate_ctrl=50, is_mit_mode=0x00)
+            print("不在干预，使用 joint 控制")
             self.robot.send_action(joint_targets_dict)
 
         obs = self._get_observation()
