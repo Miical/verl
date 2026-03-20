@@ -55,14 +55,41 @@ def create_env_batch_dataproto(obs, rews, terminations, truncations, infos, meta
         ret_dict.update(meta=meta)
 
     ret_dict = put_tensor_cpu(ret_dict)
-    tensor_batch = {
-        "full_image": ret_dict["obs"]["images_and_states"]["full_image"],
-        "wrist_image": ret_dict["obs"]["images_and_states"]["wrist_image"],
-        "state": ret_dict["obs"]["images_and_states"]["state"],
-        "rews": ret_dict["rews"],
-        "terminations": ret_dict["terminations"],
-        "truncations": ret_dict["truncations"],
-    }
+
+    images_and_states = ret_dict["obs"]["images_and_states"]
+
+    # robot 环境返回:
+    #   head_image / left_wrist_image / right_wrist_image / state
+    # libero/isaac 环境返回:
+    #   full_image / wrist_image / state
+    # 这里统一兼容两套 key，避免 robot online rollout 在 step 时因为取错 key 直接炸掉。
+    if all(k in images_and_states for k in ["head_image", "left_wrist_image", "right_wrist_image"]):
+        tensor_batch = {
+            "head_image": images_and_states["head_image"],
+            "left_wrist_image": images_and_states["left_wrist_image"],
+            "right_wrist_image": images_and_states["right_wrist_image"],
+            "state": images_and_states["state"],
+            "rews": ret_dict["rews"],
+            "terminations": ret_dict["terminations"],
+            "truncations": ret_dict["truncations"],
+        }
+    elif all(k in images_and_states for k in ["full_image", "wrist_image"]):
+        tensor_batch = {
+            "full_image": images_and_states["full_image"],
+            "wrist_image": images_and_states["wrist_image"],
+            "state": images_and_states["state"],
+            "rews": ret_dict["rews"],
+            "terminations": ret_dict["terminations"],
+            "truncations": ret_dict["truncations"],
+        }
+    else:
+        raise KeyError(
+            "Unsupported images_and_states keys. "
+            f"Got keys: {list(images_and_states.keys())}. "
+            "Expected either [head_image, left_wrist_image, right_wrist_image, state] "
+            "or [full_image, wrist_image, state]."
+        )
+
     non_tensor_batch = {"task_descriptions": obs["task_descriptions"]}
     output = DataProto.from_dict(tensors=tensor_batch, non_tensors=non_tensor_batch)
 
