@@ -1,0 +1,144 @@
+{
+  "output_dir": "outputs/piper_offline_local_learner1108_yag",
+  "job_name": "piper_offline_il",
+  "resume": false,
+  "seed": 1000,
+  "num_workers": 4,
+  "batch_size": 1024,
+  "log_freq": 500,
+  "save_checkpoint": true,
+  "save_freq": 500,
+
+  "wandb": {
+    "enable": false,
+    "project": "local_disabled",
+    "disable_artifact": true
+  },
+
+  "dataset": {
+    "repo_id": "local/test_hil_serl_v0.5_cropped_v2",
+    "root": "/home/agilex-home/agilex/dengqiuping/code/lerobot/datasets/test_hil_serl_v0.5_cropped_v2",
+    "use_imagenet_stats": true
+  },
+
+  "policy": {
+    "type": "sac",
+    "push_to_hub": false,
+    "pretrained_path": "/home/agilex-home/agilex/lerobot_hil-serl/outputs/piper_offline_local_learner1109_BC_yag/checkpoints/001000/pretrained_model",
+    "normalization_mapping": {
+      "VISUAL": "MEAN_STD",
+      "STATE": "MIN_MAX",
+      "ENV": "MIN_MAX",
+      "ACTION": "MIN_MAX"
+    },
+
+    "input_features": {
+      "observation.images.cam_high": { "type": "VISUAL", "shape": [3, 128, 128] },
+      "observation.images.cam_left_wrist": { "type": "VISUAL", "shape": [3, 128, 128] }
+    },
+    "output_features": {
+      "action": { "type": "ACTION", "shape": [4] }
+    },
+
+    "device": "cuda",
+    "storage_device": "cpu",
+
+    "dataset_stats": {
+      "observation.images": {
+        "mean": [0.485, 0.456, 0.406],
+        "std":  [0.229, 0.224, 0.225]
+      },
+      "action": {
+        "min": [-1.0, -1.0, -1.0, -1.0],
+        "max": [ 1.0,  1.0,  1.0,  1.0]
+      }
+    },
+
+    "num_discrete_actions": null,
+
+    "vision_encoder_name": null,
+    "freeze_vision_encoder": false,
+    "image_encoder_hidden_dim": 32,
+    "shared_encoder": true,
+    "image_embedding_pooling_dim": 8,
+
+    "online_steps": 100000,                
+    "online_buffer_capacity": 30000,       
+    "offline_buffer_capacity": 200000,     
+    "online_step_before_learning": 0,     
+    "policy_update_freq": 1,
+
+    "discount": 0.97,
+    "temperature_init": 0.01,
+    "num_critics": 2,
+    "num_subsample_critics": null,
+    "critic_lr": 0.0003,
+    "actor_lr": 0.0003,
+    "temperature_lr": 0.0003,
+    "critic_target_update_weight": 0.005,
+    "utd_ratio": 2,
+    "state_encoder_hidden_dim": 256,
+    "latent_dim": 256,
+    "target_entropy": null,
+    "use_backup_entropy": true,
+    "grad_clip_norm": 40.0,
+
+    "critic_network_kwargs": {
+      "hidden_dims": [256, 256],
+      "activate_final": true,
+      "final_activation": null
+    },
+    "actor_network_kwargs": {
+      "hidden_dims": [256, 256],
+      "activate_final": true
+    },
+    "policy_kwargs": {
+      "use_tanh_squash": true,
+      "std_min": 1e-5,
+      "std_max": 10.0,
+      "init_final": 0.05
+    },
+
+    "async_prefetch": false,
+    "use_torch_compile": false
+  },
+
+  "env": {
+    "type": "gym_manipulator",
+    "name": "real_robot",
+    "fps": 30,
+
+    "processor": {
+      "image_preprocessing": {
+        "crop_params_dict": {
+          "observation.images.cam_high": [1, 218, 239, 196],
+          "observation.images.cam_left_wrist": [184, 166, 270, 343]
+        },
+        "resize_size": [128, 128]
+      },
+      "inverse_kinematics": {
+        "urdf_path": "local_assets/piper.urdf",
+        "target_frame_name": "link6",
+        "end_effector_bounds": {
+          "min": [-0.40, -0.30, 0.00],
+          "max": [ 0.40,  0.30, 0.45]
+        },
+        "end_effector_step_sizes": { "x": 0.0001, "y": 0.0001, "z": 0.0001 }
+      },
+      "max_gripper_pos": 2.0
+    },
+
+    "features": {
+      "observation.images.front": { "type": "VISUAL", "shape": [3, 128, 128] },
+      "observation.images.left":  { "type": "VISUAL", "shape": [3, 128, 128] },
+      "action": { "type": "ACTION", "shape": [4] }
+    },
+    "features_map": {
+      "observation.images.front": "observation.images.cam_high",
+      "observation.images.left":  "observation.images.cam_left_wrist",
+      "action": "action"
+    },
+
+    "task": "hilserl_piper"
+  }
+}

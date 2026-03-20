@@ -1,0 +1,87 @@
+{
+  "env": {
+    "name": "real_robot",
+    "fps": 50,
+
+    "robot": {
+      "type": "piper_follower_end_effector",
+
+      "urdf_path": "local_assets/piper.urdf",
+      "target_frame_name": "link6",
+
+      "cameras": {
+        "front": {
+          "type": "orbbec_dabai",
+          "serial_number_or_name": "CC1B25100EM",
+          "width": 640,
+          "height": 480,
+          "fps": 30
+        },
+        "left": {
+          "type": "intelrealsense",
+          "serial_number_or_name": "242522071187",
+          "width": 640,
+          "height": 480,
+          "fps": 30
+        },
+        "right": {
+          "type": "intelrealsense",
+          "serial_number_or_name": "327122075682",
+          "width": 640,
+          "height": 480,
+          "fps": 30
+        }
+      }
+    },
+
+    "teleop": {
+      "type": "keyboard_ee",
+      "use_gripper": true
+    },
+
+    "processor": {
+      "observation": {
+        "display_cameras": false,
+        "add_joint_velocity_to_observation": false,
+        "add_current_to_observation": false
+      },
+
+      "image_preprocessing": {
+        "crop_params_dict": {
+          "observation.images.front": [0, 0, 480, 640],
+          "observation.images.left":  [0, 0, 480, 640],
+          "observation.images.right": [0, 0, 480, 640]
+        },
+        "resize_size": [128, 128]
+      },
+
+      "reset": {
+        "fixed_reset_joint_positions": [0, 0, 0, 0, 0, 0, 0,0, 0, 0, 0, 0, 0, 0],
+        "control_time_s": 200.0,
+        "reset_time_s": 2.5,
+        "terminate_on_success": true
+      },
+
+      "gripper": {
+        "use_gripper": true,
+        "gripper_penalty": -0.02
+      },
+
+      "max_gripper_pos": 2.0,
+
+      "reward_classifier": null
+    }
+  },
+
+  "dataset": {
+    "repo_id": "local/test_hil_serl",
+    "task": "teleop_keyboard",
+    "root": null,
+    "num_episodes_to_record": 2,
+    "replay_episode": null,
+    "push_to_hub": false
+  },
+
+  "mode": null,              
+  "device": "cpu"
+}

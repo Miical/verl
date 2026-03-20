@@ -1,0 +1,14 @@
+{
+	"folders": [
+		{
+			"path": "../../.."
+		},
+		{
+			"path": "../../../../../../agilex/angen.ye"
+		},
+		{
+			"path": "../../../../cobot_magic/collect_data"
+		}
+	],
+	"settings": {}
+}
