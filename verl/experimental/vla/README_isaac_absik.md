@@ -4,16 +4,18 @@ This document records all modifications made to integrate the **OpenPI JAX check
 
 ## Quick Start
 
-```bash
-cd /root/code/verl
-USE_JAX_INFERENCE=true bash verl/experimental/vla/run_pi05_libero_sac.sh
-```
-
 To use PyTorch inference instead (requires converted safetensors checkpoint):
 
 ```bash
 cd /root/code/verl_new
 bash verl/experimental/vla/run_pi05_libero_sac.sh
+```
+
+For reference, JAX model based inference pipeline is established. To run, you will need to first download JAX model from https://huggingface.co/china-sae-robotics/pi05_libero_isaaclab_absik-ckpt30000/tree/main, then use the follow command to run:
+
+```bash
+cd /root/code/verl
+USE_JAX_INFERENCE=true bash verl/experimental/vla/run_pi05_libero_sac.sh
 ```
 
 ## Environment Setup
@@ -361,6 +363,17 @@ if is_abs_action:
     eef_pose = raw_obs["policy"]["eef_pose"].to(self.device)
     gripper_pos = raw_obs["policy"]["gripper_pos"].to(self.device)
     hold_action = torch.cat([eef_pose, gripper_pos[..., 0:1]], dim=-1)
+```
+
+### 8. Light Intensity Change Not Taking Effect
+
+**Symptom:** `DomeLightCfg(intensity=200.0)` is set correctly in all four `SceneCfg` classes, and `__post_init__` debug prints confirm `intensity=200`, yet the rendered video still appears as bright as `intensity=1000`.
+
+**Cause:** Isaac Sim / Kit may cache scene lighting state internally (e.g., Fabric/USD stage cache). The Python-level config is correct, but the renderer sometimes uses a stale value from a previous run. This is non-deterministic — it happens intermittently, especially when switching between JAX and PyTorch inference modes or restarting without a full process cleanup.
+
+**Workaround:** Re-run the pipeline. In most cases, the correct intensity is picked up on the next launch. Ensure all Isaac Sim / Ray processes are fully killed before restarting (the run script's `pkill -9` block helps). Clearing `__pycache__` directories under `isaaclab_playground` may also help:
+```bash
+find /root/RobotLearningLab/source/isaaclab_playground -type d -name __pycache__ -exec rm -rf {} +
 ```
 
 ## Configuration Reference
