@@ -14,7 +14,9 @@
 
 from __future__ import annotations
 
+import json
 import math
+import os
 from typing import Literal
 
 import torch
@@ -32,8 +34,11 @@ from ..modules.mlp import MLP
 from .configuration_pi0_torch import PI0TorchConfig
 from .model.modeling_pi0 import PI0Model, make_att_2d_masks
 from .pi0_utils import (
+    AlohaInputs,
+    DeltaActions,
     ImageTransform,
     Normalize,
+    PadStatesAndActions,
     PromptTokenizerTransform,
     Unnormalize,
 )
@@ -102,6 +107,19 @@ def _infer_effective_action_dim_from_stats(action_norm_stats: dict, max_action_d
     return max_action_dim
 
 
+def _load_norm_stats_from_path(norm_stats_path: str) -> tuple[dict, dict]:
+    with open(norm_stats_path, "r") as f:
+        payload = json.load(f)
+    norm_stats = payload.get("norm_stats", payload)
+    state_norm_stats = norm_stats.get("observation.state")
+    action_norm_stats = norm_stats.get("action")
+    if state_norm_stats is None or action_norm_stats is None:
+        raise KeyError(
+            f"norm_stats_path={norm_stats_path} must contain keys 'observation.state' and 'action'"
+        )
+    return state_norm_stats, action_norm_stats
+
+
 class PI0ForActionPrediction(PreTrainedModel, SupportSACTraining):
     config_class = PI0TorchConfig
     base_model_prefix = "pi0_torch"
@@ -109,8 +127,16 @@ class PI0ForActionPrediction(PreTrainedModel, SupportSACTraining):
     def __init__(self, config: PI0TorchConfig):
         super().__init__(config)
         self.model: PI0Model = None
-        self.state_norm_stats = config.state_norm_stats
-        self.action_norm_stats = config.action_norm_stats
+        norm_stats_path = getattr(config, "norm_stats_path", None)
+        if norm_stats_path:
+            if not os.path.exists(norm_stats_path):
+                raise FileNotFoundError(f"norm_stats_path does not exist: {norm_stats_path}")
+            self.state_norm_stats, self.action_norm_stats = _load_norm_stats_from_path(norm_stats_path)
+            config.state_norm_stats = self.state_norm_stats
+            config.action_norm_stats = self.action_norm_stats
+        else:
+            self.state_norm_stats = config.state_norm_stats
+            self.action_norm_stats = config.action_norm_stats
         self.pi05_enabled = config.pi05_enabled
 
         assert self.state_norm_stats, "state_norm_stats must be provided in PI0TorchConfig"
@@ -122,7 +148,17 @@ class PI0ForActionPrediction(PreTrainedModel, SupportSACTraining):
         self.action_normalize_transform = Normalize(self.action_norm_stats, use_quantiles=self.pi05_enabled)
         self.image_transform = ImageTransform(resize_imgs_with_padding=(224, 224), enable_image_aug=False)
         max_length = 200 if self.pi05_enabled else 48
-        self.prompt_tokenizer_transform = PromptTokenizerTransform(max_length=max_length, discrete_state_input=False)
+        self.adapt_to_pi = bool(getattr(config, "adapt_to_pi", False))
+        self.use_delta_joint_actions = bool(getattr(config, "use_delta_joint_actions", True))
+        self.discrete_state_input = bool(getattr(config, "discrete_state_input", self.pi05_enabled))
+        self.max_action_dim = int(getattr(config, "max_action_dim", 32))
+        self.aloha_inputs_transform = AlohaInputs(adapt_to_pi=self.adapt_to_pi)
+        self.delta_action_transform = DeltaActions()
+        self.pad_states_and_actions_transform = PadStatesAndActions(action_dim=self.max_action_dim)
+        self.prompt_tokenizer_transform = PromptTokenizerTransform(
+            max_length=max_length,
+            discrete_state_input=self.discrete_state_input,
+        )
 
         # Output transforms
         self.state_unnormalize_transform = Unnormalize(self.state_norm_stats, use_quantiles=self.pi05_enabled)
@@ -221,6 +257,8 @@ class PI0ForActionPrediction(PreTrainedModel, SupportSACTraining):
         self.state_unnormalize_transform.to(device)
         self.action_normalize_transform.to(device)
         self.action_unnormalize_transform.to(device)
+        self.aloha_inputs_transform.to(device)
+        self.delta_action_transform.to(device)
         return self
 
     def forward(
@@ -368,20 +406,21 @@ class PI0ForActionPrediction(PreTrainedModel, SupportSACTraining):
         actions: dict[str, torch.Tensor],
         valids: torch.Tensor,
     ) -> torch.Tensor:
-        """Calculate the BC loss for the actor."""
+        """Calculate the BC loss using the same PI0 flow-matching objective as SFT."""
 
         prefix_features, states = state_features
         _, prefix_pad_masks, _ = prefix_features
         action_tensor = actions["full_action"]
+        action_loss_mask = actions.get("action_loss_mask", None)
 
         batch_size = action_tensor.shape[0]
         device = action_tensor.device
 
         noise = self.model.sample_noise(action_tensor.shape, device=device)
-        gamma1 = torch.empty((batch_size,), device=device).uniform_(0, 1).pow(1 / 1.5)
-        gamma2 = torch.empty((batch_size,), device=device).uniform_(0, 1).pow(1 / 1.0)
-        time = (gamma1 / (gamma1 + gamma2)) * 0.999 + 0.001
-        time = time.to(dtype=torch.float32, device=device)
+        alpha_t = torch.as_tensor(1.5, dtype=torch.float32, device=device)
+        beta_t = torch.as_tensor(1.0, dtype=torch.float32, device=device)
+        time_beta = torch.distributions.Beta(alpha_t, beta_t).sample((batch_size,))
+        time = (time_beta * 0.999 + 0.001).to(dtype=torch.float32, device=device)
 
         time_expanded = time[:, None, None]
         x_t = time_expanded * noise + (1.0 - time_expanded) * action_tensor
@@ -396,9 +435,15 @@ class PI0ForActionPrediction(PreTrainedModel, SupportSACTraining):
             time,
         )
 
-        loss = torch.nn.functional.mse_loss(u_t, model_pred, reduction="none").mean(dim=-1).mean(dim=-1)
-        valid_f = valids.float().to(loss.device)
-        return (loss * valid_f).sum() / valid_f.sum().clamp_min(1.0)
+        loss = torch.nn.functional.mse_loss(u_t, model_pred, reduction="none").mean(dim=-1)
+        if action_loss_mask is not None:
+            mask = action_loss_mask.to(device=loss.device, dtype=loss.dtype)
+        else:
+            mask = torch.ones_like(loss, dtype=loss.dtype, device=loss.device)
+
+        valid_f = valids.float().to(loss.device).unsqueeze(-1)
+        mask = mask * valid_f
+        return (loss * mask).sum() / mask.sum().clamp_min(1.0)
 
     def process_dataset_batch(
         self, 
@@ -427,30 +472,57 @@ class PI0ForActionPrediction(PreTrainedModel, SupportSACTraining):
         out['s1.images'] = torch.stack(images, dim=1)
         out['s1.image_masks'] = torch.stack(batch.s1['img_masks'], dim=1)
 
-        # Process language
-        # s0
-        lang_tokens, lang_masks = self.prompt_tokenizer_transform.call_batch(
-            {'task': batch.s0['task'], 'observation.state': batch.s0['state']},
-            tokenizer=tokenizer
+        # Align state/action preprocessing with SFT Pi0Transform:
+        # AlohaInputs -> optional DeltaActions -> Normalize -> Prompt tokenize -> PadStatesAndActions
+        s0_action_dict = {
+            'observation.state': batch.s0['state'],
+            'action': batch.a0['action'],
+        }
+        s1_action_dict = {
+            'observation.state': batch.s1['state'],
+            'action': batch.a1['action'],
+        }
+        s0_action_dict = self.aloha_inputs_transform.call_batch(s0_action_dict)
+        s1_action_dict = self.aloha_inputs_transform.call_batch(s1_action_dict)
+        if self.use_delta_joint_actions:
+            s0_action_dict = self.delta_action_transform(s0_action_dict)
+            s1_action_dict = self.delta_action_transform(s1_action_dict)
+
+        s0_state_normalized = self.state_normalize_transform(s0_action_dict['observation.state'])
+        s1_state_normalized = self.state_normalize_transform(s1_action_dict['observation.state'])
+        a0_action_normalized = self.action_normalize_transform(s0_action_dict['action'])
+        a1_action_normalized = self.action_normalize_transform(s1_action_dict['action'])
+
+        # Prompt tokenization in SFT uses the normalized (unpadded) state.
+        out['s0.lang_tokens'], out['s0.lang_masks'] = self.prompt_tokenizer_transform.call_batch(
+            {'task': batch.s0['task'], 'observation.state': s0_state_normalized},
+            tokenizer=tokenizer,
         )
-        out['s0.lang_tokens'] = lang_tokens
-        out['s0.lang_masks'] = lang_masks
-
-        # s1
-        lang_tokens, lang_masks = self.prompt_tokenizer_transform.call_batch(
-            {'task': batch.s1['task'], 'observation.state': batch.s1['state']},
-            tokenizer=tokenizer
+        out['s1.lang_tokens'], out['s1.lang_masks'] = self.prompt_tokenizer_transform.call_batch(
+            {'task': batch.s1['task'], 'observation.state': s1_state_normalized},
+            tokenizer=tokenizer,
         )
-        out['s1.lang_tokens'] = lang_tokens
-        out['s1.lang_masks'] = lang_masks
 
-        # Process states
-        out['s0.states'] = self.state_normalize_transform(batch.s0['state'])
-        out['s1.states'] = self.state_normalize_transform(batch.s1['state'])
-
-        # Process actions
-        out['a0.full_action'] = self.action_normalize_transform(batch.a0['action'])
-        out['a1.full_action'] = self.action_normalize_transform(batch.a1['action'])
+        s0_padded = self.pad_states_and_actions_transform({
+            'observation.state': s0_state_normalized,
+            'action': a0_action_normalized,
+        })
+        s1_padded = self.pad_states_and_actions_transform({
+            'observation.state': s1_state_normalized,
+            'action': a1_action_normalized,
+        })
+        out['s0.states'] = s0_padded['observation.state']
+        out['s1.states'] = s1_padded['observation.state']
+        out['a0.full_action'] = s0_padded['action']
+        out['a1.full_action'] = s1_padded['action']
+        out['a0.action_loss_mask'] = batch.a0.get(
+            'action_loss_mask',
+            torch.ones(out['a0.full_action'].shape[:2], dtype=torch.bool, device=out['a0.full_action'].device),
+        ).to(device=out['a0.full_action'].device, dtype=torch.bool)
+        out['a1.action_loss_mask'] = batch.a1.get(
+            'action_loss_mask',
+            torch.ones(out['a1.full_action'].shape[:2], dtype=torch.bool, device=out['a1.full_action'].device),
+        ).to(device=out['a1.full_action'].device, dtype=torch.bool)
 
         # Process other information
         out['rewards'] = batch.rewards.to(out['s0.states'].device)

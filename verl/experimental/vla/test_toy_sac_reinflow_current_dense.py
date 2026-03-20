@@ -1,32 +1,16 @@
-
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
-Toy SAC + PI0/flow exact-path-logprob validation script adapted to the current ReinFlow-lite interfaces.
-
-What this script is for:
-1) Exercise the CURRENT model-layer stochastic process logprob (`flow_logprob_mode=path_exact`)
-2) Exercise the CURRENT SAC actor update path with replay-pool, task_ids, dones, valids, positive_sample_mask
-3) Check whether the modified logp path can support learning on a simple continuous-control task
-
-Key differences vs older toy scripts:
-- Adds `task_ids`, `dones`, `valids`, `positive_sample_mask` to match current `RobDataParallelSACActor.update_policy`
-- Supports current ReinFlow-lite config knobs:
-    * flow_logprob_mode
-    * flow_sigma_min / max / init
-    * flow_sigma_head_hidden_dim
-    * flow_sigma_use_latent_stats
-- Keeps a tiny fake PI0 backbone so the algorithm/model-layer interface is tested without needing a real checkpoint
-- Uses a simple origin-reaching task where success and terminal are easy to inspect
+Toy SAC + PI0/flow exact-path-logprob validation script
+Dense-reward version for current ReinFlow-lite interfaces.
 """
 import argparse
 import json
-import math
 import os
 import random
 import tempfile
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, Tuple
 
 import torch
 from torch import nn
@@ -113,7 +97,7 @@ class FakePI0Model(nn.Module):
 
 
 # ----------------------------
-# Simple origin-reaching env
+# Dense-reward origin-reaching env
 # ----------------------------
 class ReachOriginToyEnv:
     def __init__(
@@ -126,6 +110,7 @@ class ReachOriginToyEnv:
         noise_std: float = 0.01,
         done_on_success: bool = True,
         state_scale: float = 1.0,
+        reward_mode: str = "dense",
     ):
         self.exec_steps = exec_steps
         self.exec_dim = exec_dim
@@ -135,6 +120,8 @@ class ReachOriginToyEnv:
         self.noise_std = noise_std
         self.done_on_success = done_on_success
         self.state_scale = state_scale
+        assert reward_mode in ("dense", "sparse")
+        self.reward_mode = reward_mode
 
     def reset_raw(self, B: int, device: torch.device, start_range: float = 1.0) -> torch.Tensor:
         s7 = torch.empty((B, self.exec_dim), device=device).uniform_(-start_range, start_range)
@@ -142,7 +129,21 @@ class ReachOriginToyEnv:
         s32[:, : self.exec_dim] = s7
         return s32
 
-    def step_chunk_raw(self, s32: torch.Tensor, a_seq_10x7: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    def _reward_dense(self, s7: torch.Tensor, a: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
+        return -self.state_scale * (s7.pow(2).sum(dim=-1)) - self.action_cost * (a.pow(2).sum(dim=-1))
+
+    def _reward_sparse(self, s7: torch.Tensor, a: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
+        dist = torch.norm(s7, dim=-1)
+        success = dist <= self.success_radius
+        return torch.where(
+            success,
+            torch.full((s7.shape[0],), self.success_reward, device=s7.device, dtype=dtype),
+            torch.zeros((s7.shape[0],), device=s7.device, dtype=dtype),
+        ) - self.action_cost * (a.pow(2).sum(dim=-1))
+
+    def step_chunk_raw(
+        self, s32: torch.Tensor, a_seq_10x7: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         B = s32.shape[0]
         device = s32.device
         s7 = s32[:, : self.exec_dim].clone()
@@ -155,31 +156,33 @@ class ReachOriginToyEnv:
             a = a_seq_10x7[:, k, :]
             not_done = ~done
             if not_done.any():
-                noise = self.noise_std * torch.randn_like(s7[not_done]) if self.noise_std > 0 else torch.zeros_like(s7[not_done])
+                if self.noise_std > 0:
+                    noise = self.noise_std * torch.randn_like(s7[not_done])
+                else:
+                    noise = torch.zeros_like(s7[not_done])
                 s7_next = s7[not_done] + a[not_done] + noise
                 s7 = s7.clone()
                 s7[not_done] = s7_next
 
-            dist = torch.norm(s7, dim=-1)
-            success = dist <= self.success_radius
-            r = torch.where(
-                success,
-                torch.full((B,), self.success_reward, device=device, dtype=s32.dtype),
-                torch.zeros((B,), device=device, dtype=s32.dtype),
-            ) - self.action_cost * (a.pow(2).sum(dim=-1))
+            if self.reward_mode == "dense":
+                r = self._reward_dense(s7, a, s32.dtype)
+            else:
+                r = self._reward_sparse(s7, a, s32.dtype)
 
             step_mask = (~done).to(torch.bool)
             masks.append(step_mask)
             rewards.append(torch.where(step_mask, r, torch.zeros_like(r)))
 
             if self.done_on_success:
+                dist = torch.norm(s7, dim=-1)
+                success = dist <= self.success_radius
                 done = done | success
 
         s_next = torch.zeros_like(s32)
         s_next[:, : self.exec_dim] = s7
-        rewards_seq = torch.stack(rewards, dim=-1)
-        response_mask = torch.stack(masks, dim=-1)
-        chunk_done = done.clone()
+        rewards_seq = torch.stack(rewards, dim=-1)      # [B, T]
+        response_mask = torch.stack(masks, dim=-1)      # [B, T]
+        chunk_done = done.clone()                       # [B]
         return s_next, rewards_seq, response_mask, chunk_done
 
 
@@ -199,14 +202,9 @@ def make_dummy_obs(states32: torch.Tensor, device: torch.device) -> Dict[str, to
 
 
 def _call_sac_forward_actor(policy, state_features):
-    """Compatibility wrapper for current/older sac_forward_actor interfaces.
-
-    Returns:
-        actions, logp, metrics_dict
-    """
     out = policy.sac_forward_actor(state_features)
     if not isinstance(out, tuple):
-        raise TypeError(f"policy.sac_forward_actor must return a tuple, got {type(out)}")
+        raise TypeError(f"policy.sac_forward_actor must return tuple, got {type(out)}")
     if len(out) == 2:
         actions, logp = out
         metrics = {}
@@ -234,12 +232,12 @@ def collect_rollout_batch(policy, env, B, exec_steps, exec_dim, gamma_micro, dev
     mask_f = response_mask.to(rewards_seq.dtype)
     denom = mask_f.sum(dim=-1).clamp_min(1.0)
     reward_disc_sum = (rewards_seq * discounts * mask_f).sum(dim=-1)
-    reward_scalar = reward_disc_sum / denom
+    reward_scalar = reward_disc_sum / denom   # [B]
 
-    rewards_for_algo = reward_scalar.to(torch.float32)
-    dones_for_algo = chunk_done.to(torch.float32)
+    rewards_for_algo = reward_scalar.to(torch.float32)                 # [B]
+    dones_for_algo = chunk_done.to(torch.float32)                     # [B]
     valids_for_algo = torch.ones((B,), device=device, dtype=torch.float32)
-    positive_for_algo = chunk_done.to(torch.float32)
+    positive_for_algo = chunk_done.to(torch.float32)                  # [B]
 
     batch = TensorDict(
         {
@@ -256,7 +254,7 @@ def collect_rollout_batch(policy, env, B, exec_steps, exec_dim, gamma_micro, dev
             "s1.lang_tokens": make_dummy_obs(s1, device)["lang_tokens"],
             "s0.lang_masks": s0_obs["lang_masks"],
             "s1.lang_masks": make_dummy_obs(s1, device)["lang_masks"],
-            "rewards": rewards_for_algo.to(torch.float32),
+            "rewards": rewards_for_algo,
             "dones": dones_for_algo,
             "valids": valids_for_algo,
             "positive_sample_mask": positive_for_algo,
@@ -268,6 +266,7 @@ def collect_rollout_batch(policy, env, B, exec_steps, exec_dim, gamma_micro, dev
 
     dist0 = torch.norm(s0[:, :exec_dim], dim=-1)
     dist1 = torch.norm(s1[:, :exec_dim], dim=-1)
+
     dbg = {
         "reward_scalar_mean": reward_scalar.mean().item(),
         "dist0": dist0.mean().item(),
@@ -286,7 +285,7 @@ def moving_average(x, w=10):
     out = []
     for i in range(len(x)):
         j0 = max(0, i - w + 1)
-        out.append(sum(x[j0:i+1]) / (i - j0 + 1))
+        out.append(sum(x[j0:i + 1]) / (i - j0 + 1))
     return out
 
 
@@ -305,7 +304,7 @@ def plot_series(series, out_path, smooth=1):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--updates", type=int, default=200)
+    parser.add_argument("--updates", type=int, default=500)
     parser.add_argument("--batch_size", type=int, default=128)
     parser.add_argument("--micro_bs", type=int, default=64)
     parser.add_argument("--exec_steps", type=int, default=10)
@@ -313,22 +312,27 @@ def main():
     parser.add_argument("--gamma_micro", type=float, default=0.99)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--smooth", type=int, default=10)
-    parser.add_argument("--out_dir", type=str, default="toy_reinflow_current")
+    parser.add_argument("--out_dir", type=str, default="toy_reinflow_dense")
     parser.add_argument("--success_radius", type=float, default=0.15)
     parser.add_argument("--success_reward", type=float, default=1.0)
     parser.add_argument("--action_cost", type=float, default=0.01)
+    parser.add_argument("--state_scale", type=float, default=1.0)
     parser.add_argument("--start_range", type=float, default=1.0)
     parser.add_argument("--noise_std", type=float, default=0.01)
+    parser.add_argument("--reward_mode", type=str, default="dense", choices=["dense", "sparse"])
+
     parser.add_argument("--auto_entropy", action="store_true", default=False)
-    parser.add_argument("--initial_alpha", type=float, default=0.2)
+    parser.add_argument("--initial_alpha", type=float, default=0.0)
     parser.add_argument("--alpha_lr", type=float, default=3e-4)
     parser.add_argument("--target_entropy", type=float, default=None)
+
     parser.add_argument("--flow_logprob_mode", type=str, default="path_exact", choices=["path_exact", "surrogate"])
     parser.add_argument("--flow_sigma_min", type=float, default=1e-3)
     parser.add_argument("--flow_sigma_max", type=float, default=5e-1)
     parser.add_argument("--flow_sigma_init", type=float, default=5e-2)
     parser.add_argument("--flow_sigma_head_hidden_dim", type=int, default=128)
     parser.add_argument("--flow_sigma_use_latent_stats", action="store_true", default=True)
+
     parser.add_argument("--critic_warmup_steps", type=int, default=20)
     args = parser.parse_args()
 
@@ -336,6 +340,7 @@ def main():
     torch.manual_seed(args.seed)
 
     import torch.distributed as dist
+
     def _init_dist_if_needed():
         if not dist.is_available() or dist.is_initialized():
             return
@@ -345,6 +350,7 @@ def main():
         else:
             init_file = f"file://{tempfile.gettempdir()}/pg_{os.getpid()}"
             dist.init_process_group(backend=backend, init_method=init_file, rank=0, world_size=1)
+
     _init_dist_if_needed()
 
     device_type = get_device_name()
@@ -361,6 +367,8 @@ def main():
         action_cost=args.action_cost,
         noise_std=args.noise_std,
         done_on_success=True,
+        state_scale=args.state_scale,
+        reward_mode=args.reward_mode,
     )
 
     state_norm_stats = {"mean": [0.0] * 32, "std": [1.0] * 32}
@@ -390,6 +398,7 @@ def main():
         prefix_len=1,
         prefix_dim=2048,
     ).to(device)
+
     policy.freeze_vision_tower = lambda: None
     policy._build_kv_cache_from_prefix = lambda prefix_features: None
 
@@ -435,6 +444,7 @@ def main():
             device=device,
             start_range=args.start_range,
         )
+
         data = DataProto(batch=batch, meta_info={"global_steps": step})
         metrics = actor.update_policy(data)
 
@@ -444,7 +454,11 @@ def main():
             sf = policy.sac_forward_state_features(s0_obs)
             a_full, logp, _actor_metrics_eval = _call_sac_forward_actor(policy, sf)
             q_pi = policy.sac_forward_critic(
-                {"full_action": a_full}, sf, use_target_network=False, method="min", requires_grad=False
+                {"full_action": a_full},
+                sf,
+                use_target_network=False,
+                method="min",
+                requires_grad=False,
             ).mean().item()
 
         metrics["debug/Q_pi"] = q_pi
@@ -457,28 +471,29 @@ def main():
             critic_loss = float(metrics.get("critic/loss", float("nan")))
             actor_loss = float(metrics.get("actor/loss", float("nan")))
             logp_mean = float(metrics.get("actor/logprob_mean", float("nan")))
-            q_pi = float(metrics.get("debug/Q_pi", float("nan")))
+            q_pi_val = float(metrics.get("debug/Q_pi", float("nan")))
+            succ1 = float(metrics.get("debug/succ1", float("nan")))
+            done_ratio = float(metrics.get("debug/chunk_done_ratio", float("nan")))
+            sigma_mean = float(metrics.get("actor/flow_sigma_mean", float("nan")))
+            path_logp = float(metrics.get("actor/flow_path_logprob_mean", float("nan")))
+            path_entropy = float(metrics.get("actor/flow_path_entropy_mean", float("nan")))
 
             print(
                 f"[step {step:04d}] "
                 f"critic_loss={critic_loss:.4f} "
                 f"actor_loss={actor_loss:.4f} "
                 f"logp={logp_mean:.3f} "
-                f"Q_pi={q_pi:.3f} "
-                f"succ1={metrics.get('debug/succ1', float('nan')):.3f} "
-                f"done={metrics.get('debug/done_ratio', float('nan')):.3f}"
+                f"Q_pi={q_pi_val:.3f} "
+                f"succ1={succ1:.3f} "
+                f"done={done_ratio:.3f} "
+                f"sigma={sigma_mean:.5f} "
+                f"path_logp={path_logp:.3f} "
+                f"path_entropy={path_entropy:.3f}"
             )
-            # print(
-            #     f"[step {step:04d}] critic_loss={metrics['critic/loss']:.4f} actor_loss={metrics['actor/loss']:.4f} "
-            #     f"Q_pi={metrics['debug/Q_pi']:.4f} succ1={metrics['debug/succ1']:.3f} "
-            #     f"done={metrics['debug/chunk_done_ratio']:.3f} sigma={metrics.get('actor/flow_sigma_mean', 0.0):.5f} "
-            #     f"path_logp={metrics.get('actor/flow_path_logprob_mean', 0.0):.3f} "
-            #     f"path_entropy={metrics.get('actor/flow_path_entropy_mean', 0.0):.3f} "
-            #     f"eval_logp={metrics['debug/logp_mean_eval']:.3f}"
-            # )
 
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
+
     jsonl_path = out_dir / "metrics.jsonl"
     with open(jsonl_path, "w", encoding="utf-8") as f:
         for m in metrics_hist:
@@ -494,6 +509,9 @@ def main():
         ("debug/Q_pi", "Q_pi.png"),
         ("debug/succ1", "succ1.png"),
         ("debug/chunk_done_ratio", "chunk_done_ratio.png"),
+        ("debug/reward_scalar_mean", "reward_scalar_mean.png"),
+        ("debug/dist0", "dist0.png"),
+        ("debug/dist1", "dist1.png"),
         ("actor/flow_sigma_mean", "flow_sigma_mean.png"),
         ("actor/flow_sigma_std", "flow_sigma_std.png"),
         ("actor/flow_path_logprob_mean", "flow_path_logprob_mean.png"),
@@ -501,6 +519,7 @@ def main():
         ("debug/logp_mean_eval", "eval_logp_mean.png"),
     ]:
         plot_series(get_series(key), out_dir / name, smooth=args.smooth)
+
 
 if __name__ == "__main__":
     main()

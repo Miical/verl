@@ -38,6 +38,8 @@ from verl.utils.metric import reduce_metrics
 REQUIRED_TRAIN_BATCH_KEYS = [
     "a0.full_action",
     "a1.full_action",
+    "a0.action_loss_mask",
+    "a1.action_loss_mask",
     "s0.states",
     "s1.states",
     "s0.images",

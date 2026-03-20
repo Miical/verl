@@ -24,6 +24,7 @@ class PI0TorchConfig(PretrainedConfig):
         self.state_norm_stats = kwargs.get("state_norm_stats", {})
         self.action_norm_stats = kwargs.get("action_norm_stats", {})
         self.pi05_enabled = kwargs.get("pi05_enabled", False)
+        self.norm_stats_path = kwargs.get("norm_stats_path", None)
 
         # ReinFlow-lite stochastic flow parameters
         self.flow_logprob_mode = kwargs.get("flow_logprob_mode", "path_exact")

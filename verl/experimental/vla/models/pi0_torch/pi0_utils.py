@@ -114,10 +114,9 @@ class DeltaActions:
         if "action" not in data or "observation.state" not in data:
             return data
         state, action = data["observation.state"], data["action"]
-        dims = self.mask.shape[-1]
-        action[..., :dims] -= torch.where(self.mask, state[..., :dims], torch.zeros_like(state[..., :dims])).unsqueeze(
-            -2
-        )
+        mask = self.mask.to(device=state.device)
+        dims = mask.shape[-1]
+        action[..., :dims] -= torch.where(mask, state[..., :dims], torch.zeros_like(state[..., :dims])).unsqueeze(-2)
         data["action"] = action
         return data
 
@@ -136,10 +135,9 @@ class AbsoluteActions:
         if "action" not in data or "observation.state" not in data:
             return data
         state, action = data["observation.state"], data["action"]
-        dims = self.mask.shape[-1]
-        action[..., :dims] += torch.where(self.mask, state[..., :dims], torch.zeros_like(state[..., :dims])).unsqueeze(
-            -2
-        )
+        mask = self.mask.to(device=state.device)
+        dims = mask.shape[-1]
+        action[..., :dims] += torch.where(mask, state[..., :dims], torch.zeros_like(state[..., :dims])).unsqueeze(-2)
         data["action"] = action
         return data
 
@@ -183,14 +181,16 @@ class AlohaInputs:
 
     def _encode_actions_inv(self, actions: torch.Tensor) -> torch.Tensor:
         if self.adapt_to_pi:
-            actions[:, :14] = self.joint_flip_mask * actions[:, :14]
+            joint_flip_mask = self.joint_flip_mask.to(device=actions.device)
+            actions[:, :14] = joint_flip_mask * actions[:, :14]
             actions[:, [6, 13]] = self._gripper_from_angular_inv(actions[:, [6, 13]])
         return actions
 
     def _decode_state(self, state: torch.Tensor) -> torch.Tensor:
         if self.adapt_to_pi:
             # Flip the joints.
-            state[:14] = self.joint_flip_mask * state[:14]
+            joint_flip_mask = self.joint_flip_mask.to(device=state.device)
+            state[:14] = joint_flip_mask * state[:14]
             # Reverse the gripper transformation that is being applied by the Aloha runtime.
             state[[6, 13]] = self._gripper_to_angular(state[[6, 13]])
         return state
@@ -217,13 +217,15 @@ class AlohaInputs:
 
     def _encode_actions_inv_batch(self, actions: torch.Tensor) -> torch.Tensor:
         if self.adapt_to_pi:
-            actions[..., :14] = self.joint_flip_mask * actions[..., :14]
+            joint_flip_mask = self.joint_flip_mask.to(device=actions.device)
+            actions[..., :14] = joint_flip_mask * actions[..., :14]
             actions[..., [6, 13]] = self._gripper_from_angular_inv(actions[..., [6, 13]])
         return actions
 
     def _decode_state_batch(self, state: torch.Tensor) -> torch.Tensor:
         if self.adapt_to_pi:
-            state[..., :14] = self.joint_flip_mask * state[..., :14]
+            joint_flip_mask = self.joint_flip_mask.to(device=state.device)
+            state[..., :14] = joint_flip_mask * state[..., :14]
             state[..., [6, 13]] = self._gripper_to_angular(state[..., [6, 13]])
         return state
 
@@ -270,7 +272,8 @@ class AlohaOutputs:
     def _encode_actions(self, actions: torch.Tensor) -> torch.Tensor:
         if self.adapt_to_pi:
             # Flip the joints.
-            actions[:, :14] = self.joint_flip_mask * actions[:, :14]
+            joint_flip_mask = self.joint_flip_mask.to(device=actions.device)
+            actions[:, :14] = joint_flip_mask * actions[:, :14]
             actions[:, [6, 13]] = self._gripper_from_angular(actions[:, [6, 13]])
         return actions
 
@@ -282,7 +285,8 @@ class AlohaOutputs:
 
     def _encode_actions_batch(self, actions: torch.Tensor) -> torch.Tensor:
         if self.adapt_to_pi:
-            actions[..., :14] = self.joint_flip_mask * actions[..., :14]
+            joint_flip_mask = self.joint_flip_mask.to(device=actions.device)
+            actions[..., :14] = joint_flip_mask * actions[..., :14]
             actions[..., [6, 13]] = self._gripper_from_angular(actions[..., [6, 13]])
         return actions
 

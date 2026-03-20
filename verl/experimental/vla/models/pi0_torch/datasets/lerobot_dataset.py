@@ -4,7 +4,7 @@ from typing_extensions import override
 from verl.protocol import DataProto
 
 from .base import Pi0DatasetInput
-from .utils import pad_last_dim_to, pad_dim_to
+from .utils import pad_dim_to
 
 
 def _get_required_image(batch: DataProto, key: str) -> torch.Tensor:
@@ -17,6 +17,34 @@ def _get_optional_image(batch: DataProto, key: str, fallback: torch.Tensor) -> t
     if key in batch.batch:
         return batch.batch[key]
     return torch.zeros_like(fallback)
+
+
+def _infer_task_list(batch: DataProto, batch_size: int) -> list[str]:
+    non_tensor_batch = getattr(batch, "non_tensor_batch", None)
+    if non_tensor_batch is not None:
+        for key in [
+            "task",
+            "tasks",
+            "language_instruction",
+            "instruction",
+            "t0.task",
+            "t0.language_instruction",
+        ]:
+            if key in non_tensor_batch:
+                values = non_tensor_batch[key]
+                if isinstance(values, str):
+                    return [values] * batch_size
+                return [str(v) for v in values]
+    return ["catch_bowl"] * batch_size
+
+
+def _get_action_loss_mask(batch: DataProto, key: str, batch_size: int, time_steps: int, device: torch.device) -> torch.Tensor:
+    if key in batch.batch:
+        mask = ~batch.batch[key].to(device=device, dtype=torch.bool)
+        if mask.ndim != 2:
+            raise ValueError(f"Expected {key} to have shape [B, T], got {tuple(mask.shape)}")
+        return mask
+    return torch.ones((batch_size, time_steps), dtype=torch.bool, device=device)
 
 
 class LeRobotPi0DatasetInput(Pi0DatasetInput):
@@ -36,6 +64,8 @@ class LeRobotPi0DatasetInput(Pi0DatasetInput):
         device = batch.batch["t0.observation.state"].device
         batch_size = batch.batch["t0.observation.state"].shape[0]
 
+        tasks = _infer_task_list(batch, batch_size)
+
         input.s0 = {
             "images": {
                 "observation.images.cam_high": cam_high_t0,
@@ -47,8 +77,8 @@ class LeRobotPi0DatasetInput(Pi0DatasetInput):
                 torch.ones((batch_size,), dtype=torch.bool, device=device),
                 torch.ones((batch_size,), dtype=torch.bool, device=device),
             ],
-            "task": ["catch_bowl"] * batch_size,
-            "state": pad_last_dim_to(batch.batch["t0.observation.state"], 32),
+            "task": tasks,
+            "state": batch.batch["t0.observation.state"],
         }
 
         input.s1 = {
@@ -62,8 +92,8 @@ class LeRobotPi0DatasetInput(Pi0DatasetInput):
                 torch.ones((batch_size,), dtype=torch.bool, device=device),
                 torch.ones((batch_size,), dtype=torch.bool, device=device),
             ],
-            "task": ["catch_bowl"] * batch_size,
-            "state": pad_last_dim_to(batch.batch["t1.observation.state"], 32),
+            "task": tasks,
+            "state": batch.batch["t1.observation.state"],
         }
 
         a0 = batch.batch["t0.action"]
@@ -74,13 +104,27 @@ class LeRobotPi0DatasetInput(Pi0DatasetInput):
         if a1.ndim != 3:
             raise ValueError(f"Expected t1.action to be chunk action [B, T, A], got shape={tuple(a1.shape)}")
 
-        a0 = pad_last_dim_to(a0, 32)
-        a1 = pad_last_dim_to(a1, 32)
-        a0 = pad_dim_to(a0, dim=1, target_size=50)
-        a1 = pad_dim_to(a1, dim=1, target_size=50)
+        a0_time_steps = a0.shape[1]
+        a1_time_steps = a1.shape[1]
+        a0_action_loss_mask = _get_action_loss_mask(batch, "t0.action_is_pad", batch_size, a0_time_steps, device)
+        a1_action_loss_mask = _get_action_loss_mask(batch, "t1.action_is_pad", batch_size, a1_time_steps, device)
 
-        input.a0 = {"action": a0}
-        input.a1 = {"action": a1}
+        if a0_time_steps < 50:
+            a0 = pad_dim_to(a0, dim=1, target_size=50)
+            a0_action_loss_mask = pad_dim_to(a0_action_loss_mask, dim=1, target_size=50)
+        elif a0_time_steps > 50:
+            a0 = a0[:, :50]
+            a0_action_loss_mask = a0_action_loss_mask[:, :50]
+
+        if a1_time_steps < 50:
+            a1 = pad_dim_to(a1, dim=1, target_size=50)
+            a1_action_loss_mask = pad_dim_to(a1_action_loss_mask, dim=1, target_size=50)
+        elif a1_time_steps > 50:
+            a1 = a1[:, :50]
+            a1_action_loss_mask = a1_action_loss_mask[:, :50]
+
+        input.a0 = {"action": a0, "action_loss_mask": a0_action_loss_mask}
+        input.a1 = {"action": a1, "action_loss_mask": a1_action_loss_mask}
 
         done = None
         for done_key in ["t1.next.done", "t0.next.done", "next.done"]:

@@ -42,6 +42,37 @@ def calculate_reward(data: DataProto, return_dict: bool = False) -> torch.Tensor
     return reward_per_step
 
 
+def _maybe_set_dataset_norm_stats_path(config):
+    dataset_type = OmegaConf.select(config, "actor_rollout_ref.model.override_config.dataset_type")
+    if dataset_type != "lerobot":
+        return
+
+    current = OmegaConf.select(config, "actor_rollout_ref.model.override_config.norm_stats_path")
+    if current:
+        return
+
+    rlpd_root = OmegaConf.select(config, "data.rlpd_files")
+    if not rlpd_root:
+        return
+
+    candidates = [
+        os.path.join(rlpd_root, "meta", "giga_pi05_norm_stats.json"),
+        os.path.join(rlpd_root, "meta", "norm_stats.json"),
+        os.path.join(rlpd_root, "meta", "norm.json"),
+    ]
+    for candidate in candidates:
+        if os.path.exists(candidate):
+            with open_dict(config.actor_rollout_ref.model.override_config):
+                config.actor_rollout_ref.model.override_config.norm_stats_path = candidate
+            logger.info(f"Using dataset norm stats from: {candidate}")
+            return
+
+    logger.warning(
+        "Could not auto-detect dataset norm stats under rlpd_files/meta; "
+        "falling back to checkpoint-provided state/action stats."
+    )
+
+
 @hydra.main(config_path="config", config_name="rob_sac_trainer", version_base=None)
 def main(config):
     if not ray.is_initialized():
@@ -61,6 +92,8 @@ def main_task(config):
     OmegaConf.resolve(config)
 
     offline_only = bool(config.trainer.get("offline_only", False))
+
+    _maybe_set_dataset_norm_stats_path(config)
 
     # propagate offline flag into actor_rollout worker config so worker-side code can branch on it
     with open_dict(config.actor_rollout_ref):
