@@ -83,6 +83,64 @@ LIBERO config and USD assets:
 - `/root/RobotLearningLab/benchmarks/datasets/libero/config`
 - `/root/RobotLearningLab/benchmarks/datasets/libero/USD`
 
+## RobotLearningLab Dependency
+
+### Repository and Branch
+
+| Item | Value |
+|------|-------|
+| Repo | `https://github.com/nvidia-china-sae/RobotLearningLab` |
+| Branch | `yujie/update/2.3.0-verl` |
+| Required commit | `b97fa8bb` (`verl needed changes`) |
+
+The pipeline depends on `isaaclab_playground` (installed via `pip install -e` from `source/isaaclab_playground/`) and the `isaaclab` framework (from `source/isaaclab/`).
+
+### Files Used at Runtime
+
+**isaaclab_playground code (8 key files):**
+
+| File | Purpose |
+|------|---------|
+| `tasks/manipulation/libero/config/franka/__init__.py` | Gym registration for `Isaac-Libero-Franka-IK-Abs-v0` |
+| `tasks/manipulation/libero/config/franka/franka_libero_env_cfg.py` | Scene, controller, light, observation, termination configs |
+| `tasks/manipulation/libero/mdp/events.py` | Object pose randomization on env reset |
+| `tasks/manipulation/libero/mdp/observations.py` | Contact force, object grasped observations |
+| `tasks/manipulation/libero/mdp/terminations.py` | `libero_goals_reached` task success check |
+| `assets/robots/franka.py` | `FRANKA_PANDA_LIBERO_HIGH_PD_CFG` robot config |
+| `utils/decorators.py` | `@subtask_termination` decorator |
+
+**Data files:**
+
+| Path | Purpose |
+|------|---------|
+| `benchmarks/datasets/libero/config/libero_object.json` | Task definitions (workspace, objects, regions, goals) |
+| `benchmarks/datasets/libero/USD/` | USD scene assets (floor, objects) |
+| `benchmarks/datasets/libero/assembled_hdf5/` | HDF5 demo files for fixed-state reset |
+
+### Modifications in `b97fa8bb` (vs upstream `update/2.3.0`)
+
+**1. Wrist camera observation (`franka_libero_env_cfg.py`)**
+
+The upstream code creates the `eye_in_hand_cam` CameraCfg (hardware) but does not register it as an observation. The commit adds a `wrist_image` ObsTerm so the observation manager collects wrist RGB images for Pi0 input.
+
+**2. Partial env reset fix (`events.py`)**
+
+Removed the `len(env_list) != num_envs` early return in `randomize_object_pose_by_groups`. Without this fix, when individual environments complete tasks and auto-reset mid-rollout, objects are placed at origin (0,0,0) and explode due to interpenetration. See [Auto-Reset Object Explosion](#6-auto-reset-object-explosion-mid-rollout) below.
+
+**3. Light intensity (`franka_libero_env_cfg.py`)**
+
+Changed DomeLight intensity from 1000 to 200 across all four scene types (KitchenTable, LivingRoomTable, Floor, StudyTable) for better visual quality in saved videos.
+
+### Older Commit Pitfalls
+
+If using an older RobotLearningLab commit (before `b97fa8bb`), the following issues will occur:
+
+| Issue | Symptom | Fix |
+|-------|---------|-----|
+| Missing `wrist_image` ObsTerm | Pi0 receives no wrist camera image; may silently use zeros or crash | Add `wrist_image = ObsTerm(func=mdp.image, params={"sensor_cfg": SceneEntityCfg("eye_in_hand_cam"), "data_type": "rgb"})` to `ObservationsCfg.policy` |
+| Partial reset early return | Objects fly off screen when individual envs auto-reset after task completion | Remove the `if len(env_list) != env.cfg.scene.num_envs: return` guard in `randomize_object_pose_by_groups` |
+| Light intensity 1000 | Overexposed/washed-out video output | Change `DomeLightCfg(intensity=1000.0)` to `intensity=200.0` in all SceneCfg classes |
+
 ## Architecture
 
 ### Two Inference Paths
@@ -258,9 +316,42 @@ Target: $HOME/data/pi05_libero_torch/config.json
 
 The original config was backed up as `config_backup.json`.
 
-### 5. Arm Stabilization After Reset
+### 5. Multi-Env Broadcast Error on HDF5 Reset
 
-**Symptom:** After `env.reset()`, the arm drifts to origin during the 10-step stabilization loop.
+**Symptom:** `RuntimeError: output with shape [1, 3] doesn't match the broadcast shape [8, 3]` during `env.reset_to()`.
+
+**Cause:** HDF5 initial state has batch dimension 1, but `interactive_scene.py` expects batch dimension matching `num_envs`. The `initial_state` dict is deeply nested (`state["articulation"]["robot"]["root_pose"]`), requiring recursive expansion.
+
+**Fix:** `isaac_env.py` uses `_expand_state()` to recursively expand all tensors with batch dim 1 to `num_envs`:
+```python
+@staticmethod
+def _expand_state(state, num_envs):
+    if isinstance(state, torch.Tensor):
+        if state.shape[0] == 1:
+            return state.expand(num_envs, *state.shape[1:]).contiguous()
+        return state
+    if isinstance(state, dict):
+        return {k: IsaacEnv._expand_state(v, num_envs) for k, v in state.items()}
+    return state
+```
+
+### 6. Auto-Reset Object Explosion Mid-Rollout
+
+**Symptom:** After a task succeeds, objects in that environment scatter violently ("explode") before the next observation.
+
+**Cause:** Isaac Lab auto-resets completed environments inside `env.step()`. The reset triggers two events in sequence:
+1. `reset_scene_to_default` — moves all objects to their `init_state` default position, which is `(0, 0, 0)` for dynamically-added LIBERO objects
+2. `randomize_object_pose_by_groups` — was supposed to scatter objects to correct positions, but had an early return: `if len(env_ids) != num_envs: return` that skipped randomization for partial resets
+
+Result: all objects pile up at origin → PhysX detects interpenetration → objects launch at high velocity.
+
+**Fix:** Remove the early return guard in `events.py` (done in RobotLearningLab commit `b97fa8bb`). This allows object randomization even when only a subset of environments reset.
+
+**Impact:** The explosion only affects post-completion steps which are masked out during training (via `compute_response_mask`), so it does not corrupt training data. The fix is primarily for visual quality in saved videos.
+
+### 7. Arm Stabilization After Reset
+
+**Symptom:** After `env.reset()`, the arm drifts to the origin during the 10-step stabilization loop.
 
 **Cause:** Sending zero actions in IK-Abs mode commands the arm to move to position (0,0,0), not to hold its current position.
 
