@@ -4,7 +4,7 @@
     "fps": 50,
 
     "robot": {
-      "type": "piper_follower_end_effector",
+      "type": "piper_follower",
 
       "can_name_left": "can_left",
       "can_name_right": "can_right",

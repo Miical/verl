@@ -1051,8 +1051,8 @@ class RealRobotEnvWrapper:
         
         # 创建并处理初始transition
         complementary_data = (
-            {"raw_end_pose_value": info.pop("raw_end_pose_value")} 
-            if "raw_end_pose_value" in info else {}
+            {"raw_joint_positions": info.pop("raw_joint_positions")}
+            if "raw_joint_positions" in info else ({"raw_end_pose_value": info.pop("raw_end_pose_value")} if "raw_end_pose_value" in info else {})
         )
         self.current_transition = create_transition(
             observation=obs, 
@@ -1080,90 +1080,33 @@ class RealRobotEnvWrapper:
             truncated: bool 是否超时
             info_dict: 信息字典，包含intervene_action和intervene_flag
         """
-        # 转换为tensor
+        # 转换为 tensor / numpy 并统一成 14 维 joint action
         if isinstance(action, np.ndarray):
             action = torch.from_numpy(action).to(self.device)
-        
-        # 确保是 [action_dim] 格式
-        if action.ndim == 2:
+
+        if isinstance(action, torch.Tensor) and action.ndim == 2:
             action = action.squeeze(0)
+
         if action is not None:
             if isinstance(action, torch.Tensor):
-                action_np = action.cpu().numpy()
+                action_np = action.detach().cpu().numpy()
             else:
                 action_np = np.asarray(action, dtype=np.float32)
-            
-            # 检查维度并填充
+
             original_dim = action_np.shape[0]
-            if action_np.shape[0] == 7:
-                # 7维动作，填充另外7维为0（双臂机器人，只控制一个臂）
+            if original_dim == 7:
                 action_np = np.concatenate([action_np, np.zeros(7, dtype=np.float32)])
-                force_print(f"[RealRobotEnvWrapper] Action padded from 7 to 14 dims")
-            elif action_np.shape[0] > 14:
-                # 超过14维，截断
+                force_print("[RealRobotEnvWrapper] Joint action padded from 7 to 14 dims")
+            elif original_dim > 14:
                 action_np = action_np[:14]
-                force_print(f"[RealRobotEnvWrapper] Action truncated from {original_dim} to 14 dims")
-            elif action_np.shape[0] < 7:
-                # 小于7维，填充到14维
-                padding_size = 14 - action_np.shape[0]
-                action_np = np.concatenate([action_np, np.zeros(padding_size, dtype=np.float32)])
-                force_print(f"[RealRobotEnvWrapper] Action padded from {original_dim} to 14 dims")
-            
-            # 检查是否已初始化运动学求解器
-            if self.left_kin is None or self.right_kin is None:
-                force_print(f"[RealRobotEnvWrapper] WARNING: Kinematics not initialized, skipping FK conversion")
-                # 直接使用原始action,不做转换
-                action = torch.from_numpy(action_np).to(self.device)
-            else:
-                # 机器人运动学 FK: joint -> end-effector pose
-                # 先转回 tensor 以便索引
-                action_tensor = torch.from_numpy(action_np).to(self.device)
-                
-                left_joint_idx = [0, 1, 2, 3, 4, 5]
-                left_grip_idx = 6
-                right_joint_idx = [7, 8, 9, 10, 11, 12]
-                right_grip_idx = 13
-                
-                # 取出关节（rad）-> numpy
-                ql_rad = action_tensor[left_joint_idx].detach().cpu().numpy().astype(float)
-                qr_rad = action_tensor[right_joint_idx].detach().cpu().numpy().astype(float)
+                force_print(f"[RealRobotEnvWrapper] Joint action truncated from {original_dim} to 14 dims")
+            elif original_dim < 14:
+                action_np = np.concatenate([action_np, np.zeros(14 - original_dim, dtype=np.float32)])
+                force_print(f"[RealRobotEnvWrapper] Joint action padded from {original_dim} to 14 dims")
 
-                # RobotKinematics.forward_kinematics 接口使用"度"
-                ql_deg = np.rad2deg(ql_rad)
-                qr_deg = np.rad2deg(qr_rad)
+            action = torch.from_numpy(action_np).to(self.device, dtype=torch.float32)
+            force_print(f"[RealRobotEnvWrapper] Joint action: {action}")
 
-                # 做 FK (使用缓存的kinematics对象)
-                T_l = self.left_kin.forward_kinematics(ql_deg)   # 4x4
-                T_r = self.right_kin.forward_kinematics(qr_deg)  # 4x4
-
-                # 位置：米
-                lx, ly, lz = T_l[:3, 3].tolist()
-                rx, ry, rz = T_r[:3, 3].tolist()
-
-                # 姿态：旋转矩阵 -> RPY（弧度）
-                lrx, lry, lrz = rotmat_to_rpy_zyx(T_l[:3, :3])
-                rrx, rry, rrz = rotmat_to_rpy_zyx(T_r[:3, :3])
-
-                # 夹爪：从 action 中获取
-                l_grip = float(action_tensor[left_grip_idx].item())
-                r_grip = float(action_tensor[right_grip_idx].item())
-
-                # 构建 end-effector pose action (14维)
-                # [L_x, L_y, L_z, L_rx, L_ry, L_rz, L_grip,
-                #  R_x, R_y, R_z, R_rx, R_ry, R_rz, R_grip]
-                endpose_action = torch.tensor(
-                    [
-                        lx, ly, lz, lrx, lry, lrz, l_grip,
-                        rx, ry, rz, rrx, rry, rrz, r_grip,
-                    ],
-                    device=self.device,
-                    dtype=torch.float32,
-                )
-                
-                # 使用转换后的 end-effector pose action
-                force_print(f"[RealRobotEnvWrapper] End-effector pose action: {endpose_action}")
-                action = endpose_action
-        
         # 通过处理器管道执行步骤（处理人工介入）
         self.current_transition = step_env_and_process_transition(
             env=self.env,

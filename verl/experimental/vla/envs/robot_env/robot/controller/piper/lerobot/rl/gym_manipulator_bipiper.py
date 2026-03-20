@@ -180,52 +180,37 @@ class GymManipulatorConfig:
     device: str = "cpu"
 
 
-def reset_follower_position(robot_arm: Robot, target_position: np.ndarray,end_pose_name) -> None:
-    """Reset robot arm to target position using smooth trajectory."""
-    robot_arm.bus_left.interface.ModeCtrl(ctrl_mode=0x01, move_mode=0x01,move_spd_rate_ctrl=50, is_mit_mode=0x00)
-    robot_arm.bus_right.interface.ModeCtrl(ctrl_mode=0x01, move_mode=0x01,move_spd_rate_ctrl=50, is_mit_mode=0x00)
-    current_position_dict_left = robot_arm.bus_left.sync_read("Present_Position")
-    current_position_dict_right = robot_arm.bus_right.sync_read("Present_Position")
-    current_position_left = np.array(
-        [current_position_dict_left[name] for name in current_position_dict_left], dtype=np.float32
-    )
-    current_position_right = np.array(
-        [current_position_dict_right[name] for name in current_position_dict_right], dtype=np.float32
-    )
-    # pdb.set_trace()
-    target_position_left=target_position[:7]
-    target_position_right=target_position[7:]
-    trajectory_left = torch.from_numpy(
-        np.linspace(current_position_left, target_position_left, 50)
-    )  # NOTE: 30 is just an arbitrary number
-    trajectory_right = torch.from_numpy(
-        np.linspace(current_position_right, target_position_right, 50)
-    )  # NOTE: 30 is just an arbitrary number
-    # pdb.set_trace()
-    # busy_wait(0.1)
-    for pose_left,pose_right in zip(trajectory_left,trajectory_right):
-        action_dict_left = dict(zip(current_position_dict_left, pose_left, strict=False))
-        action_dict_right = dict(zip(current_position_dict_right, pose_right, strict=False))
-        # pdb.set_trace()
+def reset_follower_position(robot_arm: Robot, target_position: np.ndarray, joint_names=None) -> None:
+    """Reset robot arms to a target joint configuration using a smooth joint-space trajectory."""
+    robot_arm.bus_left.interface.ModeCtrl(ctrl_mode=0x01, move_mode=0x01, move_spd_rate_ctrl=50, is_mit_mode=0x00)
+    robot_arm.bus_right.interface.ModeCtrl(ctrl_mode=0x01, move_mode=0x01, move_spd_rate_ctrl=50, is_mit_mode=0x00)
+
+    current_left = robot_arm.bus_left.sync_read("Present_Position")
+    current_right = robot_arm.bus_right.sync_read("Present_Position")
+
+    current_position_left = np.array([current_left[name] for name in robot_arm.bus_left.motors], dtype=np.float32)
+    current_position_right = np.array([current_right[name] for name in robot_arm.bus_right.motors], dtype=np.float32)
+
+    target_position = np.asarray(target_position, dtype=np.float32)
+    if target_position.shape[0] != 14:
+        raise ValueError(f"Expected 14-dim reset pose for bipiper, got shape {target_position.shape}")
+
+    target_position_left = target_position[:7]
+    target_position_right = target_position[7:]
+
+    trajectory_left = torch.from_numpy(np.linspace(current_position_left, target_position_left, 50))
+    trajectory_right = torch.from_numpy(np.linspace(current_position_right, target_position_right, 50))
+
+    for pose_left, pose_right in zip(trajectory_left, trajectory_right):
+        action_dict_left = dict(zip(robot_arm.bus_left.motors, pose_left.tolist(), strict=False))
+        action_dict_right = dict(zip(robot_arm.bus_right.motors, pose_right.tolist(), strict=False))
         robot_arm.bus_left.sync_write("Goal_Position", action_dict_left)
         robot_arm.bus_right.sync_write("Goal_Position", action_dict_right)
         busy_wait(0.015)
-    
 
-    robot_arm.bus_left.interface.ModeCtrl(ctrl_mode=0x01, move_mode=0x00,move_spd_rate_ctrl=50, is_mit_mode=0x00)
-    robot_arm.bus_right.interface.ModeCtrl(ctrl_mode=0x01, move_mode=0x00,move_spd_rate_ctrl=50, is_mit_mode=0x00)
-    action_zero=[0.056127, 0.0, 0.213266,0.0, 1.48351241090266,0.0,0.05957,0.056127, 0.0, 0.213266,0.0, 1.48351241090266,0.0,0.05957]
-    action_target=[0.056127, 0.0, 0.213266,0.0, 1.48351241090266,0.0,0.05957,0.056127, 0.0, 0.213266,0.0, 1.48351241090266,0.0,0.05957]
-    
-    #action_target=[0.252452, -0.034618, 0.272318, 3.07350736, 0.4325624, 2.90283161, 0.06916,0.252452, -0.034618, 0.272318, 3.07350736, 0.4325624, 2.90283161, 0.06916]
-    trajectory_endpose=np.linspace(action_zero, action_target, 12)
-    for action in trajectory_endpose:
-        end_pose_targets_dict = {f"{key}.value": action[i] for i, key in enumerate(end_pose_name)}
-        robot_arm.send_action(end_pose_targets_dict)
-        busy_wait(0.12)
+    robot_arm.bus_left.interface.ModeCtrl(ctrl_mode=0x01, move_mode=0x00, move_spd_rate_ctrl=50, is_mit_mode=0x00)
+    robot_arm.bus_right.interface.ModeCtrl(ctrl_mode=0x01, move_mode=0x00, move_spd_rate_ctrl=50, is_mit_mode=0x00)
     busy_wait(0.1)
-    
-    # pdb.set_trace()    
 
 
 class RobotEnv(gym.Env):
@@ -269,16 +254,11 @@ class RobotEnv(gym.Env):
 
         self.use_gripper = use_gripper
 
-        # self._joint_names = list(self.robot.bus.motors.keys())
-        self._left_joint_names = self.robot.bus_left.motors
-        self._right_joint_names = self.robot.bus_right.motors
-        self._joint_names= self._left_joint_names + self._right_joint_names
-        # self._raw_joint_positions = None
-        self._raw_end_pose_value = None
-        self._left_end_pose_name = self.robot.bus_left.end_pose_keys
-        self._right_end_pose_name = self.robot.bus_right.end_pose_keys
-        self._end_pose_name= self._left_end_pose_name + self._right_end_pose_name
-        
+        self._left_joint_names = list(self.robot.bus_left.motors)
+        self._right_joint_names = list(self.robot.bus_right.motors)
+        self._joint_names = self._left_joint_names + self._right_joint_names
+        self._raw_joint_positions = None
+
         self._setup_spaces()
 
     def _get_observation(self) -> dict[str, Any]:
@@ -286,20 +266,13 @@ class RobotEnv(gym.Env):
         obs_dict = self.robot.get_observation()
         for k in ("front", "left", "right"):
             img = obs_dict[k]
-            obs_dict[k] = img[:, :, ::-1].copy()   
-        # pdb.set_trace()
-        # raw_joint_joint_position = {f"{name}.pos": obs_dict[f"{name}.pos"] for name in self._joint_names}
-        # joint_positions = np.array([raw_joint_joint_position[f"{name}.pos"] for name in self._joint_names])
-        raw_left_end_pose_values = {f"{name}.value": obs_dict[f"{name}.value"] for name in self._left_end_pose_name}
-        raw_right_end_pose_values = {f"{name}.value": obs_dict[f"{name}.value"] for name in self._right_end_pose_name}
-        left_end_pose_value=np.array([raw_left_end_pose_values[f"{name}.value"] for name in self._left_end_pose_name])
-        right_end_pose_value=np.array([raw_right_end_pose_values[f"{name}.value"] for name in self._right_end_pose_name])
+            obs_dict[k] = img[:, :, ::-1].copy()
 
-        agent_end_pose_value = np.concatenate([left_end_pose_value, right_end_pose_value], axis=0)
+        raw_joint_positions = {f"{name}.pos": obs_dict[f"{name}.pos"] for name in self._joint_names}
+        joint_positions = np.array([raw_joint_positions[f"{name}.pos"] for name in self._joint_names], dtype=np.float32)
         images = {key: obs_dict[key] for key in self._image_keys}
-        # print("agent_end_pose_value:",agent_end_pose_value)
-        # pdb.set_trace()
-        return {"agent_end_pose_value":agent_end_pose_value , "pixels": images, **raw_left_end_pose_values,**raw_right_end_pose_values}
+
+        return {"agent_pos": joint_positions, "pixels": images, **raw_joint_positions}
 
     def _setup_spaces(self) -> None:
         """Configure observation and action spaces based on robot capabilities."""
@@ -318,11 +291,11 @@ class RobotEnv(gym.Env):
             }
         # pdb.set_trace()
         if current_observation is not None:
-            agent_end_pose_value = current_observation["agent_end_pose_value"]
+            agent_pos = current_observation["agent_pos"]
             observation_spaces[OBS_STATE] = gym.spaces.Box(
                 low=-10,
                 high=10,
-                shape=agent_end_pose_value.shape,
+                shape=agent_pos.shape,
                 dtype=np.float32,
             )
         
@@ -368,7 +341,7 @@ class RobotEnv(gym.Env):
             print('reset the environment')
             #log_say("Reset the environment.", play_sounds=True)
             # pdb.set_trace()
-            reset_follower_position(self.robot, np.array(self.reset_pose),self._end_pose_name)
+            reset_follower_position(self.robot, np.array(self.reset_pose), self._joint_names)
             # action=[0.056127, 0.0, 0.213266,0.0, 1.48351241090266,0.0,0.05957,0.056127, 0.0, 0.213266,0.0, 1.48351241090266,0.0,0.05957]
 
             #log_say("Reset the environment done.", play_sounds=True)
@@ -381,33 +354,29 @@ class RobotEnv(gym.Env):
         self.episode_data = None
         obs = self._get_observation()
         # pdb.set_trace() 
-        # self._raw_joint_positions = {f"{key}.pos": obs[f"{key}.pos"] for key in self._joint_names}
-        self._raw_end_pose_value = {f"{key}.value": obs[f"{key}.value"] for key in self._end_pose_name}
+        self._raw_joint_positions = {f"{key}.pos": obs[f"{key}.pos"] for key in self._joint_names}
 
-        return obs, {TeleopEvents.IS_INTERVENTION: False}
+        return obs, {
+            TeleopEvents.IS_INTERVENTION: False,
+            "raw_joint_positions": self._raw_joint_positions,
+        }
 
     def step(self, action, transition_info) -> tuple[dict[str, np.ndarray], float, bool, bool, dict[str, Any]]:
-        """Execute one environment step with given action."""
-        # joint_targets_dict = {f"{key}.pos": action[i] for i, key in enumerate(self.robot.bus.motors)}
-        #盲改
-        end_pose_targets_dict = {f"{key}.value": action[i] for i, key in enumerate(self._end_pose_name)}
-        is_intervention = False
+        """Execute one environment step with a 14-dim joint action."""
+        joint_targets_dict = {f"{key}.pos": float(action[i]) for i, key in enumerate(self._joint_names)}
 
+        is_intervention = False
         if TeleopEvents.IS_INTERVENTION in transition_info:
             is_intervention = transition_info[TeleopEvents.IS_INTERVENTION]
-        #print(f"is_intervention: {is_intervention}")
-        #当不进行干预时，发送动作
-        if not is_intervention:
-            self.robot.bus_left.interface.ModeCtrl(ctrl_mode=0x01, move_mode=0x00,move_spd_rate_ctrl=50, is_mit_mode=0x00)
-            self.robot.bus_right.interface.ModeCtrl(ctrl_mode=0x01, move_mode=0x00,move_spd_rate_ctrl=50, is_mit_mode=0x00)
-            print("不在干预")
-            self.robot.send_action(end_pose_targets_dict)
 
-        # print("在干预")
+        if not is_intervention:
+            self.robot.bus_left.interface.ModeCtrl(ctrl_mode=0x01, move_mode=0x00, move_spd_rate_ctrl=50, is_mit_mode=0x00)
+            self.robot.bus_right.interface.ModeCtrl(ctrl_mode=0x01, move_mode=0x00, move_spd_rate_ctrl=50, is_mit_mode=0x00)
+            print("不在干预")
+            self.robot.send_action(joint_targets_dict)
+
         obs = self._get_observation()
-        self._raw_end_pose_value = {f"{key}.value": obs[f"{key}.value"] for key in self._end_pose_name}
-        # print("self._raw_end_pose_value:",self._raw_end_pose_value)
-        # self._raw_joint_positions = {f"{key}.pos": obs[f"{key}.pos"] for key in self._joint_names}
+        self._raw_joint_positions = {f"{key}.pos": obs[f"{key}.pos"] for key in self._joint_names}
 
         if self.display_cameras:
             self.render()
@@ -423,7 +392,7 @@ class RobotEnv(gym.Env):
             reward,
             terminated,
             truncated,
-            {TeleopEvents.IS_INTERVENTION: False},
+            {TeleopEvents.IS_INTERVENTION: bool(is_intervention)},
         )
 
     def render(self) -> None:
@@ -470,13 +439,16 @@ class RobotEnv(gym.Env):
         if self.robot.is_connected:
             self.robot.disconnect()
 
-    # def get_raw_joint_positions(self) -> dict[str, float]:
-    #     """Get raw joint positions."""
-    #     return self._raw_joint_positions
+    def get_raw_joint_positions(self) -> dict[str, float]:
+        """Get raw joint positions."""
+        return self._raw_joint_positions
+
+    def get_joint_names(self) -> list[str]:
+        return list(self._joint_names)
+
+    # Backward-compatible alias for older code paths.
     def get_raw_end_pose_value(self) -> dict[str, float]:
-        return self._raw_end_pose_value
-    def get_end_pose_name(self) -> list[str]:
-        return self._end_pose_name
+        return self._raw_joint_positions
 
 def make_robot_env(cfg: HILSerlRobotEnvConfig) -> tuple[gym.Env, Any]:
     """Create robot environment from configuration.
@@ -572,11 +544,7 @@ def make_processors(
 
     # Full processor pipeline for real robot environment
     # Get robot and motor information for kinematics
-    
-
-    # 映射：bus 电机名 -> URDF 关节名（顺序必须与 motor_names 一致）
-    # 1) bus 层电机名
-    end_pose_name= env.get_end_pose_name()
+    motor_names = env.get_joint_names() if hasattr(env, "get_joint_names") else list(getattr(env, "_joint_names", []))
 
     # 2) 拆分：臂的6关节 vs 夹爪
     # arm_motor_names = [m for m in motor_names if "gripper" not in m]  # 或者直接 motor_names[:6]
@@ -667,15 +635,15 @@ def make_processors(
     env_pipeline_steps.append(AddBatchDimensionProcessorStep())
     env_pipeline_steps.append(DeviceProcessorStep(device=device))
 
-    action_pipeline_steps = [
-        AddTeleopActionAsComplimentaryDataStep(teleop_device=teleop_device),
-        AddTeleopEventsAsInfoStep(teleop_device=teleop_device),
+    action_pipeline_steps = []
+    if teleop_device is not None:
+        action_pipeline_steps.append(AddTeleopEventsAsInfoStep(teleop_device=teleop_device))
+    action_pipeline_steps.append(
         InterventionActionProcessorStep(
             use_gripper=cfg.processor.gripper.use_gripper if cfg.processor.gripper is not None else False,
             terminate_on_success=terminate_on_success,
-        ),
-    ]
-    action_pipeline_steps.append(RobotActionToPolicyActionProcessorStep(end_pose_name=end_pose_name))
+        )
+    )
     # Replace InverseKinematicsProcessor with new kinematic processors
     # if cfg.processor.inverse_kinematics is not None and kinematics_solver is not None:
     #     # Add EE bounds and safety processor
@@ -743,7 +711,7 @@ def step_env_and_process_transition(
     # Create action transition
     transition[TransitionKey.ACTION] = action
     transition[TransitionKey.OBSERVATION] = (
-        env.get_raw_end_pose_value() if hasattr(env, "get_raw_end_pose_value") else {}
+        env.get_raw_joint_positions() if hasattr(env, "get_raw_joint_positions") else {}
     )
     processed_action_transition = action_processor(transition)
     processed_action = processed_action_transition[TransitionKey.ACTION]
@@ -816,7 +784,7 @@ def control_loop(
     obs, info = env.reset()
     # pdb.set_trace()
     complementary_data = (
-        {"raw_end_pose_value": info.pop("raw_end_pose_value")} if "raw_end_pose_value" in info else {}
+        {"raw_joint_positions": info.pop("raw_joint_positions")} if "raw_joint_positions" in info else {}
     )
     env_processor.reset()
     action_processor.reset()

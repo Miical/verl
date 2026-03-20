@@ -127,6 +127,12 @@ class PI0RolloutRob(NaiveRolloutRob):
                 requires_grad=False,
             ).detach().float().reshape(-1)
 
+        action_loss_mask = torch.ones(
+            output.action.shape[:2],
+            device=output.action.device,
+            dtype=torch.bool,
+        )
+
         tensor_batch = {
             "action": output.action,
             "full_action": a["full_action"],
@@ -136,6 +142,8 @@ class PI0RolloutRob(NaiveRolloutRob):
             "lang_masks": s["lang_masks"],
             "states": s["states"],
             "critic_value": critic_value,
+            "a0.action_loss_mask": action_loss_mask,
+            "a1.action_loss_mask": action_loss_mask.clone(),
         }
 
         ret = DataProto.from_dict(tensor_batch)
