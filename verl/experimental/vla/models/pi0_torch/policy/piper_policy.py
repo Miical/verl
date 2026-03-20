@@ -20,7 +20,6 @@ from verl.protocol import DataProto
 from .base import Pi0Input, Pi0Output
 
 PI0_MAX_STATE_DIM = 32
-PI0_ACTION_CHUNK_SIZE = 10
 PIPER_ACTION_DIM = 14
 
 
@@ -70,5 +69,5 @@ class PiperPi0Output(Pi0Output):
     def from_model_output(cls, model_output: dict) -> "PiperPi0Output":
         output = cls()
         full_action = model_output["full_action"]
-        output.action = full_action[:, :PI0_ACTION_CHUNK_SIZE, : min(PIPER_ACTION_DIM, full_action.shape[-1])]
+        output.action = full_action[:, :, : min(PIPER_ACTION_DIM, full_action.shape[-1])]
         return output

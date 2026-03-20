@@ -131,6 +131,7 @@ outputs
 hfd.sh
 readme_yag.md
 
+tensorboard_log
 verl/experimental/vla/run_pi05_libero_sac_base.sh
 
 verl/experimental/vla/run_pi05_libero_sac_disagg.sh

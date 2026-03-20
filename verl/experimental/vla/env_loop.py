@@ -126,8 +126,17 @@ class EnvLoop:
                     meta_info={"stage_id": stage_id},
                 )
 
-                env_ref = self.env_wg.env_interact_step(action_data)
-                env_result: DataProto = await asyncio.to_thread(env_ref.get)
+                if self.simulator_type == "robot":
+                    env_result = await asyncio.to_thread(self.env_wg.env_interact_step_sync_robot, action_data)
+                    if isinstance(env_result, list):
+                        assert len(env_result) == 1, (
+                            "robot sync env step should return exactly one env worker output, "
+                            f"but got {len(env_result)}"
+                        )
+                        env_result = env_result[0]
+                else:
+                    env_ref = self.env_wg.env_interact_step(action_data)
+                    env_result: DataProto = await asyncio.to_thread(env_ref.get)
 
                 trajectories[stage_id][-1]["rew"] = env_result.batch["rews"]
                 trajectories[stage_id][-1]["done"] = env_result.batch["terminations"]

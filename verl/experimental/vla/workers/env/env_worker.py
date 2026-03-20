@@ -55,14 +55,8 @@ def create_env_batch_dataproto(obs, rews, terminations, truncations, infos, meta
         ret_dict.update(meta=meta)
 
     ret_dict = put_tensor_cpu(ret_dict)
-
     images_and_states = ret_dict["obs"]["images_and_states"]
 
-    # robot 环境返回:
-    #   head_image / left_wrist_image / right_wrist_image / state
-    # libero/isaac 环境返回:
-    #   full_image / wrist_image / state
-    # 这里统一兼容两套 key，避免 robot online rollout 在 step 时因为取错 key 直接炸掉。
     if all(k in images_and_states for k in ["head_image", "left_wrist_image", "right_wrist_image"]):
         tensor_batch = {
             "head_image": images_and_states["head_image"],
@@ -90,7 +84,12 @@ def create_env_batch_dataproto(obs, rews, terminations, truncations, infos, meta
             "or [full_image, wrist_image, state]."
         )
 
-    non_tensor_batch = {"task_descriptions": obs["task_descriptions"]}
+    task_descriptions = obs["task_descriptions"]
+    if isinstance(task_descriptions, str):
+        batch_size = tensor_batch["state"].shape[0]
+        task_descriptions = [task_descriptions] * batch_size
+
+    non_tensor_batch = {"task_descriptions": task_descriptions}
     output = DataProto.from_dict(tensors=tensor_batch, non_tensors=non_tensor_batch)
 
     return output
@@ -181,24 +180,16 @@ class EnvWorker(Worker, DistProfilerExtension):
             self.simulator_list[i].start_simulator()
         return
 
-    @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="env"), blocking=False)
-    @DistProfiler.annotate(color="red", role="env_interact_step")
-    def env_interact_step(self, data: DataProto) -> dict:
+    def _env_interact_step_impl(self, data: DataProto) -> DataProto:
         """
-        This function is used to interact with the environment.
+        Shared implementation for env step.
+
+        Robot online uses a single real env worker and is safer with a synchronous call path,
+        but simulator backends can keep using the existing lazy dispatch path.
         """
         chunk_actions: torch.Tensor = data.non_tensor_batch["actions"]
         chunk_values = data.non_tensor_batch["critic_values"]
         stage_id: int = data.meta_info["stage_id"]
-
-        # Pi0.5 Libero is not required
-        # TODO: prepare actions according to simulator type
-        # chunk_actions = prepare_actions(
-        #     simulator_type=self.cfg.train.simulator_type,
-        #     raw_chunk_actions=chunk_actions,
-        #     num_action_chunks=self.cfg.actor.model.num_action_chunks,
-        #     action_dim=self.cfg.actor.model.action_dim,
-        # )
 
         env_info_list = {}
 
@@ -212,9 +203,9 @@ class EnvWorker(Worker, DistProfilerExtension):
             ].chunk_step(chunk_actions, chunk_values=chunk_values)
         chunk_dones = torch.logical_or(chunk_terminations, chunk_truncations)
 
-        if chunk_dones.any():
-            if "final_info" in infos:
-                final_info = infos["final_info"]
+        if chunk_dones.any() and "final_info" in infos:
+            final_info = infos["final_info"]
+            if "episode" in final_info:
                 for key in final_info["episode"]:
                     env_info_list[key] = final_info["episode"][key][chunk_dones[:, -1]].cpu()
 
@@ -227,6 +218,23 @@ class EnvWorker(Worker, DistProfilerExtension):
             meta=env_info_list,
         )
         return env_batch
+
+    @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="env"), blocking=False)
+    @DistProfiler.annotate(color="red", role="env_interact_step")
+    def env_interact_step(self, data: DataProto) -> DataProto:
+        """Default lazy env step path."""
+        return self._env_interact_step_impl(data)
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL, blocking=True)
+    @DistProfiler.annotate(color="red", role="env_interact_step_sync_robot")
+    def env_interact_step_sync_robot(self, data: DataProto) -> DataProto:
+        """Synchronous step path for robot online rollout.
+
+        Avoids the lazy DataProto ObjectRef chain, which can surface as OwnerDiedError
+        before the true step exception is propagated.
+        """
+        assert self.world_size == 1, "env_interact_step_sync_robot expects a single env worker"
+        return self._env_interact_step_impl(data)
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def get_all_state_ids(self):

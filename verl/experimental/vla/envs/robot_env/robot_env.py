@@ -773,9 +773,13 @@ class RealRobotEnv(gym.Env):
                 chunk_images_and_states["state"] = torch.stack(all_states, dim=1)
             
             # 构建返回的观测格式
+            task_descriptions = chunk_obs_list[-1].get("task_descriptions", [""] * self.num_envs)
+            if isinstance(task_descriptions, str):
+                task_descriptions = [task_descriptions] * self.num_envs
+
             chunk_obs = {
                 "images_and_states": chunk_images_and_states,
-                "task_descriptions": all_task_descriptions[0] if all_task_descriptions else "",
+                "task_descriptions": task_descriptions,
             }
         else:
             # 没有人工介入：返回最后一步的完整观测（images + state）和所有步骤的 state
