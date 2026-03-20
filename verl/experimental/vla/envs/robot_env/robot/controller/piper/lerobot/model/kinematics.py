@@ -12,6 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
+from pathlib import Path
+
 import numpy as np
 
 
@@ -40,7 +43,24 @@ class RobotKinematics:
                 "Please install the optional dependencies of `kinematics` in the package."
             ) from e
 
-        self.robot = placo.RobotWrapper(urdf_path)
+        urdf_arg = Path(urdf_path).expanduser().resolve()
+        if not urdf_arg.exists():
+            raise FileNotFoundError(f"URDF path does not exist: {urdf_arg}")
+
+        # placo.RobotWrapper expects the directory containing robot.urdf rather than the
+        # full file path. Passing a file path can be misinterpreted as <path>/robot.urdf.
+        robot_wrapper_arg = urdf_arg
+        if urdf_arg.is_file():
+            robot_wrapper_arg = urdf_arg.parent
+
+        # Meshes in robot.urdf are referenced with relative paths, so create the wrapper
+        # with the local_assets directory as the working directory.
+        original_cwd = os.getcwd()
+        try:
+            os.chdir(str(robot_wrapper_arg))
+            self.robot = placo.RobotWrapper(str(robot_wrapper_arg))
+        finally:
+            os.chdir(original_cwd)
         self.solver = placo.KinematicsSolver(self.robot)
         self.solver.mask_fbase(True)  # Fix the base
 

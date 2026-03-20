@@ -49,10 +49,11 @@ class RealRobotEnv(gym.Env):
         world_size: Total number of processes
     """
     
-    def __init__(self, cfg, rank, world_size):
+    def __init__(self, cfg, rank, world_size, stage_id=None, **kwargs):
         self.rank = rank
         self.cfg = cfg
         self.world_size = world_size
+        self.stage_id = stage_id
         self.seed = getattr(cfg, 'seed', 42) + rank
         self.num_envs = getattr(cfg, 'num_envs', 1)
         

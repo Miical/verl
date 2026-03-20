@@ -49,34 +49,20 @@ def create_env_batch(obs, rews, dones, infos, meta=None):
     return ret_dict
 
 
-def create_env_batch_dataproto(obs, rews, terminations, truncations, infos, simulator_type: str, meta=None):
+def create_env_batch_dataproto(obs, rews, terminations, truncations, infos, meta=None):
     ret_dict = {"obs": obs, "rews": rews, "terminations": terminations, "truncations": truncations, "infos": infos}
     if meta is not None:
         ret_dict.update(meta=meta)
 
     ret_dict = put_tensor_cpu(ret_dict)
-    images_and_states = ret_dict["obs"]["images_and_states"]
-
-    if simulator_type == "robot":
-        tensor_batch = {
-            "head_image": images_and_states["head_image"],
-            "left_wrist_image": images_and_states["left_wrist_image"],
-            "right_wrist_image": images_and_states["right_wrist_image"],
-            "state": images_and_states["state"],
-            "rews": ret_dict["rews"],
-            "terminations": ret_dict["terminations"],
-            "truncations": ret_dict["truncations"],
-        }
-    else:
-        tensor_batch = {
-            "full_image": images_and_states["full_image"],
-            "wrist_image": images_and_states["wrist_image"],
-            "state": images_and_states["state"],
-            "rews": ret_dict["rews"],
-            "terminations": ret_dict["terminations"],
-            "truncations": ret_dict["truncations"],
-        }
-
+    tensor_batch = {
+        "full_image": ret_dict["obs"]["images_and_states"]["full_image"],
+        "wrist_image": ret_dict["obs"]["images_and_states"]["wrist_image"],
+        "state": ret_dict["obs"]["images_and_states"]["state"],
+        "rews": ret_dict["rews"],
+        "terminations": ret_dict["terminations"],
+        "truncations": ret_dict["truncations"],
+    }
     non_tensor_batch = {"task_descriptions": obs["task_descriptions"]}
     output = DataProto.from_dict(tensors=tensor_batch, non_tensors=non_tensor_batch)
 
@@ -144,19 +130,6 @@ class EnvWorker(Worker, DistProfilerExtension):
                         stage_id=stage_id,
                     )
                 )
-        elif self.cfg.train.simulator_type == "robot":
-            from verl.experimental.vla.envs.robot_env.robot_env import RealRobotEnv
-
-            for stage_id in range(self.stage_num):
-                self.simulator_list.append(
-                    EnvManager(
-                        self.cfg.train,
-                        rank=self._rank,
-                        world_size=self._world_size,
-                        env_cls=RealRobotEnv,
-                        stage_id=stage_id,
-                    )
-                )
         else:
             raise NotImplementedError(f"Simulator type {self.cfg.train.simulator_type} not implemented")
 
@@ -174,7 +147,7 @@ class EnvWorker(Worker, DistProfilerExtension):
         This function is used to interact with the environment.
         """
         chunk_actions: torch.Tensor = data.non_tensor_batch["actions"]
-        chunk_values = data.non_tensor_batch.get("critic_values", None)
+        chunk_values = data.non_tensor_batch["critic_values"]
         stage_id: int = data.meta_info["stage_id"]
 
         # Pi0.5 Libero is not required
@@ -188,14 +161,9 @@ class EnvWorker(Worker, DistProfilerExtension):
 
         env_info_list = {}
 
-        if self.cfg.train.simulator_type == "robot":
-            extracted_obs, chunk_rewards, chunk_terminations, chunk_truncations, infos = self.simulator_list[
-                stage_id
-            ].chunk_step(chunk_actions)
-        else:
-            extracted_obs, chunk_rewards, chunk_terminations, chunk_truncations, infos = self.simulator_list[
-                stage_id
-            ].chunk_step(chunk_actions, chunk_values=chunk_values)
+        extracted_obs, chunk_rewards, chunk_terminations, chunk_truncations, infos = self.simulator_list[
+            stage_id
+        ].chunk_step(chunk_actions, chunk_values=chunk_values)
         chunk_dones = torch.logical_or(chunk_terminations, chunk_truncations)
 
         if chunk_dones.any():
@@ -210,7 +178,6 @@ class EnvWorker(Worker, DistProfilerExtension):
             terminations=chunk_terminations,
             truncations=chunk_truncations,
             infos=infos,
-            simulator_type=self.cfg.train.simulator_type,
             meta=env_info_list,
         )
         return env_batch
@@ -221,14 +188,8 @@ class EnvWorker(Worker, DistProfilerExtension):
         state_ids = self.simulator_list[0].get_all_state_ids()
         return state_ids
 
-    @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="env"), blocking=False)
-    @DistProfiler.annotate(color="blue", role="env_reset_envs_to_state_ids")
-    def reset_envs_to_state_ids(self, data: DataProto):
-        """Reset environments to specified state IDs.
-
-        Args:
-            state_ids: State IDs to reset environments to
-        """
+    def _reset_envs_to_state_ids_impl(self, data: DataProto) -> DataProto:
+        """Shared implementation for env reset."""
         state_ids_list = list(data.non_tensor_batch["state_ids"])
         task_ids_list = list(data.non_tensor_batch["task_ids"])
 
@@ -257,19 +218,34 @@ class EnvWorker(Worker, DistProfilerExtension):
         output_tensor_dict = {}
         output_non_tensor_dict = {}
 
-        # Handle nested 'images_and_states'
         images_and_states_list = [d[0]["images_and_states"] for d in result_list]
         if images_and_states_list:
             for k in images_and_states_list[0].keys():
                 if isinstance(images_and_states_list[0][k], torch.Tensor):
                     output_tensor_dict[k] = torch.cat([d[k] for d in images_and_states_list])
 
-        # Handle 'task_descriptions'
         task_descriptions_list = [d[0]["task_descriptions"] for d in result_list]
         output_non_tensor_dict["task_descriptions"] = list(itertools.chain.from_iterable(task_descriptions_list))
 
-        output = DataProto.from_dict(tensors=output_tensor_dict, non_tensors=output_non_tensor_dict)
-        return output
+        return DataProto.from_dict(tensors=output_tensor_dict, non_tensors=output_non_tensor_dict)
+
+    @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="env"), blocking=False)
+    @DistProfiler.annotate(color="blue", role="env_reset_envs_to_state_ids")
+    def reset_envs_to_state_ids(self, data: DataProto):
+        """Reset environments to specified state IDs using the default lazy mesh-dispatch path."""
+        return self._reset_envs_to_state_ids_impl(data)
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL, blocking=True)
+    @DistProfiler.annotate(color="blue", role="env_reset_envs_to_state_ids_sync_robot")
+    def reset_envs_to_state_ids_sync_robot(self, data: DataProto):
+        """Synchronous reset path for robot online rollout.
+
+        Robot online currently uses a single env worker talking to real hardware.
+        Using a direct synchronous call avoids the lazy DataProto ObjectRef chain that can fail
+        with OwnerDiedError before the first rollout step.
+        """
+        assert self.world_size == 1, "reset_envs_to_state_ids_sync_robot expects a single env worker"
+        return self._reset_envs_to_state_ids_impl(data)
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     @DistProfiler.annotate(color="gray", role="env_finish_rollout")

@@ -909,13 +909,10 @@ class RealRobotEnvWrapper:
             current_file = Path(__file__).resolve()
             piper_dir = current_file.parent  # .../robot/controller/piper/
             
-            # 🔧 关键修复：使用 local_assets/ 目录下的 robot.urdf
-            # 这样 placo 会在 local_assets/ 下查找 robot.urdf，
-            # 并且 mesh 文件的相对路径也是相对于 local_assets/ 的
-            # mesh_dir = piper_dir / "local_assets"
-
-            # urdf_path = mesh_dir  # 传入目录,让 placo 自动查找 robot.urdf
-            urdf_path = "/home/agilex-home/agilex/keweijie/verl/recipe/vla/envs/robot_env/robot/controller/piper/local_assets/robot.urdf"
+            # 使用当前文件相对路径动态定位 local_assets，避免残留旧项目路径。
+            # 注意：placo.RobotWrapper 更适合接收包含 robot.urdf 的目录，
+            # 之前传入具体文件路径时会被错误解释成 <path>/robot.urdf。
+            urdf_path = piper_dir / "local_assets"
             
             # force_print(f"[RealRobotEnvWrapper] Current file: {current_file}")
             # force_print(f"[RealRobotEnvWrapper] Computed URDF path: {urdf_path}")

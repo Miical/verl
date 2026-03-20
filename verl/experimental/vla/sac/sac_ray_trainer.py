@@ -35,6 +35,14 @@ from verl.utils.debug import marked_timer
 from verl.utils.metric import reduce_metrics
 
 
+class _ImmediateResetResult:
+    def __init__(self, value):
+        self._value = value
+
+    def get(self):
+        return self._value
+
+
 REQUIRED_TRAIN_BATCH_KEYS = [
     "a0.full_action",
     "a1.full_action",
@@ -259,6 +267,17 @@ class RobRaySACTrainer(RayPPOTrainer):
         initial_state_ids = gen_batch.non_tensor_batch["state_ids"]
         task_ids = gen_batch.non_tensor_batch["task_ids"]
         reset_prompts = DataProto.from_dict(non_tensors={"state_ids": initial_state_ids, "task_ids": task_ids})
+
+        if self.config.env.train.simulator_type == "robot":
+            reset_output = self.env_wg.reset_envs_to_state_ids_sync_robot(reset_prompts)
+            if isinstance(reset_output, list):
+                assert len(reset_output) == 1, (
+                    "robot sync reset should return exactly one env worker output, "
+                    f"but got {len(reset_output)}"
+                )
+                reset_output = reset_output[0]
+            return _ImmediateResetResult(reset_output)
+
         return self.env_wg.reset_envs_to_state_ids(reset_prompts)
 
     def fit(self):
