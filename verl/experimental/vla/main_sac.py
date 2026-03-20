@@ -42,6 +42,38 @@ def calculate_reward(data: DataProto, return_dict: bool = False) -> torch.Tensor
     return reward_per_step
 
 
+def _build_robot_online_dummy_dataset(config):
+    configured_num_samples = int(OmegaConf.select(config, "data.robot_online_num_samples") or 1)
+    configured_prompt = OmegaConf.select(config, "data.robot_online_prompt")
+    configured_task_id = int(OmegaConf.select(config, "data.robot_online_task_id") or 0)
+
+    batch_size = int(config.data.get("gen_batch_size", config.data.train_batch_size))
+    num_samples = max(configured_num_samples, batch_size)
+    fixed_prompt = configured_prompt or OmegaConf.select(config, "env.train.env.task_description") or "catch_bowl"
+
+    rows = []
+    for idx in range(num_samples):
+        rows.append(
+            {
+                "data_source": "robot_online",
+                "prompt": fixed_prompt,
+                "state_ids": 0,
+                "task_ids": configured_task_id,
+                "ability": "robot",
+                "extra_info": {
+                    "split": "train",
+                    "state_ids": 0,
+                    "index": idx,
+                    "task": fixed_prompt,
+                    "task_ids": configured_task_id,
+                    "task_suite_name": "real_robot",
+                },
+            }
+        )
+
+    return datasets.Dataset.from_list(rows)
+
+
 def _maybe_set_dataset_norm_stats_path(config):
     dataset_type = OmegaConf.select(config, "actor_rollout_ref.model.override_config.dataset_type")
     if dataset_type != "lerobot":
@@ -103,7 +135,12 @@ def main_task(config):
             config.actor_rollout_ref.rollout.tensor_model_parallel_size = 1
 
     local_path = copy_local_path_from_hdfs(config.actor_rollout_ref.model.path)
-    tokenizer = hf_tokenizer(local_path)
+    tokenizer_src = config.actor_rollout_ref.model.get("tokenizer_path") or config.actor_rollout_ref.model.path
+    tokenizer_local_path = copy_local_path_from_hdfs(tokenizer_src)
+    tokenizer = hf_tokenizer(
+        tokenizer_local_path,
+        trust_remote_code=config.actor_rollout_ref.model.get("trust_remote_code", False),
+    )
 
     if config.actor_rollout_ref.actor.strategy in ["fsdp", "fsdp2"]:
         assert config.actor_rollout_ref.actor.strategy == config.critic.strategy
@@ -157,6 +194,8 @@ def main_task(config):
             root=rlpd_root,
         )
 
+    simulator_type = OmegaConf.select(config, "env.train.simulator_type")
+
     if offline_only:
         assert config.trainer.rlpd_enable, "offline_only=True requires trainer.rlpd_enable=True"
         assert rlpd_dataset is not None, "offline_only=True requires a valid rlpd_dataset"
@@ -164,6 +203,9 @@ def main_task(config):
         val_dataset = rlpd_dataset
         collate_fn = rlpd_collate_fn
         train_sampler = rlpd_sampler
+    elif simulator_type == "robot":
+        train_dataset = _build_robot_online_dummy_dataset(config)
+        val_dataset = _build_robot_online_dummy_dataset(config)
     else:
         train_dataset = datasets.load_dataset("parquet", data_files=config.data.train_files)["train"]
         val_dataset = datasets.load_dataset("parquet", data_files=config.data.val_files)["train"]

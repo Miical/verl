@@ -9,6 +9,7 @@ SFT_MODEL_PATH="/shared_disk/users/weijie.ke/weight/giga-openpi/pick_catch_bowl_
 NORM_PATH="/shared_disk/users/yejun.zeng/datasets/huggingface/lerobot/catch_bowl/meta/norm.json"
 TOKENIZER_PATH="$SFT_MODEL_PATH"
 
+
 OUTPUT_DIR="/shared_disk/users/weijie.ke/offline_rlpd_runs/catch_bowl_offline_only_320_cb3w"
 
 NUM_NODES=1

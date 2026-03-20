@@ -49,20 +49,34 @@ def create_env_batch(obs, rews, dones, infos, meta=None):
     return ret_dict
 
 
-def create_env_batch_dataproto(obs, rews, terminations, truncations, infos, meta=None):
+def create_env_batch_dataproto(obs, rews, terminations, truncations, infos, simulator_type: str, meta=None):
     ret_dict = {"obs": obs, "rews": rews, "terminations": terminations, "truncations": truncations, "infos": infos}
     if meta is not None:
         ret_dict.update(meta=meta)
 
     ret_dict = put_tensor_cpu(ret_dict)
-    tensor_batch = {
-        "full_image": ret_dict["obs"]["images_and_states"]["full_image"],
-        "wrist_image": ret_dict["obs"]["images_and_states"]["wrist_image"],
-        "state": ret_dict["obs"]["images_and_states"]["state"],
-        "rews": ret_dict["rews"],
-        "terminations": ret_dict["terminations"],
-        "truncations": ret_dict["truncations"],
-    }
+    images_and_states = ret_dict["obs"]["images_and_states"]
+
+    if simulator_type == "robot":
+        tensor_batch = {
+            "head_image": images_and_states["head_image"],
+            "left_wrist_image": images_and_states["left_wrist_image"],
+            "right_wrist_image": images_and_states["right_wrist_image"],
+            "state": images_and_states["state"],
+            "rews": ret_dict["rews"],
+            "terminations": ret_dict["terminations"],
+            "truncations": ret_dict["truncations"],
+        }
+    else:
+        tensor_batch = {
+            "full_image": images_and_states["full_image"],
+            "wrist_image": images_and_states["wrist_image"],
+            "state": images_and_states["state"],
+            "rews": ret_dict["rews"],
+            "terminations": ret_dict["terminations"],
+            "truncations": ret_dict["truncations"],
+        }
+
     non_tensor_batch = {"task_descriptions": obs["task_descriptions"]}
     output = DataProto.from_dict(tensors=tensor_batch, non_tensors=non_tensor_batch)
 
@@ -130,6 +144,19 @@ class EnvWorker(Worker, DistProfilerExtension):
                         stage_id=stage_id,
                     )
                 )
+        elif self.cfg.train.simulator_type == "robot":
+            from verl.experimental.vla.envs.robot_env.robot_env import RealRobotEnv
+
+            for stage_id in range(self.stage_num):
+                self.simulator_list.append(
+                    EnvManager(
+                        self.cfg.train,
+                        rank=self._rank,
+                        world_size=self._world_size,
+                        env_cls=RealRobotEnv,
+                        stage_id=stage_id,
+                    )
+                )
         else:
             raise NotImplementedError(f"Simulator type {self.cfg.train.simulator_type} not implemented")
 
@@ -147,7 +174,7 @@ class EnvWorker(Worker, DistProfilerExtension):
         This function is used to interact with the environment.
         """
         chunk_actions: torch.Tensor = data.non_tensor_batch["actions"]
-        chunk_values = data.non_tensor_batch["critic_values"]
+        chunk_values = data.non_tensor_batch.get("critic_values", None)
         stage_id: int = data.meta_info["stage_id"]
 
         # Pi0.5 Libero is not required
@@ -161,9 +188,14 @@ class EnvWorker(Worker, DistProfilerExtension):
 
         env_info_list = {}
 
-        extracted_obs, chunk_rewards, chunk_terminations, chunk_truncations, infos = self.simulator_list[
-            stage_id
-        ].chunk_step(chunk_actions, chunk_values=chunk_values)
+        if self.cfg.train.simulator_type == "robot":
+            extracted_obs, chunk_rewards, chunk_terminations, chunk_truncations, infos = self.simulator_list[
+                stage_id
+            ].chunk_step(chunk_actions)
+        else:
+            extracted_obs, chunk_rewards, chunk_terminations, chunk_truncations, infos = self.simulator_list[
+                stage_id
+            ].chunk_step(chunk_actions, chunk_values=chunk_values)
         chunk_dones = torch.logical_or(chunk_terminations, chunk_truncations)
 
         if chunk_dones.any():
@@ -178,6 +210,7 @@ class EnvWorker(Worker, DistProfilerExtension):
             terminations=chunk_terminations,
             truncations=chunk_truncations,
             infos=infos,
+            simulator_type=self.cfg.train.simulator_type,
             meta=env_info_list,
         )
         return env_batch
@@ -204,7 +237,7 @@ class EnvWorker(Worker, DistProfilerExtension):
         )
         result_list = []
         for stage_id in range(self.stage_num):
-            if self.cfg.train.simulator_type == "isaac":
+            if self.cfg.train.simulator_type in ["isaac", "robot"]:
                 assert (
                     len(
                         set(
@@ -214,7 +247,7 @@ class EnvWorker(Worker, DistProfilerExtension):
                         )
                     )
                     == 1
-                ), "rollout.n should equal to num_envs for isaac"
+                ), f"rollout.n should equal to num_envs for {self.cfg.train.simulator_type}"
 
             result = self.simulator_list[stage_id].reset_envs_to_state_ids(
                 state_ids_list[stage_id * self.cfg.train.num_envs : (stage_id + 1) * self.cfg.train.num_envs],
@@ -227,7 +260,6 @@ class EnvWorker(Worker, DistProfilerExtension):
         # Handle nested 'images_and_states'
         images_and_states_list = [d[0]["images_and_states"] for d in result_list]
         if images_and_states_list:
-            # Assuming all dicts in the list have the same keys
             for k in images_and_states_list[0].keys():
                 if isinstance(images_and_states_list[0][k], torch.Tensor):
                     output_tensor_dict[k] = torch.cat([d[k] for d in images_and_states_list])

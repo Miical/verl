@@ -164,7 +164,7 @@ class PiperMotorsBus:
             logging.error(f"Exception during connect: {format_exc()}")
             return False
 
-    def disconnect(self, reset_pos: bool = False, disable_torque: bool = False):
+    def disconnect(self, reset_pos: bool = False, disable_torque: bool = True):
         if self.interface and self.is_connected:
             try:
                 if reset_pos:
@@ -182,7 +182,7 @@ class PiperMotorsBus:
             self.interface.EnableArm(motor_num=7, enable_flag=0x02)
             self.interface.ModeCtrl(
                 ctrl_mode=0x01,     # CAN command
-                move_mode=0x01,     # MOVE J
+                move_mode=0x00,     # MOVE P
                 move_spd_rate_ctrl=move_spd_rate_ctrl,
                 is_mit_mode=0x00
             )
@@ -331,14 +331,14 @@ class PiperMotorsBus:
             
         except Exception:
             logging.error(f"Failed to reset position on {self.can_name}: {format_exc()}")
-        # finally:
-        #     # 4. 切回末端位姿控制模式 MOVE P（CAN 控制）
-        #     try:
-        #         logging.info(f"[{self.can_name}] Switch back to end-pose mode (MOVE P).")
-        #         # pdb.set_trace()
-        #         self._set_move_mode(move_mode=0x00, move_spd_rate_ctrl=move_spd_rate_ctrl)
-        #     except Exception:
-        #         logging.error(f"Failed to switch back to end-pose mode on {self.can_name}: {format_exc()}")
+        finally:
+            # 4. 切回末端位姿控制模式 MOVE P（CAN 控制）
+            try:
+                logging.info(f"[{self.can_name}] Switch back to end-pose mode (MOVE P).")
+                # pdb.set_trace()
+                self._set_move_mode(move_mode=0x00, move_spd_rate_ctrl=move_spd_rate_ctrl)
+            except Exception:
+                logging.error(f"Failed to switch back to end-pose mode on {self.can_name}: {format_exc()}")
 
 
     def end_pose_ctrl(

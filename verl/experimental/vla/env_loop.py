@@ -49,6 +49,11 @@ class EnvLoop:
         self.num_envs_per_worker = config.env.train.num_envs
         self.action_dim = config.env.actor.model.action_dim
         self.num_action_chunks = config.env.actor.model.num_action_chunks
+        self.simulator_type = config.env.train.simulator_type
+        if self.simulator_type == "robot":
+            self.image_keys = ["head_image", "left_wrist_image", "right_wrist_image"]
+        else:
+            self.image_keys = ["full_image", "wrist_image"]
         # Derived properties
         self.total_envs = self.env_wg.world_size * self.num_envs_per_worker
         if self.total_envs % self.stage_num != 0:
@@ -127,8 +132,9 @@ class EnvLoop:
                 trajectories[stage_id][-1]["rew"] = env_result.batch["rews"]
                 trajectories[stage_id][-1]["done"] = env_result.batch["terminations"]
 
+                batch_select_keys = self.image_keys + ["state"]
                 next_obs = DataProto(
-                    batch=env_result.batch.select("full_image", "wrist_image", "state"),
+                    batch=env_result.batch.select(*batch_select_keys),
                     non_tensor_batch={"task_descriptions": env_result.non_tensor_batch["task_descriptions"]},
                 )
 
