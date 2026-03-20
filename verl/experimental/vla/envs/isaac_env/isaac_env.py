@@ -52,6 +52,7 @@ class IsaacEnv(gym.Env):
         self._generator = np.random.default_rng(seed=self.seed)
 
         self.task_suite_name = self.cfg.task_suite_name
+        self.reset_mode = self.cfg.get("reset_mode", "random")  # "hdf5" | "random"
 
         self.env = None
         self.prev_step_reward = np.zeros(self.num_envs)
@@ -458,40 +459,52 @@ class IsaacEnv(gym.Env):
         return state
 
     def reset_envs_to_state_ids(self, state_ids_list, task_ids_list):
-        logger.info(f"IsaacEnv reset_envs_to_state_ids task_ids_list: {task_ids_list}")
+        logger.info(
+            f"IsaacEnv reset_envs_to_state_ids task_ids={task_ids_list}, "
+            f"reset_mode={self.reset_mode}"
+        )
         assert len(set(task_ids_list)) == 1, "Isaac env only support single task"
 
         task_id = task_ids_list[0]
         self._init_env(task_id)
 
         raw_obs, infos = self.env.reset()
-        env_idx = np.arange(self.num_envs)
 
-        episode_hint = int(state_ids_list[0]) if state_ids_list else 0
-        initial_state = self._load_hdf5_initial_state(task_id, episode_hint=episode_hint)
+        if self.reset_mode == "hdf5":
+            raw_obs, infos = self._reset_from_hdf5(task_id, state_ids_list, raw_obs, infos)
 
-        if initial_state is not None:
-            env_ids_tensor = torch.arange(self.num_envs, device=self.device)
-            if self.num_envs > 1:
-                initial_state = self._expand_state(initial_state, self.num_envs)
-            raw_obs, infos = self.env.reset_to(initial_state, env_ids_tensor, is_relative=True)
-            logger.info("Reset environment to HDF5 initial state")
-        else:
-            logger.warning("No HDF5 initial state available, using default reset")
-
-        self._reset_metrics(env_idx)
+        raw_obs = self._stabilize_arm(raw_obs)
+        self._reset_metrics()
         self.elapsed_steps = np.zeros(self.num_envs, dtype=np.int32)
-
-        is_abs_action = "IK-Abs" in (self.task_name or "")
-        for _ in range(10):
-            if is_abs_action:
-                eef_pose = raw_obs["policy"]["eef_pose"].to(self.device)     # (num_envs, 7): pos3 + quat_wxyz4
-                gripper_pos = raw_obs["policy"]["gripper_pos"].to(self.device)  # (num_envs, 2)
-                hold_action = torch.cat([eef_pose, gripper_pos[..., 0:1]], dim=-1)  # (num_envs, 8)
-            else:
-                env_action_dim = self.env.action_space.shape[-1]
-                hold_action = torch.zeros((self.num_envs, env_action_dim), device=self.device)
-            raw_obs, _, _, _, infos = self.env.step(hold_action)
 
         obs = self._wrap_obs(raw_obs)
         return obs, infos
+
+    def _reset_from_hdf5(self, task_id, state_ids_list, raw_obs, infos):
+        """Override env state with a fixed initial state loaded from HDF5 demo data."""
+        episode_hint = int(state_ids_list[0]) if state_ids_list else 0
+        initial_state = self._load_hdf5_initial_state(task_id, episode_hint=episode_hint)
+        if initial_state is None:
+            logger.warning("No HDF5 initial state available, falling back to random reset")
+            return raw_obs, infos
+
+        env_ids_tensor = torch.arange(self.num_envs, device=self.device)
+        if self.num_envs > 1:
+            initial_state = self._expand_state(initial_state, self.num_envs)
+        raw_obs, infos = self.env.reset_to(initial_state, env_ids_tensor, is_relative=True)
+        logger.info("Reset environment to HDF5 initial state")
+        return raw_obs, infos
+
+    def _stabilize_arm(self, raw_obs, steps=10):
+        """Run a few hold-position steps so the arm settles after reset."""
+        is_abs_action = "IK-Abs" in (self.task_name or "")
+        for _ in range(steps):
+            if is_abs_action:
+                eef_pose = raw_obs["policy"]["eef_pose"].to(self.device)
+                gripper_pos = raw_obs["policy"]["gripper_pos"].to(self.device)
+                hold_action = torch.cat([eef_pose, gripper_pos[..., 0:1]], dim=-1)
+            else:
+                env_action_dim = self.env.action_space.shape[-1]
+                hold_action = torch.zeros((self.num_envs, env_action_dim), device=self.device)
+            raw_obs, _, _, _, _ = self.env.step(hold_action)
+        return raw_obs

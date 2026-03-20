@@ -93,7 +93,6 @@ LIBERO config and USD assets:
 |------|-------|
 | Repo | `https://github.com/nvidia-china-sae/RobotLearningLab` |
 | Branch | `yujie/update/2.3.0-verl` |
-| Required commit | `b97fa8bb` (`verl needed changes`) |
 
 The pipeline depends on `isaaclab_playground` (installed via `pip install -e` from `source/isaaclab_playground/`) and the `isaaclab` framework (from `source/isaaclab/`).
 
@@ -243,6 +242,40 @@ In the OpenPI training pipeline, the `AbsoluteActions` transform (in `openpi/tra
 
 In our pipeline, we bypass OpenPI's transform chain and apply the conversion manually.
 
+## Environment Reset Modes
+
+The pipeline supports two ways to initialize environment state at the start of each rollout, controlled by the `RESET_MODE` environment variable (passed via `env.train.reset_mode` Hydra config).
+
+### `hdf5` — Fixed Initial State from Demo Data (default)
+
+```bash
+RESET_MODE=hdf5 bash verl/experimental/vla/run_pi05_libero_sac.sh
+```
+
+Loads the exact robot and object poses from an HDF5 demo file and calls `env.reset_to()` to place the scene into that state. All parallel environments receive the same initial state (broadcast via `_expand_state`). This mode is useful for:
+
+- **Reproducible evaluation**: every run starts from the same configuration, making success rate comparisons fair.
+- **Debugging**: eliminates initialization variance as a failure source.
+
+If the HDF5 file is not found, it falls back to the `random` behavior automatically.
+
+### `random` — Isaac Lab Built-in Randomization
+
+```bash
+RESET_MODE=random bash verl/experimental/vla/run_pi05_libero_sac.sh
+```
+
+Uses `env.reset()` only, which triggers Isaac Lab's `EventTerm` pipeline:
+
+1. `reset_scene_to_default` — resets robot joints to the default pose.
+2. `randomize_object_pose_by_groups` — places each object within a narrow pose range defined in the task config (typically ~1 cm variation per axis).
+
+This mode is preferred for **RL training** because the small initial-state variation improves policy robustness. Note that the pose ranges are intentionally narrow (aligned with LIBERO demo distributions), so the randomization is minor — objects land in roughly the same spot each time, with slight perturbation.
+
+### Common to Both Modes
+
+After the initial state is established (by either method), the pipeline runs a 10-step **arm stabilization loop** that holds the current EEF pose. This prevents the arm from drifting during the physics settling phase. See [Arm Stabilization After Reset](#7-arm-stabilization-after-reset).
+
 ## Known Limitations
 
 ### 1. JAX Mode is Rollout-Only (No RL Training)
@@ -351,19 +384,20 @@ Result: all objects pile up at origin → PhysX detects interpenetration → obj
 
 **Impact:** The explosion only affects post-completion steps which are masked out during training (via `compute_response_mask`), so it does not corrupt training data. The fix is primarily for visual quality in saved videos.
 
-### 7. Arm Stabilization After Reset
+### 7. Arm Stabilization After Reset (Zero Action ≠ Hold Position)
 
-**Symptom:** After `env.reset()`, the arm drifts to the origin during the 10-step stabilization loop.
+**Symptom:** After `env.reset()`, the arm immediately flips upside down or crashes into the table during the 10-step stabilization loop.
 
-**Cause:** Sending zero actions in IK-Abs mode commands the arm to move to position (0,0,0), not to hold its current position.
+**Cause:** The original code (designed for MuJoCo with OSC relative control) sends **zero actions** during the 10 stabilization steps after reset. In relative mode, zero means "don't move" — this is correct. However, in Isaac Lab's IK-Abs (absolute) mode, zero means "move to position (0,0,0) with identity rotation", which causes the arm to slam toward the world origin.
 
-**Fix:** During stabilization, send the current EEF pose as the action (hold position):
+**Fix:** Detect whether the task uses absolute actions (`IK-Abs`) and, if so, read the current EEF pose and send it back as the hold action:
 ```python
 if is_abs_action:
     eef_pose = raw_obs["policy"]["eef_pose"].to(self.device)
     gripper_pos = raw_obs["policy"]["gripper_pos"].to(self.device)
     hold_action = torch.cat([eef_pose, gripper_pos[..., 0:1]], dim=-1)
 ```
+For non-absolute tasks (e.g., MuJoCo OSC-relative), the original zero-action logic is preserved.
 
 ### 8. Light Intensity Change Not Taking Effect
 
@@ -387,6 +421,7 @@ find /root/RobotLearningLab/source/isaaclab_playground -type d -name __pycache__
 | `JAX_CONFIG_NAME` | `pi05_libero` | OpenPI training config name |
 | `SFT_MODEL_PATH` | `$HOME/data/pi05_libero_torch` | Path to PyTorch model (used for tokenizer even in JAX mode) |
 | `SIM_TYPE` | `isaac` | Simulator type (`isaac` or `libero`) |
+| `RESET_MODE` | `random` | Environment reset mode: `random` (Isaac Lab randomization) or `hdf5` (fixed demo state) |
 | `NUM_ENV` | `1` | Number of parallel environments per worker |
 | `MAX_EPISODE_STEPS` | `210` | Max steps per episode (rollout iterations = this / `NUM_ACTION_CHUNKS`) |
 | `NUM_ACTION_CHUNKS` | `10` | Action chunk size |

@@ -27,6 +27,11 @@ JAX_CONFIG_NAME=${JAX_CONFIG_NAME:-"pi05_libero"}
 # from checkpoint metadata (looks for "absik"/"abs" in the training config_name).
 ABSOLUTE_ACTION_MODE=${ABSOLUTE_ACTION_MODE:-"auto"}
 
+# Environment reset mode:
+#   "hdf5"   - load fixed initial state from HDF5 demo data (reproducible, matches training demos)
+#   "random" - use Isaac Lab's built-in randomization within narrow pose ranges
+RESET_MODE=${RESET_MODE:-"random"}
+
 # LD_LIBRARY_PATH for JAX CUDA support
 NVIDIA_BASE=/workspace/isaaclab/_isaac_sim/exts/omni.isaac.ml_archive/pip_prebundle/nvidia
 CUDNN_LIB=/workspace/isaaclab/_isaac_sim/kit/python/lib/python3.11/site-packages/nvidia/cudnn/lib
@@ -105,6 +110,7 @@ $PYTHON -m verl.experimental.vla.main_sac \
     env.train.video_cfg.save_video=True \
     env.train.video_cfg.video_base_dir=${VIDEO_OUTPUT} \
     env.train.seed=42 \
+    +env.train.reset_mode=$RESET_MODE \
     actor_rollout_ref.actor.fsdp_config.model_dtype=bfloat16 \
     actor_rollout_ref.actor.fsdp_config.wrap_policy.transformer_layer_cls_to_wrap=[SiglipEncoderLayer,GemmaDecoderLayerWithExpert] \
     actor_rollout_ref.model.path=$SFT_MODEL_PATH \
