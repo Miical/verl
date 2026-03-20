@@ -428,6 +428,7 @@ class PiperMotorsBus:
                         cur = self._current_positions[motor]
                         joint_angles.append(int(np.rad2deg(cur) * 1000))
                 # 确保 Piper 处于关节控制模式（MOVE J）后再发送 JointCtrl
+                # print(f"joint_angles{joint_angles}")
                 self._set_move_mode(move_mode=0x01)
                 self.interface.JointCtrl(
                     joint_1=joint_angles[0],

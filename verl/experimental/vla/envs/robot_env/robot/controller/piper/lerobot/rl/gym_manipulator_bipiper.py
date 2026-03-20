@@ -364,18 +364,54 @@ class RobotEnv(gym.Env):
 
     def step(self, action, transition_info) -> tuple[dict[str, np.ndarray], float, bool, bool, dict[str, Any]]:
         """Execute one environment step with a 14-dim joint action."""
-        joint_targets_dict = {f"{key}.pos": float(action[i]) for i, key in enumerate(self._joint_names)}
+        action = np.asarray(action, dtype=np.float32).reshape(-1)
+        if action.shape[0] != len(self._joint_names):
+            raise ValueError(
+                f"Expected action dim {len(self._joint_names)}, got shape {action.shape}, "
+                f"joint names: {self._joint_names}"
+            )
+
+        # 总 joint target，保留 .pos 只是为了和 observation / debug 打印风格一致
+        joint_targets_dict = {
+            f"{key}.pos": float(action[i]) for i, key in enumerate(self._joint_names)
+        }
+
+        # 给 bus_left / bus_right 的 sync_write("Goal_Position", ...) 用
+        # 注意：底层要的是不带 .pos 的 key
+        left_joint_targets_dict = {
+            k[:-4]: v for k, v in joint_targets_dict.items() if k.startswith("left_") and k.endswith(".pos")
+        }
+        right_joint_targets_dict = {
+            k[:-4]: v for k, v in joint_targets_dict.items() if k.startswith("right_") and k.endswith(".pos")
+        }
 
         is_intervention = False
         if TeleopEvents.IS_INTERVENTION in transition_info:
-            is_intervention = transition_info[TeleopEvents.IS_INTERVENTION]
+            is_intervention = bool(transition_info[TeleopEvents.IS_INTERVENTION])
 
         if not is_intervention:
-            # Joint policy -> joint control: 每一步都明确保持在 MOVE J，避免底层残留在 MOVE P。
-            self.robot.bus_left.interface.ModeCtrl(ctrl_mode=0x01, move_mode=0x01, move_spd_rate_ctrl=50, is_mit_mode=0x00)
-            self.robot.bus_right.interface.ModeCtrl(ctrl_mode=0x01, move_mode=0x01, move_spd_rate_ctrl=50, is_mit_mode=0x00)
             print("不在干预，使用 joint 控制")
-            self.robot.send_action(joint_targets_dict)
+            print(f"joint_targets_dict {joint_targets_dict}")
+            print(f"left_joint_targets_dict {left_joint_targets_dict}")
+            print(f"right_joint_targets_dict {right_joint_targets_dict}")
+
+            # 每一步都显式切到 MOVE J，避免底层残留在 MOVE P / EndPose 模式
+            self.robot.bus_left.interface.ModeCtrl(
+                ctrl_mode=0x01,
+                move_mode=0x01,          # MOVE J
+                move_spd_rate_ctrl=50,
+                is_mit_mode=0x00,
+            )
+            self.robot.bus_right.interface.ModeCtrl(
+                ctrl_mode=0x01,
+                move_mode=0x01,          # MOVE J
+                move_spd_rate_ctrl=50,
+                is_mit_mode=0x00,
+            )
+
+            self.robot.bus_left.sync_write("Goal_Position", left_joint_targets_dict)
+            self.robot.bus_right.sync_write("Goal_Position", right_joint_targets_dict)
+
 
         obs = self._get_observation()
         self._raw_joint_positions = {f"{key}.pos": obs[f"{key}.pos"] for key in self._joint_names}
