@@ -446,6 +446,17 @@ class IsaacEnv(gym.Env):
         finally:
             handler.close()
 
+    @staticmethod
+    def _expand_state(state, num_envs):
+        """Recursively expand all tensors with batch dim 1 to num_envs."""
+        if isinstance(state, torch.Tensor):
+            if state.shape[0] == 1:
+                return state.expand(num_envs, *state.shape[1:]).contiguous()
+            return state
+        if isinstance(state, dict):
+            return {k: IsaacEnv._expand_state(v, num_envs) for k, v in state.items()}
+        return state
+
     def reset_envs_to_state_ids(self, state_ids_list, task_ids_list):
         logger.info(f"IsaacEnv reset_envs_to_state_ids task_ids_list: {task_ids_list}")
         assert len(set(task_ids_list)) == 1, "Isaac env only support single task"
@@ -461,6 +472,8 @@ class IsaacEnv(gym.Env):
 
         if initial_state is not None:
             env_ids_tensor = torch.arange(self.num_envs, device=self.device)
+            if self.num_envs > 1:
+                initial_state = self._expand_state(initial_state, self.num_envs)
             raw_obs, infos = self.env.reset_to(initial_state, env_ids_tensor, is_relative=True)
             logger.info("Reset environment to HDF5 initial state")
         else:

@@ -48,9 +48,9 @@ NUM_ROLLOUT_GPUS=$((NUM_GPUS - NUM_ENV_GPUS))  # number of gpus for rollout work
 # Rollout Config
 # NOTE: TRAIN_BATCH_SIZE * ROLLOUT_N == NUM_ENV_GPUS * NUM_STAGE * NUM_ENV
 TRAIN_BATCH_SIZE=4                             # batch size for dataloaders per step
-ROLLOUT_N=1                                    # response number for each prompt (rollout.n == NUM_ENV for isaac)
+ROLLOUT_N=8                                    # response number for each prompt (rollout.n == NUM_ENV for isaac)
 NUM_STAGE=2                                    # number of pipeline stages
-NUM_ENV=1                                      # number of envs per env worker
+NUM_ENV=8                                      # number of envs per env worker
 
 NUM_ACTION_CHUNKS=10                           # number of action chunks
 MAX_EPISODE_STEPS=300                          # max episode steps for each env
