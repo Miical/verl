@@ -18,10 +18,7 @@ import json
 import logging
 import math
 import os
-from types import SimpleNamespace
 from typing import Literal
-
-import numpy as np
 
 import torch
 from onnx_ir import Tensor
@@ -169,24 +166,6 @@ class PI0ForActionPrediction(PreTrainedModel, SupportSACTraining):
         self.no_state = bool(getattr(config, "no_state", False))
         self._warned_no_abs_transform = False
 
-        # Rollout debug / dataset replay support.
-        self.debug_rollout_mode = str(getattr(config, "debug_rollout_mode", "off")).lower()
-        self.debug_dataset_root = getattr(config, "debug_dataset_root", None)
-        self.debug_dataset_repo_id = getattr(config, "debug_dataset_repo_id", None)
-        self.debug_dataset_index = int(getattr(config, "debug_dataset_index", -1))
-        self.debug_dataset_start_index = int(getattr(config, "debug_dataset_start_index", 0))
-        self.debug_dataset_stride = max(1, int(getattr(config, "debug_dataset_stride", getattr(config, "n_action_steps", 1))))
-        self.debug_dataset_auto_advance = bool(getattr(config, "debug_dataset_auto_advance", True))
-        self.debug_dataset_action_send_variant = str(
-            getattr(config, "debug_dataset_action_send_variant", "recovered_abs")
-        ).lower()
-        self.debug_dataset_observation_send_ground_truth = bool(
-            getattr(config, "debug_dataset_observation_send_ground_truth", False)
-        )
-        self._debug_dataset = None
-        self._debug_dataset_next_index = self.debug_dataset_start_index
-        self._debug_rollout_logged_once = False
-
         # Output transforms
         self.state_unnormalize_transform = Unnormalize(self.state_norm_stats, use_quantiles=self.pi05_enabled)
         self.action_unnormalize_transform = Unnormalize(self.action_norm_stats, use_quantiles=self.pi05_enabled)
@@ -288,282 +267,6 @@ class PI0ForActionPrediction(PreTrainedModel, SupportSACTraining):
         self.delta_action_transform.to(device)
         return self
 
-    def _resolve_real_action_dim(self, state_raw_unnormalized: torch.Tensor, env_name: str) -> int:
-        cfg = getattr(self, "config", None)
-        if env_name == "piper" and cfg is not None and getattr(cfg, "action_dim", None) is not None:
-            return int(cfg.action_dim)
-        return int(state_raw_unnormalized.shape[-1])
-
-    def _debug_dataset_spec(self) -> tuple[str, str]:
-        root = self.debug_dataset_root
-        if root is None:
-            raise ValueError(
-                "debug_rollout_mode is enabled but debug_dataset_root is not set. "
-                "Please pass +actor_rollout_ref.model.override_config.debug_dataset_root=/path/to/lerobot/dataset"
-            )
-        repo_id = self.debug_dataset_repo_id
-        if repo_id is None:
-            repo_id = os.path.basename(str(root).rstrip("/")) or "lerobot"
-        return str(root), str(repo_id)
-
-    def _ensure_debug_dataset(self):
-        if self._debug_dataset is not None:
-            return self._debug_dataset
-        from verl.experimental.vla.dataloader.lerobot import make_dataset
-
-        root, repo_id = self._debug_dataset_spec()
-        self._debug_dataset = make_dataset(repo_id=repo_id, root=root)
-        logger.warning(
-            "[PI0ForActionPrediction] Loaded debug LeRobot dataset for rollout replay: root=%s repo_id=%s len=%d",
-            root,
-            repo_id,
-            len(self._debug_dataset),
-        )
-        return self._debug_dataset
-
-    def _next_debug_dataset_sample(self) -> tuple[int, dict]:
-        dataset = self._ensure_debug_dataset()
-        if len(dataset) <= 0:
-            raise RuntimeError("debug replay dataset is empty")
-
-        if self.debug_dataset_index >= 0:
-            dataset_index = self.debug_dataset_index % len(dataset)
-        else:
-            dataset_index = self._debug_dataset_next_index % len(dataset)
-            if self.debug_dataset_auto_advance:
-                self._debug_dataset_next_index = (self._debug_dataset_next_index + self.debug_dataset_stride) % len(dataset)
-
-        sample_pair = dataset[dataset_index]
-        if isinstance(sample_pair, (list, tuple)) and len(sample_pair) >= 1:
-            sample0 = sample_pair[0]
-        else:
-            sample0 = sample_pair
-        logger.warning(
-            "[PI0ForActionPrediction] debug dataset select index=%s next_index=%s stride=%s fixed_index=%s",
-            dataset_index,
-            self._debug_dataset_next_index,
-            self.debug_dataset_stride,
-            self.debug_dataset_index,
-        )
-        return dataset_index, sample0
-
-    @staticmethod
-    def _to_float_tensor(x, *, device: torch.device, dtype: torch.dtype = torch.float32) -> torch.Tensor:
-        if isinstance(x, torch.Tensor):
-            tensor = x.detach().clone()
-        else:
-            tensor = torch.as_tensor(np.array(x))
-        return tensor.to(device=device, dtype=dtype)
-
-    def _to_image_chw_float(self, image, *, device: torch.device) -> torch.Tensor:
-        tensor = self._to_float_tensor(image, device=device, dtype=torch.float32)
-        if tensor.ndim == 2:
-            tensor = tensor.unsqueeze(0)
-        elif tensor.ndim == 3:
-            if tensor.shape[0] in (1, 3):
-                pass
-            elif tensor.shape[-1] in (1, 3):
-                tensor = tensor.permute(2, 0, 1)
-            else:
-                raise ValueError(f"Unsupported image shape: {tuple(tensor.shape)}")
-        else:
-            raise ValueError(f"Unsupported image ndim: {tensor.ndim}")
-
-        if tensor.numel() > 0 and tensor.max() > 1.5:
-            tensor = tensor / 255.0
-        return tensor.clamp(0.0, 1.0)
-
-    @staticmethod
-    def _extract_task_from_dataset_sample(sample: dict) -> str:
-        for key in ["task", "language_instruction", "instruction", "lang_instruction"]:
-            if key in sample:
-                value = sample[key]
-                if isinstance(value, (list, tuple)) and len(value) > 0:
-                    return str(value[0])
-                return str(value)
-        return "catch_bowl"
-
-    def _prepare_pi0_input_from_dataset_sample(self, sample: dict, *, device: torch.device) -> SimpleNamespace:
-        images = {
-            "observation.images.cam_high": self._to_image_chw_float(sample["observation.images.cam_high"], device=device).unsqueeze(0),
-            "observation.images.cam_left_wrist": self._to_image_chw_float(sample["observation.images.cam_left_wrist"], device=device).unsqueeze(0),
-            "observation.images.cam_right_wrist": self._to_image_chw_float(sample["observation.images.cam_right_wrist"], device=device).unsqueeze(0),
-        }
-        state = self._to_float_tensor(sample["observation.state"], device=device, dtype=torch.float32).view(1, -1)
-        if state.shape[-1] < self.max_action_dim:
-            state = torch.nn.functional.pad(state, (0, self.max_action_dim - state.shape[-1]), "constant", 0)
-
-        action = self._to_float_tensor(sample["action"], device=device, dtype=torch.float32)
-        if action.ndim == 1:
-            action = action.unsqueeze(0)
-        if action.ndim == 2:
-            action = action.unsqueeze(0)
-        if action.ndim != 3:
-            raise ValueError(f"Expected dataset action to have shape [T,A] or [1,T,A], got {tuple(action.shape)}")
-
-        action_loss_mask = None
-        if "action_is_pad" in sample:
-            action_loss_mask = self._to_float_tensor(sample["action_is_pad"], device=device, dtype=torch.bool)
-            if action_loss_mask.ndim == 1:
-                action_loss_mask = action_loss_mask.unsqueeze(0)
-
-        return SimpleNamespace(
-            images=images,
-            img_masks=[torch.ones((1,), device=device, dtype=torch.bool) for _ in range(3)],
-            task=[self._extract_task_from_dataset_sample(sample)],
-            state=state,
-            gt_action=action,
-            gt_action_is_pad=action_loss_mask,
-        )
-
-    def _prepare_rollout_inputs(self, pi0_input, tokenizer, env_name: str):
-        state_raw_unnormalized = pi0_input.state
-        target_device = state_raw_unnormalized.device
-        try:
-            self._to(target_device)
-        except Exception:
-            pass
-
-        real_act_dim = self._resolve_real_action_dim(state_raw_unnormalized, env_name)
-
-        state = self.state_normalize_transform(state_raw_unnormalized)
-        if self.no_state:
-            state = torch.zeros_like(state)
-
-        images, _ = self.image_transform.call_batch(pi0_input.images)
-        state_for_prompt = state[:, :real_act_dim] if self.pi05_enabled else state
-        lang_tokens, lang_masks = self.prompt_tokenizer_transform.call_batch(
-            {"task": pi0_input.task, "observation.state": state_for_prompt}, tokenizer
-        )
-
-        s = {
-            "states": state,
-            "images": torch.stack(images, dim=1),
-            "image_masks": torch.stack(pi0_input.img_masks, dim=1),
-            "lang_tokens": lang_tokens,
-            "lang_masks": lang_masks,
-        }
-        return state_raw_unnormalized, real_act_dim, state, images, lang_tokens, lang_masks, s
-
-    def _postprocess_piper_actions(
-        self,
-        actual_action: torch.Tensor,
-        state_raw_unnormalized: torch.Tensor,
-        real_act_dim: int,
-    ) -> torch.Tensor:
-        real_act_dim = max(1, min(real_act_dim, int(actual_action.shape[-1]), int(state_raw_unnormalized.shape[-1])))
-
-        if self.use_endpose:
-            try:
-                from scipy.spatial.transform import Rotation as R
-            except Exception:
-                R = None
-                logger.warning("use_endpose=True but scipy is unavailable; falling back to joint absolute conversion.")
-        else:
-            R = None
-
-        if self.use_endpose and R is not None and real_act_dim >= 14:
-            B, T, _ = actual_action.shape
-            abs_action = actual_action.clone()
-            pos_indices_left = torch.tensor([0, 1, 2], device=actual_action.device)
-            pos_indices_right = torch.tensor([7, 8, 9], device=actual_action.device)
-            rot_indices_left = torch.tensor([3, 4, 5], device=actual_action.device)
-            rot_indices_right = torch.tensor([10, 11, 12], device=actual_action.device)
-            s0_pos = state_raw_unnormalized[:, :real_act_dim]
-            delta_pos = actual_action[:, :, :real_act_dim]
-            abs_action[:, :, pos_indices_left] = s0_pos[:, pos_indices_left].unsqueeze(1) + delta_pos[:, :, pos_indices_left]
-            abs_action[:, :, pos_indices_right] = s0_pos[:, pos_indices_right].unsqueeze(1) + delta_pos[:, :, pos_indices_right]
-            s0_rot_left = state_raw_unnormalized[:, rot_indices_left]
-            s0_rot_right = state_raw_unnormalized[:, rot_indices_right]
-            for t in range(T):
-                delta_rot_left = actual_action[:, t, rot_indices_left]
-                delta_rot_right = actual_action[:, t, rot_indices_right]
-                for b in range(B):
-                    state_left_rot = R.from_euler("xyz", s0_rot_left[b].detach().cpu().numpy(), degrees=True)
-                    delta_left_rot = R.from_euler("xyz", delta_rot_left[b].detach().cpu().numpy(), degrees=True)
-                    abs_rot_left = state_left_rot * delta_left_rot
-                    abs_action[b, t, rot_indices_left] = torch.tensor(
-                        abs_rot_left.as_euler("xyz", degrees=True),
-                        device=actual_action.device,
-                        dtype=actual_action.dtype,
-                    )
-                    state_right_rot = R.from_euler("xyz", s0_rot_right[b].detach().cpu().numpy(), degrees=True)
-                    delta_right_rot = R.from_euler("xyz", delta_rot_right[b].detach().cpu().numpy(), degrees=True)
-                    abs_rot_right = state_right_rot * delta_right_rot
-                    abs_action[b, t, rot_indices_right] = torch.tensor(
-                        abs_rot_right.as_euler("xyz", degrees=True),
-                        device=actual_action.device,
-                        dtype=actual_action.dtype,
-                    )
-            return abs_action
-
-        s0 = state_raw_unnormalized[:, :real_act_dim].unsqueeze(1)
-        delta = actual_action[..., :real_act_dim]
-        mask = torch.ones((real_act_dim,), device=actual_action.device, dtype=torch.bool)
-        if real_act_dim > 6:
-            mask[6] = False
-        if real_act_dim > 13:
-            mask[13] = False
-        abs_action = actual_action.clone()
-        abs_action[..., :real_act_dim] = torch.where(mask.view(1, 1, -1), s0 + delta, delta)
-        if not self._warned_no_abs_transform:
-            logger.warning("[PI0ForActionPrediction] Using fallback delta->absolute transformation for piper rollout.")
-            self._warned_no_abs_transform = True
-        return abs_action
-
-    def _current_runtime_roundtrip_for_piper(
-        self,
-        gt_abs_action: torch.Tensor,
-        state_raw_unnormalized: torch.Tensor,
-        real_act_dim: int,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        real_act_dim = max(1, min(real_act_dim, int(gt_abs_action.shape[-1]), int(state_raw_unnormalized.shape[-1])))
-        mask = torch.ones((real_act_dim,), device=gt_abs_action.device, dtype=torch.bool)
-        if real_act_dim > 6:
-            mask[6] = False
-        if real_act_dim > 13:
-            mask[13] = False
-
-        delta_action = gt_abs_action.clone()
-        s0 = state_raw_unnormalized[:, :real_act_dim].unsqueeze(1)
-        delta_action[..., :real_act_dim] = torch.where(
-            mask.view(1, 1, -1),
-            gt_abs_action[..., :real_act_dim] - s0,
-            gt_abs_action[..., :real_act_dim],
-        )
-        norm_action = self.action_normalize_transform(delta_action)
-        recovered_delta = self.action_unnormalize_transform(norm_action)
-        recovered_abs = recovered_delta.clone()
-        recovered_abs[..., :real_act_dim] = torch.where(
-            mask.view(1, 1, -1),
-            s0 + recovered_delta[..., :real_act_dim],
-            recovered_delta[..., :real_act_dim],
-        )
-        return norm_action, recovered_delta, recovered_abs
-
-    @staticmethod
-    def _log_action_compare(tag: str, pred: torch.Tensor, gt: torch.Tensor) -> None:
-        common_t = min(int(pred.shape[1]), int(gt.shape[1]))
-        common_a = min(int(pred.shape[-1]), int(gt.shape[-1]))
-        pred_cmp = pred[:, :common_t, :common_a]
-        gt_cmp = gt[:, :common_t, :common_a]
-        abs_diff = (pred_cmp - gt_cmp).abs()
-        logger.warning(
-            "[%s] compare on [B=%d,T=%d,A=%d]: mae=%.6f max=%.6f",
-            tag,
-            pred_cmp.shape[0],
-            common_t,
-            common_a,
-            float(abs_diff.mean().item()),
-            float(abs_diff.max().item()),
-        )
-        logger.warning(
-            "[%s] pred[0,0,:14]=%s gt[0,0,:14]=%s",
-            tag,
-            pred_cmp[0, 0, : min(14, common_a)].detach().cpu().tolist(),
-            gt_cmp[0, 0, : min(14, common_a)].detach().cpu().tolist(),
-        )
-
     def forward(
         self,
         images: list[torch.Tensor],
@@ -621,76 +324,35 @@ class PI0ForActionPrediction(PreTrainedModel, SupportSACTraining):
         if env_name is None:
             env_name = "piper" if is_robot_obs else "libero"
 
-        target_device = None
-        if len(env_obs.batch) > 0:
-            target_device = next(iter(env_obs.batch.values())).device
+        if env_name == "piper":
+            pi0_input = PiperPi0Input.from_env_obs(env_obs)
+        elif env_name == "libero":
+            pi0_input = LiberoPi0Input.from_env_obs(env_obs)
         else:
-            target_device = torch.device(get_device_name())
+            raise ValueError(f"Unknown env_name={env_name}")
 
-        debug_mode = self.debug_rollout_mode
-        debug_dataset_index = None
-        if debug_mode in {"dataset_action", "dataset_action_replay", "dataset_observation", "dataset_observation_replay"}:
-            if env_name != "piper":
-                raise ValueError(f"debug_rollout_mode={debug_mode} currently only supports env_name='piper'")
-            debug_dataset_index, debug_sample = self._next_debug_dataset_sample()
-            pi0_input = self._prepare_pi0_input_from_dataset_sample(debug_sample, device=target_device)
-            if not self._debug_rollout_logged_once:
-                logger.warning(
-                    "[PI0ForActionPrediction] debug_rollout_mode=%s enabled. Using dataset sample index=%s task=%s",
-                    debug_mode,
-                    debug_dataset_index,
-                    pi0_input.task[0],
-                )
-                self._debug_rollout_logged_once = True
+        state_raw_unnormalized = pi0_input.state
+        target_device = state_raw_unnormalized.device
+        try:
+            self._to(target_device)
+        except Exception:
+            pass
+
+        cfg = getattr(self, "config", None)
+        if env_name == "piper" and cfg is not None and getattr(cfg, "action_dim", None) is not None:
+            real_act_dim = int(cfg.action_dim)
         else:
-            if env_name == "piper":
-                pi0_input = PiperPi0Input.from_env_obs(env_obs)
-            elif env_name == "libero":
-                pi0_input = LiberoPi0Input.from_env_obs(env_obs)
-            else:
-                raise ValueError(f"Unknown env_name={env_name}")
+            real_act_dim = int(state_raw_unnormalized.shape[-1])
 
-        state_raw_unnormalized, real_act_dim, state, images, lang_tokens, lang_masks, s = self._prepare_rollout_inputs(
-            pi0_input, tokenizer, env_name
+        state = self.state_normalize_transform(state_raw_unnormalized)
+        if self.no_state:
+            state = torch.zeros_like(state)
+
+        images, _ = self.image_transform.call_batch(pi0_input.images)
+        state_for_prompt = state[:, :real_act_dim] if self.pi05_enabled else state
+        lang_tokens, lang_masks = self.prompt_tokenizer_transform.call_batch(
+            {"task": pi0_input.task, "observation.state": state_for_prompt}, tokenizer
         )
-
-        gt_action = getattr(pi0_input, "gt_action", None)
-
-        if debug_mode in {"dataset_action", "dataset_action_replay"}:
-            if gt_action is None:
-                raise RuntimeError("dataset_action replay requested but dataset sample does not contain action")
-
-            target_steps = max(1, int(getattr(self, "n_action_steps", gt_action.shape[1])))
-            if gt_action.shape[1] > target_steps:
-                logger.warning(
-                    "[PI0ForActionPrediction] dataset_action replay truncating dataset chunk from T=%s to n_action_steps=%s",
-                    gt_action.shape[1],
-                    target_steps,
-                )
-                gt_action = gt_action[:, :target_steps]
-            _, _, recovered_abs = self._current_runtime_roundtrip_for_piper(
-                gt_action, state_raw_unnormalized, real_act_dim
-            )
-            self._log_action_compare("dataset_action_roundtrip", recovered_abs, gt_action)
-
-            send_variant = self.debug_dataset_action_send_variant
-            if send_variant in {"raw", "gt", "ground_truth"}:
-                action_to_send = gt_action
-            else:
-                action_to_send = recovered_abs
-
-            logger.warning(
-                "[PI0ForActionPrediction] dataset_action replay using sample index=%s send_variant=%s",
-                debug_dataset_index,
-                send_variant,
-            )
-            rollout_log_probs = torch.zeros(action_to_send.shape[0], device=action_to_send.device, dtype=torch.float32)
-            pi0_output = PiperPi0Output.from_model_output({"full_action": action_to_send})
-            a = {
-                "full_action": self.action_normalize_transform(action_to_send),
-                "log_probs": rollout_log_probs,
-            }
-            return pi0_output, s, a
 
         if self.flow_sde_enable:
             prefix_features = self.model.embed_prefix(
@@ -712,35 +374,82 @@ class PI0ForActionPrediction(PreTrainedModel, SupportSACTraining):
         actual_action = self.action_unnormalize_transform(pred_action)
 
         if env_name == "piper":
-            actual_action = self._postprocess_piper_actions(actual_action, state_raw_unnormalized, real_act_dim)
+            real_act_dim = max(1, min(real_act_dim, int(actual_action.shape[-1]), int(state_raw_unnormalized.shape[-1])))
 
-        if debug_mode in {"dataset_observation", "dataset_observation_replay"} and gt_action is not None:
-            target_steps = min(actual_action.shape[1], gt_action.shape[1])
-            gt_action = gt_action[:, :target_steps]
-            actual_action = actual_action[:, :target_steps]
-            self._log_action_compare("dataset_observation_model_vs_gt", actual_action, gt_action)
-            if self.debug_dataset_observation_send_ground_truth:
-                logger.warning(
-                    "[PI0ForActionPrediction] dataset_observation replay configured to send ground-truth action to robot. index=%s",
-                    debug_dataset_index,
-                )
-                action_to_send = gt_action
+            if self.use_endpose:
+                try:
+                    from scipy.spatial.transform import Rotation as R
+                except Exception:
+                    R = None
+                    logger.warning("use_endpose=True but scipy is unavailable; falling back to joint absolute conversion.")
             else:
-                logger.warning(
-                    "[PI0ForActionPrediction] dataset_observation replay sending MODEL output to robot. index=%s",
-                    debug_dataset_index,
-                )
-                action_to_send = actual_action
-        else:
-            action_to_send = actual_action
+                R = None
+
+            if self.use_endpose and R is not None and real_act_dim >= 14:
+                B, T, _ = actual_action.shape
+                abs_action = actual_action.clone()
+                pos_indices_left = torch.tensor([0, 1, 2], device=actual_action.device)
+                pos_indices_right = torch.tensor([7, 8, 9], device=actual_action.device)
+                rot_indices_left = torch.tensor([3, 4, 5], device=actual_action.device)
+                rot_indices_right = torch.tensor([10, 11, 12], device=actual_action.device)
+                s0_pos = state_raw_unnormalized[:, :real_act_dim]
+                delta_pos = actual_action[:, :, :real_act_dim]
+                abs_action[:, :, pos_indices_left] = s0_pos[:, pos_indices_left].unsqueeze(1) + delta_pos[:, :, pos_indices_left]
+                abs_action[:, :, pos_indices_right] = s0_pos[:, pos_indices_right].unsqueeze(1) + delta_pos[:, :, pos_indices_right]
+                s0_rot_left = state_raw_unnormalized[:, rot_indices_left]
+                s0_rot_right = state_raw_unnormalized[:, rot_indices_right]
+                for t in range(T):
+                    delta_rot_left = actual_action[:, t, rot_indices_left]
+                    delta_rot_right = actual_action[:, t, rot_indices_right]
+                    for b in range(B):
+                        state_left_rot = R.from_euler("xyz", s0_rot_left[b].detach().cpu().numpy(), degrees=True)
+                        delta_left_rot = R.from_euler("xyz", delta_rot_left[b].detach().cpu().numpy(), degrees=True)
+                        abs_rot_left = state_left_rot * delta_left_rot
+                        abs_action[b, t, rot_indices_left] = torch.tensor(
+                            abs_rot_left.as_euler("xyz", degrees=True),
+                            device=actual_action.device,
+                            dtype=actual_action.dtype,
+                        )
+                        state_right_rot = R.from_euler("xyz", s0_rot_right[b].detach().cpu().numpy(), degrees=True)
+                        delta_right_rot = R.from_euler("xyz", delta_rot_right[b].detach().cpu().numpy(), degrees=True)
+                        abs_rot_right = state_right_rot * delta_right_rot
+                        abs_action[b, t, rot_indices_right] = torch.tensor(
+                            abs_rot_right.as_euler("xyz", degrees=True),
+                            device=actual_action.device,
+                            dtype=actual_action.dtype,
+                        )
+                actual_action = abs_action
+            else:
+                s0 = state_raw_unnormalized[:, :real_act_dim].unsqueeze(1)
+                delta = actual_action[..., :real_act_dim]
+                mask = torch.ones((real_act_dim,), device=actual_action.device, dtype=torch.bool)
+                if real_act_dim > 6:
+                    mask[6] = False
+                if real_act_dim > 13:
+                    mask[13] = False
+                abs_action = actual_action.clone()
+                abs_action[..., :real_act_dim] = torch.where(mask.view(1, 1, -1), s0 + delta, delta)
+                actual_action = abs_action
+                if not self._warned_no_abs_transform:
+                    logger.warning(
+                        "[PI0ForActionPrediction] Using fallback delta->absolute transformation for piper rollout."
+                    )
+                    self._warned_no_abs_transform = True
 
         if env_name == "piper":
-            pi0_output = PiperPi0Output.from_model_output({"full_action": action_to_send})
-            full_action_for_critic = self.action_normalize_transform(action_to_send)
+            pi0_output = PiperPi0Output.from_model_output({"full_action": actual_action})
+            full_action_for_critic = self.action_normalize_transform(actual_action)
         else:
-            pi0_output = LiberoPi0Output.from_model_output({"full_action": action_to_send})
+            pi0_output = LiberoPi0Output.from_model_output({"full_action": actual_action})
             full_action_for_critic = pred_action
 
+        s = {
+            "states": state,
+            "images": torch.stack(images, dim=1),
+            "image_masks": torch.stack(pi0_input.img_masks, dim=1),
+            "lang_tokens": lang_tokens,
+            "lang_masks": lang_masks,
+        }
         a = {
             "full_action": full_action_for_critic,
             "log_probs": rollout_log_probs,
