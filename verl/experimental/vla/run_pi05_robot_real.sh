@@ -71,9 +71,9 @@ NUM_STAGE=1
 NUM_ENV=1
 
 # 建议先和数据/action chunk 对齐
-ACTION_CHUNK=50
+ACTION_CHUNK=10
 MAX_EPISODE_STEPS=300
-STEP_SIZE=1
+STEP_SIZE=10
 
 # =========================================================
 # 训练配置
@@ -171,6 +171,8 @@ $PYTHON -m verl.experimental.vla.main_sac \
     +actor_rollout_ref.algorithm='sac' \
     actor_rollout_ref.model.path="$SFT_MODEL_PATH" \
     actor_rollout_ref.model.tokenizer_path="$TOKENIZER_PATH" \
+    actor_rollout_ref.model.override_config.flow_sde_enable=False \
+    actor_rollout_ref.model.override_config.flow_sde_rollout_noise_scale=0.0 \
     +actor_rollout_ref.model.override_config.dataset_type=lerobot \
     +actor_rollout_ref.model.override_config.attn_implementation=eager \
     +actor_rollout_ref.model.override_config.flow_logprob_mode=path_exact \
@@ -212,4 +214,12 @@ $PYTHON -m verl.experimental.vla.main_sac \
     \
     actor_rollout_ref.ref.log_prob_micro_batch_size=16 \
     actor_rollout_ref.ref.fsdp_config.param_offload=True \
-    algorithm.kl_ctrl.kl_coef=0.00
+    algorithm.kl_ctrl.kl_coef=0.00 \
+    ++actor_rollout_ref.model.override_config.n_action_steps=10 \
+    ++actor_rollout_ref.model.override_config.debug_rollout_mode=dataset_observation \
+    ++actor_rollout_ref.model.override_config.debug_dataset_root=/shared_disk/users/yejun.zeng/datasets/huggingface/lerobot/catch_bowl \
+    ++actor_rollout_ref.model.override_config.debug_dataset_repo_id=catch_bowl \
+    ++actor_rollout_ref.model.override_config.debug_dataset_start_index=0 \
+    ++actor_rollout_ref.model.override_config.debug_dataset_auto_advance=True \
+    ++actor_rollout_ref.model.override_config.debug_dataset_stride=10 \
+    ++actor_rollout_ref.model.override_config.debug_dataset_observation_send_ground_truth=False
