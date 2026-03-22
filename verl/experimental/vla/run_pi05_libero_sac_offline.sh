@@ -3,11 +3,13 @@ set -x
 set -e
 
 RLPD_FILES="/shared_disk/users/yejun.zeng/datasets/huggingface/lerobot/catch_bowl"
-SFT_MODEL_PATH="/shared_disk/users/weijie.ke/weight/giga-openpi/pick_catch_bowl_new_yag/1k"
+SFT_MODEL_PATH="/shared_disk/users/weijie.ke/weight/giga-openpi/pick_catch_bowl_new_yag/1_5w"
 NORM_PATH="/shared_disk/users/yejun.zeng/datasets/huggingface/lerobot/catch_bowl/meta/norm.json"
 TOKENIZER_PATH="$SFT_MODEL_PATH"
 
-OUTPUT_DIR="/shared_disk/users/angen.ye/code/hil-serl/model/verl_fintune_model/catch_bowl/322_1k_piper50"
+# OUTPUT_DIR="/shared_disk/users/angen.ye/code/hil-serl/model/verl_fintune_model/catch_bowl/322_1k_piper50"
+
+OUTPUT_DIR="/shared_disk/users/angen.ye/code/hil-serl/model/verl_fintune_model/catch_bowl/322_1_5w_piper50_no_bc"
 
 NUM_NODES=1
 NUM_GPUS=4
@@ -15,7 +17,7 @@ NUM_ENV_GPUS=0
 NUM_ROLLOUT_GPUS=4
 
 RLPD_BATCH_SIZE=256
-TOTAL_EPOCHS=50
+TOTAL_EPOCHS=300
 MICRO_BATCH_SIZE=8
 LR=1e-5
 
@@ -78,8 +80,8 @@ $PYTHON -m verl.experimental.vla.main_sac \
     critic.strategy=fsdp2 \
     actor_rollout_ref.actor.use_dynamic_bsz=False \
     actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=$MICRO_BATCH_SIZE \
-    actor_rollout_ref.actor.critic_warmup_steps=0 \
-    actor_rollout_ref.actor.sac.bc_loss_coef=1.0 \
+    actor_rollout_ref.actor.critic_warmup_steps=300 \
+    actor_rollout_ref.actor.sac.bc_loss_coef=0 \
     actor_rollout_ref.actor.optim.lr=$LR \
     actor_rollout_ref.actor.optim.warmup_style=constant \
     actor_rollout_ref.actor.grad_clip=1.0 \

@@ -65,9 +65,9 @@ class LiberoPi0DatasetInput(Pi0DatasetInput):
                     "observation.images.cam_right_wrist": empty_right,
                 },
                 "img_masks": [
-                    torch.ones((batch_size,), dtype=torch.bool),
-                    torch.ones((batch_size,), dtype=torch.bool),
-                    torch.zeros((batch_size,), dtype=torch.bool),
+                    torch.ones((batch_size,), dtype=torch.bool, device=device),
+                    torch.ones((batch_size,), dtype=torch.bool, device=device),
+                    torch.zeros((batch_size,), dtype=torch.bool, device=device),
                 ],
                 "task": [parse_task(p) for p in batch.non_tensor_batch[f"{prefix}.hdf5_path"]],
                 "state": pad_last_dim_to(
@@ -87,9 +87,17 @@ class LiberoPi0DatasetInput(Pi0DatasetInput):
         input.s1 = state["t1"]
         input.a0 = {"action": pad_dim_to(pad_last_dim_to(batch.batch["t0.actions"], 32), dim=1, target_size=50)}
         input.a1 = {"action": pad_dim_to(pad_last_dim_to(batch.batch["t1.actions"], 32), dim=1, target_size=50)}
-        input.rewards = batch.batch["t1.chunk_dones"].float()
-        input.valids = torch.ones((batch_size,), dtype=torch.float32, device=device)
-        input.dones = batch.batch["t1.chunk_dones"].float()
-        input.positive_sample_mask = torch.ones((batch_size,), dtype=torch.float32, device=device)
+
+        done = batch.batch["t1.chunk_dones"].to(device=device, dtype=torch.bool)
+
+        if "t1.rewards" in batch.batch:
+            reward = batch.batch["t1.rewards"].to(device=device, dtype=torch.float32)
+        else:
+            reward = done.float()
+
+        input.rewards = reward
+        input.valids = torch.ones((batch_size,), dtype=torch.bool, device=device)
+        input.dones = done
+        input.positive_sample_mask = torch.ones((batch_size,), dtype=torch.bool, device=device)
 
         return input

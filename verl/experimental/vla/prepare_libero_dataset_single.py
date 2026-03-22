@@ -234,18 +234,18 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--task_suite_name",
-        default="libero_spatial",
+        default="libero_10",
         help="Task suite name. Support single suite (e.g. libero_spatial), multiple suites split by comma, or all.",
     )
     parser.add_argument(
         "--local_save_dir",
-        default="~/data/libero_rl",
+        default="~/data/libero_10_task3",
         help="The save directory for the preprocessed dataset.",
     )
     parser.add_argument(
         "--single_task_id",
         type=int,
-        default=None,
+        default=3,
         help="If set, only generate dataset for this single task_id within the suite.",
     )
     parser.add_argument(
