@@ -55,16 +55,17 @@ actor_rollout_ref:
       gamma: 0.99
       tau: 1.0
       bc_loss_coef: 0
-      initial_alpha: 0
+      initial_alpha: 0.01
       critic_replay_positive_sample_ratio: 0.5
       actor_replay_positive_sample_ratio: 0.8
       auto_entropy: False
       alpha_type: exp
       alpha_lr: 0.0003
-      target_entropy: -64.0
+      target_entropy: -1
+      n_step_return: 1
     critic_lr: 0.0001
     critic_weight_decay: 0
-    critic_warmup_steps: 1
+    critic_warmup_steps: 20
     actor_update_interval: 1
     actor_ema_enabled: true
     actor_ema_decay: 0.95

@@ -300,6 +300,7 @@ class RobDataParallelSACActor(BaseSACActor):
         dones: torch.Tensor,
         next_log_prob: Optional[torch.Tensor],
         valids: torch.Tensor,
+        discounts: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Calculate critic loss using the SAC loss function.
 
@@ -319,10 +320,14 @@ class RobDataParallelSACActor(BaseSACActor):
         alpha = self._get_alpha()
 
         with torch.no_grad():
-            if next_log_prob is None:
-                y = rewards + gamma * (1.0 - dones) * q_target
+            if discounts is None:
+                bootstrap_discount = gamma * (1.0 - dones)
             else:
-                y = rewards + gamma * (1.0 - dones) * (q_target - alpha * next_log_prob)
+                bootstrap_discount = discounts
+            if next_log_prob is None:
+                y = rewards + bootstrap_discount * q_target
+            else:
+                y = rewards + bootstrap_discount * (q_target - alpha * next_log_prob)
 
         y = y.unsqueeze(1).expand_as(q_predict)  # (B, critic_num)
         valid_mask = valids.unsqueeze(1)
@@ -373,6 +378,7 @@ class RobDataParallelSACActor(BaseSACActor):
                 dones=micro_batch["dones"],
                 next_log_prob=log_probs_1,
                 valids=micro_batch["valids"],
+                discounts=micro_batch.get("discounts", None),
             )
         return critic_loss, q_values_0, q_values_1
 
@@ -440,20 +446,21 @@ class RobDataParallelSACActor(BaseSACActor):
 
         metrics: dict[str, float] = {}
         if "empty_batch" not in data.meta_info:
-            with torch.no_grad():
-                metrics["debug/bc_loss_input"] = float(self._compute_bc_loss_on_batch(data.select([
-                    "a0.full_action",
-                    "a0.action_loss_mask",
-                    "s0.states",
-                    "s0.images",
-                    "s0.image_masks",
-                    "s0.lang_tokens",
-                    "s0.lang_masks",
-                    "valids",
-                ]).batch).detach().float().item())
+            if getattr(self.config.sac, "bc_loss_coef", 0.0) > 0:
+                with torch.no_grad():
+                    metrics["debug/bc_loss_input"] = float(self._compute_bc_loss_on_batch(data.select([
+                        "a0.full_action",
+                        "a0.action_loss_mask",
+                        "s0.states",
+                        "s0.images",
+                        "s0.image_masks",
+                        "s0.lang_tokens",
+                        "s0.lang_masks",
+                        "valids",
+                    ]).batch).detach().float().item())
 
             task_ids = data.batch["task_ids"]
-            self.replay_pool.add_batch(data.select([
+            replay_batch = data.select([
                 "a0.full_action",
                 "a1.full_action",
                 "a0.action_loss_mask",
@@ -471,8 +478,16 @@ class RobDataParallelSACActor(BaseSACActor):
                 "rewards",
                 "dones",
                 "valids",
-                "positive_sample_mask"
-            ]).batch, task_ids=task_ids)
+                "positive_sample_mask",
+            ]).batch
+            if "discounts" in data.batch:
+                replay_batch["discounts"] = data.batch["discounts"]
+            else:
+                replay_batch["discounts"] = (
+                    torch.tensor(float(self.sac_config.gamma), device=replay_batch["dones"].device, dtype=replay_batch["rewards"].dtype)
+                    * (1.0 - replay_batch["dones"].to(replay_batch["rewards"].dtype))
+                )
+            self.replay_pool.add_batch(replay_batch, task_ids=task_ids)
 
         replay_positive_sample_ratio = float(self.sac_config.get("critic_replay_positive_sample_ratio", 0.5))
         critic_batch, critic_replay_sample_info = self.replay_pool.sample_batch(

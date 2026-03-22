@@ -3,12 +3,17 @@ set -x
 set -e
 
 RLPD_FILES="/shared_disk/users/yejun.zeng/datasets/huggingface/lerobot/catch_bowl"
+# RLPD_FILES="/shared_disk/users/yejun.zeng/datasets/huggingface/lerobot/install_belt"
 # SFT_MODEL_PATH="/shared_disk/users/angen.ye/code/hil-serl/model/torch_pi05_base"
+SFT_MODEL_PATH="/shared_disk/users/weijie.ke/weight/giga-openpi/install_belt_joint/5000"
 # SFT_MODEL_PATH="/shared_disk/users/weijie.ke/weight/giga-openpi/install_belt_joint/3w"
-SFT_MODEL_PATH="/shared_disk/users/weijie.ke/weight/giga-openpi/pick_catch_bowl_new_yag/1k"
+# SFT_MODEL_PATH="/shared_disk/users/weijie.ke/weight/giga-openpi/pick_catch_bowl_new_yag/3w"
+# NORM_PATH="/shared_disk/users/yejun.zeng/datasets/huggingface/lerobot/install_belt/meta/norm.json"
+NORM_PATH="/shared_disk/users/yejun.zeng/datasets/huggingface/lerobot/catch_bowl/meta/norm.json"
 TOKENIZER_PATH="$SFT_MODEL_PATH"
 
-OUTPUT_DIR="/shared_disk/users/weijie.ke/offline_rlpd_runs/catch_bowl_offline_only_320_catch_bowl"
+# OUTPUT_DIR="/shared_disk/users/angen.ye/code/hil-serl/model/verl_fintune_model/catch_bowl/test2"
+OUTPUT_DIR="/shared_disk/users/angen.ye/code/hil-serl/model/verl_fintune_model/catch_bowl/322_from_install_belt_5k_3"
 
 NUM_NODES=1
 NUM_GPUS=4
@@ -79,6 +84,9 @@ $PYTHON -m verl.experimental.vla.main_sac \
     actor_rollout_ref.model.enable_gradient_checkpointing=False \
     actor_rollout_ref.model.use_remove_padding=False \
     actor_rollout_ref.model.trust_remote_code=False \
-    actor_rollout_ref.actor.replay_pool_save_dir="$OUTPUT_DIR/replay_pools"
+    actor_rollout_ref.actor.replay_pool_save_dir="$OUTPUT_DIR/replay_pools" \
+    +actor_rollout_ref.model.override_config.norm_stats_path="$NORM_PATH" \
+    +actor_rollout_ref.model.override_config.piper_real_dataset=True \
+    +actor_rollout_ref.model.override_config.piper_use_delta_action=True \
     # +actor_rollout_ref.model.override_config.critic_action_steps=50 \
     # +actor_rollout_ref.model.override_config.critic_action_dim=14

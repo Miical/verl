@@ -392,7 +392,7 @@ class ImageTransform:
             )
             self.pose_transform = transforms.Compose(
                 [
-                    transforms.RandomCrop(int(self.width * 0.95), int(self.height * 0.95)),
+                    transforms.RandomCrop((int(self.width * 0.95), int(self.height * 0.95))),
                     transforms.Resize((self.width, self.height)),
                     transforms.RandomRotation((-5, 5)),
                 ]

@@ -20,8 +20,8 @@ from verl.protocol import DataProto
 from .base import Pi0Input, Pi0Output
 
 PI0_MAX_STATE_DIM = 32
-PI0_ACTION_CHUNK_SIZE = 10
-PIPER_ACTION_DIM = 14  # Piper 双臂机器人的动作维度（每个臂7维）
+DEFAULT_PI0_ACTION_CHUNK_SIZE = 10
+DEFAULT_PIPER_ACTION_DIM = 14  # Piper 双臂机器人的动作维度（每个臂7维）
 
 
 class PiperPi0Input(Pi0Input):
@@ -98,10 +98,14 @@ class PiperPi0Output(Pi0Output):
         output = cls()
         full_action = model_output["full_action"]
         
-        # 动态获取实际的 action_dim，默认使用 PIPER_ACTION_DIM
+        action_steps = int(model_output.get("action_steps", DEFAULT_PI0_ACTION_CHUNK_SIZE))
+        configured_action_dim = int(model_output.get("action_dim", DEFAULT_PIPER_ACTION_DIM))
+
+        # 动态获取实际的 action_dim，默认使用 DEFAULT_PIPER_ACTION_DIM
         actual_action_dim = full_action.shape[-1]
-        action_dim = min(actual_action_dim, PIPER_ACTION_DIM)
-        
-        # 提取前 PI0_ACTION_CHUNK_SIZE 个时间步和前 action_dim 个动作维度
-        output.action = full_action[:, :PI0_ACTION_CHUNK_SIZE, :action_dim]
+        action_dim = min(actual_action_dim, configured_action_dim)
+        action_steps = min(full_action.shape[1], action_steps)
+
+        # 提取前 action_steps 个时间步和前 action_dim 个动作维度
+        output.action = full_action[:, :action_steps, :action_dim]
         return output

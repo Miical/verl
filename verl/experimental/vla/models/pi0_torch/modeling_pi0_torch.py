@@ -176,6 +176,10 @@ class PI0ForActionPrediction(PreTrainedModel, SupportSACTraining):
         self.flow_sde_rollout_noise_scale = float(getattr(config, "flow_sde_rollout_noise_scale", 1.0))
         self.flow_sde_train_noise_scale = float(getattr(config, "flow_sde_train_noise_scale", 1.0))
         self.flow_logprob_mode = str(getattr(config, "flow_logprob_mode", "path_exact"))
+        self.flow_logprob_reduction = str(getattr(config, "flow_logprob_reduction", "sum"))
+        self.flow_logprob_exec_steps = getattr(config, "flow_logprob_exec_steps", None)
+        self.flow_logprob_exec_dim = getattr(config, "flow_logprob_exec_dim", None)
+        self.flow_logprob_clip = getattr(config, "flow_logprob_clip", None)
         self.flow_sigma_head_hidden_dim = int(getattr(config, "flow_sigma_head_hidden_dim", 512))
         self.flow_sigma_min = float(getattr(config, "flow_sigma_min", 1e-3))
         self.flow_sigma_max = float(getattr(config, "flow_sigma_max", 5e-1))
@@ -674,6 +678,44 @@ class PI0ForActionPrediction(PreTrainedModel, SupportSACTraining):
         entropy = 0.5 * (1.0 + math.log(2.0 * math.pi)) + torch.log(std_safe)
         return entropy.sum(dim=(-1, -2))
 
+    def _get_flow_logprob_exec_shape(self, action_like: torch.Tensor) -> tuple[int, int]:
+        cfg_steps = self.flow_logprob_exec_steps
+        cfg_dim = self.flow_logprob_exec_dim
+
+        if cfg_steps is None:
+            cfg_steps = getattr(self.config, "critic_action_steps", action_like.shape[1])
+        if cfg_dim is None:
+            cfg_dim = getattr(self.config, "critic_action_dim", action_like.shape[2])
+
+        exec_steps = max(1, min(int(cfg_steps), int(action_like.shape[1])))
+        exec_dim = max(1, min(int(cfg_dim), int(action_like.shape[2])))
+        return exec_steps, exec_dim
+
+    def _reduce_flow_path_stat(
+        self,
+        values: torch.Tensor,
+        *,
+        exec_steps: int,
+        exec_dim: int,
+        denoise_steps: int,
+    ) -> torch.Tensor:
+        reduction = self.flow_logprob_reduction
+        if reduction == "sum":
+            reduced = values
+        elif reduction == "mean_denoise":
+            reduced = values / float(max(denoise_steps, 1))
+        elif reduction == "mean_exec":
+            reduced = values / float(max(exec_steps * exec_dim, 1))
+        elif reduction == "mean_exec_path":
+            reduced = values / float(max(denoise_steps * exec_steps * exec_dim, 1))
+        else:
+            raise ValueError(f"Unknown flow_logprob_reduction: {reduction}")
+
+        if self.flow_logprob_clip is not None:
+            clip_val = float(self.flow_logprob_clip)
+            reduced = reduced.clamp(min=-clip_val, max=clip_val)
+        return reduced
+
     def _masked_mean_prefix(self, prefix_embs: torch.Tensor, prefix_pad_masks: torch.Tensor) -> torch.Tensor:
         weights = prefix_pad_masks.to(dtype=prefix_embs.dtype).unsqueeze(-1)
         denom = weights.sum(dim=1).clamp_min(1.0)
@@ -726,6 +768,7 @@ class PI0ForActionPrediction(PreTrainedModel, SupportSACTraining):
         step_entropies: list[torch.Tensor] = []
         step_sigma_means: list[torch.Tensor] = []
         step_sigma_stds: list[torch.Tensor] = []
+        exec_steps, exec_dim = self._get_flow_logprob_exec_shape(x_t)
 
         for idx in range(self.model.num_steps):
             t_cur = timesteps[idx]
@@ -774,16 +817,33 @@ class PI0ForActionPrediction(PreTrainedModel, SupportSACTraining):
                 x_prev = x_mean
 
             if return_log_prob:
-                step_log_probs.append(self._diag_gaussian_log_prob_sum(x_prev, x_mean, sigma_t))
-                step_entropies.append(self._diag_gaussian_entropy_sum(sigma_t))
+                x_prev_exec = x_prev[:, :exec_steps, :exec_dim]
+                x_mean_exec = x_mean[:, :exec_steps, :exec_dim]
+                sigma_exec = sigma_t.expand_as(x_prev_exec)
+                step_log_probs.append(self._diag_gaussian_log_prob_sum(x_prev_exec, x_mean_exec, sigma_exec))
+                step_entropies.append(self._diag_gaussian_entropy_sum(sigma_exec))
 
             step_sigma_means.append(sigma_t.mean())
             step_sigma_stds.append(sigma_t.std(unbiased=False))
             x_t = x_prev
 
+        raw_log_probs = None
+        raw_path_entropy = None
         if return_log_prob and self.flow_logprob_mode == "path_exact":
-            log_probs = torch.stack(step_log_probs, dim=1).sum(dim=1)
-            path_entropy = torch.stack(step_entropies, dim=1).sum(dim=1)
+            raw_log_probs = torch.stack(step_log_probs, dim=1).sum(dim=1)
+            raw_path_entropy = torch.stack(step_entropies, dim=1).sum(dim=1)
+            log_probs = self._reduce_flow_path_stat(
+                raw_log_probs,
+                exec_steps=exec_steps,
+                exec_dim=exec_dim,
+                denoise_steps=self.model.num_steps,
+            )
+            path_entropy = self._reduce_flow_path_stat(
+                raw_path_entropy,
+                exec_steps=exec_steps,
+                exec_dim=exec_dim,
+                denoise_steps=self.model.num_steps,
+            )
         elif return_log_prob:
             log_probs = None
             path_entropy = None
@@ -795,11 +855,17 @@ class PI0ForActionPrediction(PreTrainedModel, SupportSACTraining):
             "flow_sigma_mean": float(torch.stack(step_sigma_means).mean().item()),
             "flow_sigma_std": float(torch.stack(step_sigma_stds).mean().item()),
             "flow_logprob_mode": 1.0 if self.flow_logprob_mode == "path_exact" else 0.0,
+            "flow_logprob_exec_steps": float(exec_steps),
+            "flow_logprob_exec_dim": float(exec_dim),
         }
         if path_entropy is not None:
             metrics["flow_path_entropy_mean"] = float(path_entropy.mean().item())
+        if raw_path_entropy is not None:
+            metrics["flow_raw_path_entropy_mean"] = float(raw_path_entropy.mean().item())
         if log_probs is not None:
             metrics["flow_path_logprob_mean"] = float(log_probs.mean().item())
+        if raw_log_probs is not None:
+            metrics["flow_raw_path_logprob_mean"] = float(raw_log_probs.mean().item())
 
         return x_t, log_probs, metrics
 

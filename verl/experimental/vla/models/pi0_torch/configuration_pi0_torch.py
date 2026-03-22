@@ -28,6 +28,10 @@ class PI0TorchConfig(PretrainedConfig):
 
         # ReinFlow-lite stochastic flow parameters
         self.flow_logprob_mode = kwargs.get("flow_logprob_mode", "path_exact")
+        self.flow_logprob_reduction = kwargs.get("flow_logprob_reduction", "sum")
+        self.flow_logprob_exec_steps = kwargs.get("flow_logprob_exec_steps", None)
+        self.flow_logprob_exec_dim = kwargs.get("flow_logprob_exec_dim", None)
+        self.flow_logprob_clip = kwargs.get("flow_logprob_clip", None)
         self.flow_sigma_head_hidden_dim = kwargs.get("flow_sigma_head_hidden_dim", 512)
         self.flow_sigma_min = kwargs.get("flow_sigma_min", 1e-3)
         self.flow_sigma_max = kwargs.get("flow_sigma_max", 5e-1)

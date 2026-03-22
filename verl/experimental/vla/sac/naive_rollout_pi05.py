@@ -128,7 +128,7 @@ class PI0RolloutRob(NaiveRolloutRob):
             ).detach().float().reshape(-1)
 
         action_loss_mask = torch.ones(
-            output.action.shape[:2],
+            a["full_action"].shape[:2],
             device=output.action.device,
             dtype=torch.bool,
         )

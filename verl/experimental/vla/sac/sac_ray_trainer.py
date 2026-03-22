@@ -64,6 +64,9 @@ REQUIRED_TRAIN_BATCH_KEYS = [
     "positive_sample_mask",
     "task_ids",
 ]
+OPTIONAL_TRAIN_BATCH_KEYS = [
+    "discounts",
+]
 
 
 def compute_avg_positive_trajectory_length(batch: DataProto) -> float:
@@ -132,11 +135,106 @@ def add_transition_prefixes(data: DataProto) -> DataProto:
     return data
 
 
+def _gather_time_dim(tensor: torch.Tensor, index: torch.Tensor) -> torch.Tensor:
+    if tensor.ndim < 2:
+        raise ValueError(f"Expected tensor with time dimension, got shape={tuple(tensor.shape)}")
+    view_shape = [index.shape[0], index.shape[1]] + [1] * (tensor.ndim - 2)
+    expand_shape = list(index.shape) + list(tensor.shape[2:])
+    gather_index = index.view(*view_shape).expand(*expand_shape)
+    return tensor.gather(1, gather_index)
+
+
+def build_n_step_transitions(data: DataProto, gamma: float, n_step: int) -> DataProto:
+    if n_step <= 1:
+        if "discounts" not in data.batch and "dones" in data.batch and "rewards" in data.batch:
+            dones = data.batch["dones"].to(data.batch["rewards"].dtype)
+            data.batch["discounts"] = (1.0 - dones) * float(gamma)
+        return data
+
+    batch = data.batch
+    required = ["rewards", "dones"]
+    for key in required:
+        if key not in batch:
+            raise KeyError(f"build_n_step_transitions requires key: {key}")
+
+    rewards = batch["rewards"].float()
+    dones = batch["dones"].bool()
+    B, S = rewards.shape
+    device = rewards.device
+
+    base_idx = torch.arange(S, device=device).view(1, S).expand(B, S)
+    end_idx = base_idx.clone()
+    cumulative_rewards = torch.zeros_like(rewards)
+    terminal_within = torch.zeros((B, S), dtype=torch.bool, device=device)
+    step_count = torch.zeros((B, S), dtype=torch.long, device=device)
+    active = torch.ones((B, S), dtype=torch.bool, device=device)
+
+    for k in range(n_step):
+        idx_k = (base_idx + k).clamp(max=S - 1)
+        valid_k = (base_idx + k) < S
+        active_k = active & valid_k
+        if not active_k.any():
+            break
+
+        rewards_k = rewards.gather(1, idx_k)
+        dones_k = dones.gather(1, idx_k)
+
+        cumulative_rewards = cumulative_rewards + ((float(gamma) ** k) * rewards_k * active_k.float())
+        end_idx = torch.where(active_k, idx_k, end_idx)
+        step_count = step_count + active_k.long()
+        terminal_within = terminal_within | (active_k & dones_k)
+        active = active_k & (~dones_k)
+
+    discounts = (float(gamma) ** step_count.float()) * (~terminal_within).float()
+
+    gather_keys = [
+        "s1.states",
+        "s1.images",
+        "s1.image_masks",
+        "s1.lang_tokens",
+        "s1.lang_masks",
+        "a1.full_action",
+        "a1.action_loss_mask",
+    ]
+    for key in gather_keys:
+        if key in batch:
+            batch[key] = _gather_time_dim(batch[key], end_idx)
+
+    if "positive_sample_mask" in batch:
+        positive = batch["positive_sample_mask"].to(torch.bool)
+        positive_window = torch.zeros((B, S), dtype=torch.bool, device=device)
+        active = torch.ones((B, S), dtype=torch.bool, device=device)
+        for k in range(n_step):
+            idx_k = (base_idx + k).clamp(max=S - 1)
+            valid_k = (base_idx + k) < S
+            active_k = active & valid_k
+            if not active_k.any():
+                break
+            positive_k = positive.gather(1, idx_k)
+            dones_k = dones.gather(1, idx_k)
+            positive_window = positive_window | (active_k & positive_k)
+            active = active_k & (~dones_k)
+        batch["positive_sample_mask"] = positive_window.to(batch["positive_sample_mask"].dtype)
+
+    batch["rewards"] = cumulative_rewards.to(batch["rewards"].dtype)
+    batch["dones"] = terminal_within.to(batch["dones"].dtype)
+    batch["discounts"] = discounts.to(batch["rewards"].dtype)
+    return data
+
+
+def ensure_bootstrap_discounts(data: DataProto, gamma: float) -> DataProto:
+    if "discounts" not in data.batch:
+        dones = data.batch["dones"].to(data.batch["rewards"].dtype)
+        data.batch["discounts"] = ((1.0 - dones) * float(gamma)).to(data.batch["rewards"].dtype)
+    return data
+
+
 def select_required_train_fields(data: DataProto, tag: str) -> DataProto:
     missing = [k for k in REQUIRED_TRAIN_BATCH_KEYS if k not in data.batch]
     if missing:
         raise KeyError(f"{tag} is missing required train keys: {missing}")
-    return data.select(REQUIRED_TRAIN_BATCH_KEYS)
+    selected_keys = list(REQUIRED_TRAIN_BATCH_KEYS) + [k for k in OPTIONAL_TRAIN_BATCH_KEYS if k in data.batch]
+    return data.select(selected_keys)
 
 
 class RobRaySACTrainer(RayPPOTrainer):
@@ -318,6 +416,9 @@ class RobRaySACTrainer(RayPPOTrainer):
         next_step_profile = False
 
         rlpd_dataloader_iter = None
+        gamma = float(self.config.actor_rollout_ref.actor.sac.gamma)
+        n_step_return = int(self.config.actor_rollout_ref.actor.sac.get("n_step_return", 1))
+
         if self.config.trainer.rlpd_enable:
             assert self.rlpd_dataloader is not None
             rlpd_dataloader_iter = itertools.cycle(self.rlpd_dataloader)
@@ -337,6 +438,7 @@ class RobRaySACTrainer(RayPPOTrainer):
                     with marked_timer("step", timing_raw):
                         rlpd_batch = DataProto.from_single_dict(rlpd_batch_raw)
                         rlpd_batch = self.actor_rollout_wg.process_dataset_batch(rlpd_batch).get()
+                        rlpd_batch = ensure_bootstrap_discounts(rlpd_batch, gamma=gamma)
                         rlpd_batch = select_required_train_fields(rlpd_batch, tag="offline-only RLPD batch")
                         rlpd_batch.meta_info["global_token_num"] = [0]
                         rlpd_batch.meta_info["global_steps"] = self.global_steps
@@ -441,6 +543,7 @@ class RobRaySACTrainer(RayPPOTrainer):
                             metrics["data/trajectory_avg_reward"] = average_reward
                             metrics["data/avg_positive_trajectory_length"] = compute_avg_positive_trajectory_length(batch)
                             batch = add_transition_prefixes(batch)
+                            batch = build_n_step_transitions(batch, gamma=gamma, n_step=n_step_return)
                             assert task_ids_from_dataloader is not None
                             rollout_level_task_ids = [task_id for task_id in task_ids_from_dataloader for _ in range(self.config.actor_rollout_ref.rollout.n)]
                             batch.batch["task_ids"] = torch.tensor(rollout_level_task_ids, dtype=torch.long, device=batch.batch["dones"].device)
@@ -453,6 +556,7 @@ class RobRaySACTrainer(RayPPOTrainer):
                                 rlpd_batch_raw = next(rlpd_dataloader_iter)
                                 rlpd_batch = DataProto.from_single_dict(rlpd_batch_raw)
                                 rlpd_batch = self.actor_rollout_wg.process_dataset_batch(rlpd_batch).get()
+                                rlpd_batch = ensure_bootstrap_discounts(rlpd_batch, gamma=gamma)
                                 rlpd_batch = select_required_train_fields(rlpd_batch, tag="RLPD batch")
                                 train_batch = DataProto.concat([rl_batch, rlpd_batch])
                                 train_batch.meta_info["global_token_num"] = [0]
