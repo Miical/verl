@@ -44,13 +44,13 @@ RLPD_BATCH_SIZE=64
 # TOKENIZER_PATH="$SFT_MODEL_PATH"
 # NORM_PATH="/shared_disk/users/yejun.zeng/datasets/huggingface/lerobot/catch_bowl/meta/norm.json"
 
-SFT_MODEL_PATH="/shared_disk/users/weijie.ke/weight/giga-openpi/install_belt_joint/3w"
+SFT_MODEL_PATH="/shared_disk/users/weijie.ke/weight/giga-openpi/install_belt_joint/1k"
 TOKENIZER_PATH="$SFT_MODEL_PATH"
 NORM_PATH="/shared_disk/users/yejun.zeng/datasets/huggingface/lerobot/install_belt/meta/norm.json"
 # =========================================================
 # 输出目录
 # =========================================================
-OUTPUT_DIR="/shared_disk/users/weijie.ke/online_robot_rlpd_runs/catch_bowl_robot_online_bc_322_test"
+OUTPUT_DIR="/shared_disk/users/weijie.ke/online_robot_rlpd_runs/catch_bowl_robot_online_bc_323_test"
 VIDEO_OUTPUT="/shared_disk/users/weijie.ke/verl/video"
 mkdir -p "$OUTPUT_DIR"
 

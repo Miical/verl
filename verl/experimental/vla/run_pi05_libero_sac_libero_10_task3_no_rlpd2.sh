@@ -18,13 +18,13 @@ libero_test_path=${TEST_FILES:-${ONLINE_DATA_DIR}/test.parquet}
 # =========================
 RLPD_FILES=${RLPD_FILES:-/shared_disk/users/angen.ye/code/hil-serl/datasets/LIBERO-dataset/libero_10_task3}
 RLPD_BATCH_SIZE=${RLPD_BATCH_SIZE:-32}
-ENABLE_RLPD=${ENABLE_RLPD:-True}
+ENABLE_RLPD=${ENABLE_RLPD:-False}
 
 
 
 
-EXPERIMENT_NAME=${EXPERIMENT_NAME:-libero10_task3_rlpd_smoke_bad_head_train}
-OUTPUT_DIR=${OUTPUT_DIR:-/shared_disk/users/angen.ye/code/hil-serl/model/verl_fintune_model/libero10_task3_rlpd_smoke_bad_head_train}
+EXPERIMENT_NAME=${EXPERIMENT_NAME:-libero10_task3_rlpd_smoke_bad_head_train_no_rlpd2}
+OUTPUT_DIR=${OUTPUT_DIR:-/shared_disk/users/angen.ye/code/hil-serl/model/verl_fintune_model/libero10_task3_rlpd_smoke_bad_head_train_no_rlpd_2}
 VIDEO_OUTPUT="${OUTPUT_DIR}/video"
 # SFT_MODEL_PATH=${SFT_MODEL_PATH:-/shared_disk/users/angen.ye/code/hil-serl/model/torch_pi05_base}
 SFT_MODEL_PATH="/shared_disk/users/angen.ye/code/hil-serl/model/pi05_libero_torch_bad_head_v3"
@@ -43,7 +43,7 @@ NUM_ENV=${NUM_ENV:-8}
 
 NUM_ACTION_CHUNKS=${NUM_ACTION_CHUNKS:-8}
 ACTION_DIM=${ACTION_DIM:-7}
-MAX_EPISODE_STEPS=${MAX_EPISODE_STEPS:-256}
+MAX_EPISODE_STEPS=${MAX_EPISODE_STEPS:-512}
 
 MINI_BATCH_SIZE=${MINI_BATCH_SIZE:-128}
 MICRO_BATCH_SIZE=${MICRO_BATCH_SIZE:-8}
@@ -116,7 +116,7 @@ $PYTHON -m verl.experimental.vla.main_sac \
     +actor_rollout_ref.model.override_config.dataset_type=libero \
     +actor_rollout_ref.model.override_config.rlpd_single_task=True \
     +actor_rollout_ref.model.override_config.rlpd_single_task_id=$SINGLE_TASK_ID \
-    actor_rollout_ref.actor.sac.n_step_return=5 \
+    actor_rollout_ref.actor.sac.n_step_return=10 \
     actor_rollout_ref.actor.entropy_coeff=0. \
     actor_rollout_ref.rollout.temperature=1.0 \
     actor_rollout_ref.rollout.prompt_length=512 \

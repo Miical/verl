@@ -18,13 +18,13 @@ libero_test_path=${TEST_FILES:-${ONLINE_DATA_DIR}/test.parquet}
 # =========================
 RLPD_FILES=${RLPD_FILES:-/shared_disk/users/angen.ye/code/hil-serl/datasets/LIBERO-dataset/libero_10_task3}
 RLPD_BATCH_SIZE=${RLPD_BATCH_SIZE:-32}
-ENABLE_RLPD=${ENABLE_RLPD:-True}
+ENABLE_RLPD=${ENABLE_RLPD:-False}
 
 
 
 
-EXPERIMENT_NAME=${EXPERIMENT_NAME:-libero10_task3_rlpd_smoke_bad_head_train}
-OUTPUT_DIR=${OUTPUT_DIR:-/shared_disk/users/angen.ye/code/hil-serl/model/verl_fintune_model/libero10_task3_rlpd_smoke_bad_head_train}
+EXPERIMENT_NAME=${EXPERIMENT_NAME:-libero10_task3_rlpd_smoke_bad_head_train_no_rlpd}
+OUTPUT_DIR=${OUTPUT_DIR:-/shared_disk/users/angen.ye/code/hil-serl/model/verl_fintune_model/libero10_task3_rlpd_smoke_bad_head_train_no_rlpd}
 VIDEO_OUTPUT="${OUTPUT_DIR}/video"
 # SFT_MODEL_PATH=${SFT_MODEL_PATH:-/shared_disk/users/angen.ye/code/hil-serl/model/torch_pi05_base}
 SFT_MODEL_PATH="/shared_disk/users/angen.ye/code/hil-serl/model/pi05_libero_torch_bad_head_v3"

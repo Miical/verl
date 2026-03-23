@@ -35,10 +35,8 @@ class LiberoPi0DatasetInput(Pi0DatasetInput):
 
         state = {}
         for prefix in ["t0", "t1"]:
-            cam_high = torch.flip(batch.batch[f"{prefix}.obs.agentview_rgb"], dims=(1, 2)).permute(0, 3, 1, 2).float()
-            left_wrist = (
-                torch.flip(batch.batch[f"{prefix}.obs.eye_in_hand_rgb"], dims=(1, 2)).permute(0, 3, 1, 2).float()
-            )
+            cam_high = batch.batch[f"{prefix}.obs.agentview_rgb"].permute(0, 3, 1, 2).float()
+            left_wrist = batch.batch[f"{prefix}.obs.eye_in_hand_rgb"].permute(0, 3, 1, 2).float()
 
             if cam_high.shape[-2:] != (LIBERO_SIM_IMAGE_SIZE, LIBERO_SIM_IMAGE_SIZE):
                 cam_high = F.interpolate(
@@ -85,8 +83,32 @@ class LiberoPi0DatasetInput(Pi0DatasetInput):
 
         input.s0 = state["t0"]
         input.s1 = state["t1"]
-        input.a0 = {"action": pad_dim_to(pad_last_dim_to(batch.batch["t0.actions"], 32), dim=1, target_size=50)}
-        input.a1 = {"action": pad_dim_to(pad_last_dim_to(batch.batch["t1.actions"], 32), dim=1, target_size=50)}
+        t0_actions_raw = batch.batch["t0.actions"]
+        t1_actions_raw = batch.batch["t1.actions"]
+
+        t0_h = t0_actions_raw.shape[1]
+        t1_h = t1_actions_raw.shape[1]
+
+        input.a0 = {
+            "action": pad_dim_to(pad_last_dim_to(t0_actions_raw, 32), dim=1, target_size=50),
+            "action_loss_mask": torch.cat(
+                [
+                    torch.ones((batch_size, t0_h), dtype=torch.bool, device=device),
+                    torch.zeros((batch_size, 50 - t0_h), dtype=torch.bool, device=device),
+                ],
+                dim=1,
+            ),
+        }
+        input.a1 = {
+            "action": pad_dim_to(pad_last_dim_to(t1_actions_raw, 32), dim=1, target_size=50),
+            "action_loss_mask": torch.cat(
+                [
+                    torch.ones((batch_size, t1_h), dtype=torch.bool, device=device),
+                    torch.zeros((batch_size, 50 - t1_h), dtype=torch.bool, device=device),
+                ],
+                dim=1,
+            ),
+        }
 
         done = batch.batch["t1.chunk_dones"].to(device=device, dtype=torch.bool)
 
