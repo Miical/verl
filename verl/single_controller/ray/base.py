@@ -143,8 +143,8 @@ class RayResourcePool(ResourcePool):
         bundle = {"CPU": self.max_colocate_count}
         if self.use_gpu:
             bundle[device_name] = 1
-            if self.accelerator_type is not None:
-                bundle[self.accelerator_type] = 1e-4
+        if self.accelerator_type is not None:
+            bundle[self.accelerator_type] = 1e-4
         pg_scheme = [[bundle.copy() for _ in range(process_count)] for process_count in self._store]
 
         lifetime = "detached" if self.detached else None
@@ -186,6 +186,7 @@ class ResourcePoolManager:
 
     resource_pool_spec: dict[str, list[int]]
     mapping: dict[int, str]
+    resource_pool_kwargs: dict[str, dict] = field(default_factory=dict)
     resource_pool_dict: dict[str, RayResourcePool] = field(default_factory=dict)
 
     def create_resource_pool(self):
@@ -201,8 +202,12 @@ class ResourcePoolManager:
             # For FSDP backend, using max_colocate_count=3: actor_critic_ref, rollout, reward model (optional)
             # For Megatron backend, we recommend using max_colocate_count>1
             # that can utilize different WorkerGroup for differnt models
+            resource_pool_options = dict(self.resource_pool_kwargs.get(resource_pool_name, {}))
             resource_pool = RayResourcePool(
-                process_on_nodes=process_on_nodes, use_gpu=True, max_colocate_count=3, name_prefix=resource_pool_name
+                process_on_nodes=process_on_nodes,
+                max_colocate_count=3,
+                name_prefix=resource_pool_name,
+                **resource_pool_options,
             )
             self.resource_pool_dict[resource_pool_name] = resource_pool
 
@@ -213,8 +218,15 @@ class ResourcePoolManager:
         return self.resource_pool_dict[self.mapping[role]]
 
     def get_n_gpus(self) -> int:
-        """Get the number of gpus in this cluster."""
-        return sum([n_gpus for process_on_nodes in self.resource_pool_spec.values() for n_gpus in process_on_nodes])
+        """Get the number of gpus required by GPU-backed pools in this cluster."""
+        return sum(
+            [
+                n_gpus
+                for pool_name, process_on_nodes in self.resource_pool_spec.items()
+                if self.resource_pool_kwargs.get(pool_name, {}).get("use_gpu", True)
+                for n_gpus in process_on_nodes
+            ]
+        )
 
     def _check_resource_available(self):
         """Check if the resource pool can be satisfied in this ray cluster."""
@@ -227,7 +239,12 @@ class ResourcePoolManager:
         # check total required gpus can be satisfied
         total_available_gpus = sum(node_available_gpus.values())
         total_required_gpus = sum(
-            [n_gpus for process_on_nodes in self.resource_pool_spec.values() for n_gpus in process_on_nodes]
+            [
+                n_gpus
+                for pool_name, process_on_nodes in self.resource_pool_spec.items()
+                if self.resource_pool_kwargs.get(pool_name, {}).get("use_gpu", True)
+                for n_gpus in process_on_nodes
+            ]
         )
         if total_available_gpus < total_required_gpus:
             raise ValueError(

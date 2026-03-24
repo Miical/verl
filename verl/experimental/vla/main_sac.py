@@ -52,7 +52,10 @@ def main(config):
         ray_init_kwargs = OmegaConf.create({**ray_init_kwargs, "runtime_env": runtime_env})
         logger.info(f"ray init kwargs: {ray_init_kwargs}")
         ray.init(**OmegaConf.to_container(ray_init_kwargs))
-    ray.get(main_task.remote(config))
+    task_options = {"num_cpus": 1}
+    if config.env.disagg_sim.enable:
+        task_options["resources"] = {"train_rollout": 0.001}
+    ray.get(main_task.options(**task_options).remote(config))
 
 
 @ray.remote
@@ -88,17 +91,26 @@ def main_task(config):
     train_rollout_gpu_num = config.trainer.n_rollout_gpus_per_node
     train_rollout_nodes_num = config.trainer.nnodes
     env_gpu_num = config.trainer.n_env_gpus_per_node
+    env_worker_num = config.trainer.get("n_env_workers_per_node", env_gpu_num)
     env_nodes_num = config.env.disagg_sim.nnodes if config.env.disagg_sim.enable else config.trainer.nnodes
 
     resource_pool_spec = {
         "train_rollout_pool": [train_rollout_gpu_num] * train_rollout_nodes_num,
-        "env_gpu_pool": [env_gpu_num] * env_nodes_num,
+        "env_gpu_pool": [env_worker_num] * env_nodes_num,
+    }
+    resource_pool_kwargs = {
+        "train_rollout_pool": {"use_gpu": True},
+        "env_gpu_pool": {"use_gpu": env_gpu_num > 0},
     }
     mapping = {
         Role.ActorRollout: "train_rollout_pool",
         Role.Env: "env_gpu_pool",
     }
-    resource_pool_manager = ResourcePoolManager(resource_pool_spec=resource_pool_spec, mapping=mapping)
+    resource_pool_manager = ResourcePoolManager(
+        resource_pool_spec=resource_pool_spec,
+        mapping=mapping,
+        resource_pool_kwargs=resource_pool_kwargs,
+    )
 
     # create datasets
     train_dataset = datasets.load_dataset("parquet", data_files=config.data.train_files)["train"]

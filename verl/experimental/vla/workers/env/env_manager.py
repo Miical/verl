@@ -29,7 +29,10 @@ logger = logging.getLogger(__name__)
 
 def cleanup_device_tensors():
     gc.collect()
-    get_torch_device().empty_cache()
+    torch_device = get_torch_device()
+    empty_cache = getattr(torch_device, "empty_cache", None)
+    if callable(empty_cache):
+        empty_cache()
 
 
 def get_gpu_numa_node(gpu_id: int) -> int:
@@ -180,7 +183,7 @@ class EnvManager:
                 self.command_queue,
                 self.result_queue,
                 self.state_buffer,
-                True,
+                torch.cuda.is_available(),
             ),
         )
         self.process.start()
