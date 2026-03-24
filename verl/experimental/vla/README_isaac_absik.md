@@ -9,7 +9,143 @@ Run the **Pi0.5 VLA model** in **Isaac Lab** with the **DiffIK absolute action**
 | [**verl**](https://github.com/Miical/verl/tree/yujie/fix-isaac-verl) (this repo) | `yujie/fix-isaac-verl` |
 | [**RobotLearningLab**](https://github.com/nvidia-china-sae/RobotLearningLab/tree/yujie/update/2.3.0-verl) | `yujie/update/2.3.0-verl` (commit `b97fa8bb`) |
 
-## Step 0: Fix PyTorch Checkpoint norm_stats
+## Option A: Clean Build (Recommended)
+
+Build from the official Isaac Lab base image. All dependencies are installed by the Dockerfile; repos are mounted from the host at runtime.
+
+### 1. Prepare Host Data
+
+Clone repos:
+
+```bash
+git clone https://github.com/Miical/verl.git ~/iCode/RL/verl
+cd ~/iCode/RL/verl && git checkout yujie/fix-isaac-verl
+
+git clone https://github.com/nvidia-china-sae/RobotLearningLab.git ~/iCode/RL/RobotLearningLab
+cd ~/iCode/RL/RobotLearningLab && git checkout yujie/update/2.3.0-verl
+```
+
+Download USD scene assets (not tracked in git):
+
+```bash
+python3 -c "
+from huggingface_hub import snapshot_download
+snapshot_download(
+    'china-sae-robotics/RobotLearningLab_Dataset',
+    repo_type='dataset',
+    allow_patterns=['libero/USD/**'],
+    local_dir='/tmp/hf_libero'
+)
+"
+cp -r /tmp/hf_libero/libero/USD ~/iCode/RL/RobotLearningLab/benchmarks/datasets/libero/USD
+```
+
+Prepare model checkpoint and RL data:
+
+```bash
+# PyTorch checkpoint (~13G) — download from HuggingFace:
+python3 -c "
+from huggingface_hub import snapshot_download
+snapshot_download(
+    'china-sae-robotics/pi05_libero_torch',
+    local_dir='$HOME/iDataset/VLA/openpi/checkpoint/pi05_libero_torch'
+)
+"
+# Then fix config.json (see "Fix PyTorch Checkpoint norm_stats" below)
+
+# RL prompt parquet files — already included in this repo:
+mkdir -p ~/iDataset/VLA/openpi/libero_rl
+cp verl/experimental/vla/libero_rl_train.parquet ~/iDataset/VLA/openpi/libero_rl/train.parquet
+cp verl/experimental/vla/libero_rl_test.parquet ~/iDataset/VLA/openpi/libero_rl/test.parquet
+```
+
+### 2. Build
+
+```bash
+cd ~/iCode/RL/verl/docker
+DOCKER_BUILDKIT=1 docker build -f Dockerfile.isaaclab323 -t verl-isaac-vla:latest .
+```
+
+The base image `nvcr.io/nvidia/isaac-lab:2.3.0` will be pulled automatically if not already present.
+
+### 3. Run
+
+A convenience script is provided:
+
+```bash
+cd ~/iCode/RL/verl/docker && ./run_isaaclab323.sh
+```
+
+Or run manually:
+
+```bash
+docker run \
+    --entrypoint /root/entrypoint.sh \
+    -e "ACCEPT_EULA=Y" \
+    -it --gpus all \
+    -v /dev/shm:/dev/shm:rw \
+    -v ~/iCode/RL/verl:/root/code/verl \
+    -v ~/iCode/RL/RobotLearningLab:/root/RobotLearningLab \
+    -v ~/iDataset/VLA/openpi/checkpoint/pi05_libero_torch:/root/data/pi05_libero_torch \
+    -v ~/iDataset/VLA/openpi/libero_rl:/root/data/libero_rl \
+    verl-isaac-vla:latest \
+    bash
+```
+
+Inside the container:
+
+```bash
+cd /root/code/verl
+bash verl/experimental/vla/run_pi05_libero_sac.sh
+```
+
+### Host → Container Mount Mapping
+
+| Host Path | Container Path | Content |
+|---|---|---|
+| `~/iCode/RL/verl` | `/root/code/verl` | verl framework (branch `yujie/fix-isaac-verl`) |
+| `~/iCode/RL/RobotLearningLab` | `/root/RobotLearningLab` | Isaac Lab playground + USD assets (branch `yujie/update/2.3.0-verl`) |
+| `~/iDataset/VLA/openpi/checkpoint/pi05_libero_torch` | `/root/data/pi05_libero_torch` | PyTorch model checkpoint (13G) |
+| `~/iDataset/VLA/openpi/libero_rl` | `/root/data/libero_rl` | train/test parquet files |
+
+### Dockerfile.isaaclab323 vs Dockerfile.isaaclab230
+
+`Dockerfile.isaaclab323` is based on `Dockerfile.isaaclab230` with the following changes:
+
+| Change | Why |
+|--------|-----|
+| Removed `COPY RobotLearningLab/` and its `pip install -e` | Repos are mounted at runtime via `-v`, not baked into the image |
+| Added VLA pip deps (`diffusers`, `draccus`, `einops`, `wandb`, `lerobot`, etc.) | Required by the PyTorch VLA inference pipeline |
+| Added pip re-bootstrap after `pip install --upgrade` | Upgrading `packaging` corrupts `pip._vendor.packaging`; fixed by re-installing pip via `get-pip.py` |
+| Pin `numpy==1.26.4` after all pip installs | Later deps pull in numpy 2.x which breaks Isaac Sim's C extensions (pinocchio, etc.) |
+| `libgl1-mesa-glx` → `libgl1` | `libgl1-mesa-glx` is unavailable on Ubuntu 24.04 (base image OS) |
+| Added `entrypoint.sh` with `ENTRYPOINT`/`CMD` | Symlinks mounted repos and runs `pip install -e` at container start; also patches `torch._vendor.packaging._structures` (broken symlink from packaging upgrade) |
+
+### What the entrypoint does
+
+1. Restores `torch._vendor.packaging._structures.py` if the symlink is broken (caused by packaging upgrade)
+2. Symlinks mounted `RobotLearningLab/source/isaaclab_playground` into `/workspace/isaaclab/source/`
+3. Runs `pip install -e` (no-deps) for both `verl` and `isaaclab_playground`
+4. Executes the user command (`bash` by default)
+
+---
+
+## Option B: Using the Pre-built verl Image
+
+If you already have access to the pre-built image `vemlp-demo-cn-beijing.cr.volces.com/verl/verl-isaac-fix:v0.1`, you can skip the Dockerfile build. This image already has all system and pip dependencies installed.
+
+```bash
+docker run --entrypoint bash \
+    -e "ACCEPT_EULA=Y" \
+    -it --gpus all \
+    -v /dev/shm:/dev/shm:rw \
+    --rm \
+    vemlp-demo-cn-beijing.cr.volces.com/verl/verl-isaac-fix:v0.1
+```
+
+This image already has all dependencies, repos, and data pre-installed. Refer to the sections below for repo setup, data preparation, and running instructions.
+
+## Fix PyTorch Checkpoint norm_stats
 
 **This must be done before running anything with PyTorch inference.**
 
@@ -23,18 +159,16 @@ cp verl/experimental/vla/pi05_libero_torch_config.json $HOME/data/pi05_libero_to
 
 The corrected config contains `state_norm_stats` and `action_norm_stats` extracted from the JAX checkpoint (`$HOME/data/pi05_libero_absik/checkpoint-30000/assets/all_libero_suites/norm_stats.json`).
 
-## Quick Start
+## Quick Start (inside container)
 
 ```bash
-cd /root/code/verl_new
+cd /root/code/verl
 bash verl/experimental/vla/run_pi05_libero_sac.sh
 ```
 
 Videos are saved to `$HOME/video/`.
 
-## Environment Setup
-
-### Prerequisites
+## Environment Prerequisites (without Docker)
 
 | Component | Version / Path | Notes |
 |-----------|---------------|-------|
@@ -60,7 +194,7 @@ From **RobotLearningLab**:
 | Path | Description |
 |------|-------------|
 | `benchmarks/datasets/libero/config/` | Task definitions (e.g., `libero_object.json`) |
-| `benchmarks/datasets/libero/USD/` | USD scene assets (floor, objects, tables) |
+| `benchmarks/datasets/libero/USD/` | USD scene assets — download from [HuggingFace](https://huggingface.co/datasets/china-sae-robotics/RobotLearningLab_Dataset/tree/main/libero/USD) |
 | `benchmarks/datasets/libero/assembled_hdf5/` | HDF5 demo files (for `RESET_MODE=hdf5` only) |
 
 ## Action Flow
@@ -231,7 +365,7 @@ Download JAX checkpoint from `https://huggingface.co/china-sae-robotics/pi05_lib
 ### Run
 
 ```bash
-cd /root/code/verl_new
+cd /root/code/verl
 USE_JAX_INFERENCE=true bash verl/experimental/vla/run_pi05_libero_sac.sh
 ```
 
