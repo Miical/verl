@@ -130,6 +130,20 @@ class EnvWorker(Worker, DistProfilerExtension):
                         stage_id=stage_id,
                     )
                 )
+
+        elif self.cfg.train.simulator_type == "lerobot":
+            from verl.experimental.vla.envs.lerobot_env.lerobot_env import LeRobotEnv
+
+            for stage_id in range(self.stage_num):
+                self.simulator_list.append(
+                    EnvManager(
+                        self.cfg.train,
+                        rank=self._rank,
+                        world_size=self._world_size,
+                        env_cls=LeRobotEnv,
+                        stage_id=stage_id,
+                    )
+                )
         else:
             raise NotImplementedError(f"Simulator type {self.cfg.train.simulator_type} not implemented")
 
