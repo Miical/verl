@@ -25,6 +25,7 @@ class LeRobotEnv(gym.Env):
         self.world_size = world_size
         self.stage_id = stage_id
         self.num_envs = cfg.num_envs
+        assert self.num_envs == 1, f"LeRobotEnv only supports a single real-world environment, got {self.num_envs}"
         self.max_episode_steps = int(cfg.max_episode_steps)
         self.action_dim = int(getattr(cfg, "action_dim", 7))
         self.state_dim = int(getattr(cfg, "state_dim", 8))

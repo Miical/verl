@@ -197,6 +197,12 @@ class RobRaySACTrainer(RayPPOTrainer):
     def _reset_envs(self, gen_batch: DataProto) -> asyncio.Future:
         initial_state_ids = gen_batch.non_tensor_batch["state_ids"]
         task_ids = gen_batch.non_tensor_batch["task_ids"]
+        if self.config.env.train.get("single_env_rollout", False):
+            assert self.config.env.rollout.pipeline_stage_num == 1, (
+                "single_env_rollout only supports pipeline_stage_num == 1"
+            )
+            initial_state_ids = initial_state_ids[:1]
+            task_ids = task_ids[:1]
         reset_prompts = DataProto.from_dict(non_tensors={"state_ids": initial_state_ids, "task_ids": task_ids})
         reset_future = self.env_wg.reset_envs_to_state_ids(reset_prompts)
         return reset_future
@@ -235,8 +241,11 @@ class RobRaySACTrainer(RayPPOTrainer):
         )
 
         # task id
+        task_ids = rollout_output.meta_info["task_ids"]
+        if self.config.env.train.get("single_env_rollout", False):
+            task_ids = task_ids[:1]
         rollout_output.batch["task_ids"] = torch.as_tensor(
-            rollout_output.meta_info["task_ids"],
+            task_ids,
             dtype=torch.long,
             device=rollout_output.batch["action"].device,
         )

@@ -82,6 +82,7 @@ class EnvWorker(Worker, DistProfilerExtension):
         self.eval_simulator_list = []
 
         self.stage_num = self.cfg.rollout.pipeline_stage_num
+        self.single_env_rollout = bool(self.cfg.train.get("single_env_rollout", False))
         initialize_global_process_group_ray(timeout_second=None)
         device_name = get_device_name()
         env_device_mesh = init_device_mesh(device_name, mesh_shape=(self.world_size, 1), mesh_dim_names=["dp", "tp"])
@@ -213,27 +214,27 @@ class EnvWorker(Worker, DistProfilerExtension):
         state_ids_list = list(data.non_tensor_batch["state_ids"])
         task_ids_list = list(data.non_tensor_batch["task_ids"])
 
-        assert len(state_ids_list) == self.cfg.train.num_envs * self.stage_num, (
-            f"state_ids_list length is {len(state_ids_list)}, but should be {self.cfg.train.num_envs * self.stage_num}"
+        full_batch_size = self.cfg.train.num_envs * self.stage_num
+        single_env_rollout = getattr(self, "single_env_rollout", bool(self.cfg.train.get("single_env_rollout", False)))
+        if single_env_rollout:
+            assert self.stage_num == 1, "single_env_rollout only supports pipeline_stage_num == 1"
+        stage_batch_size = 1 if single_env_rollout else full_batch_size
+        assert len(state_ids_list) == stage_batch_size, (
+            f"state_ids_list length is {len(state_ids_list)}, but should be {stage_batch_size}"
         )
         result_list = []
         for stage_id in range(self.stage_num):
-            if self.cfg.train.simulator_type == "isaac":
-                assert (
-                    len(
-                        set(
-                            state_ids_list[
-                                stage_id * self.cfg.train.num_envs : (stage_id + 1) * self.cfg.train.num_envs
-                            ]
-                        )
-                    )
-                    == 1
-                ), "rollout.n should equal to num_envs for isaac"
+            if single_env_rollout:
+                stage_state_ids = state_ids_list[:1]
+                stage_task_ids = task_ids_list[:1]
+            else:
+                stage_state_ids = state_ids_list[stage_id * self.cfg.train.num_envs : (stage_id + 1) * self.cfg.train.num_envs]
+                stage_task_ids = task_ids_list[stage_id * self.cfg.train.num_envs : (stage_id + 1) * self.cfg.train.num_envs]
 
-            result = self.simulator_list[stage_id].reset_envs_to_state_ids(
-                state_ids_list[stage_id * self.cfg.train.num_envs : (stage_id + 1) * self.cfg.train.num_envs],
-                task_ids_list[stage_id * self.cfg.train.num_envs : (stage_id + 1) * self.cfg.train.num_envs],
-            )
+            if self.cfg.train.simulator_type == "isaac":
+                assert len(set(stage_state_ids)) == 1, "rollout.n should equal to num_envs for isaac"
+
+            result = self.simulator_list[stage_id].reset_envs_to_state_ids(stage_state_ids, stage_task_ids)
             result_list.append(result)
         output_tensor_dict = {}
         output_non_tensor_dict = {}

@@ -49,6 +49,9 @@ class EnvLoop:
         self.num_envs_per_worker = config.env.train.num_envs
         self.action_dim = config.env.actor.model.action_dim
         self.num_action_chunks = config.env.actor.model.num_action_chunks
+        self.single_env_rollout = bool(config.env.train.get("single_env_rollout", False))
+        if self.single_env_rollout:
+            assert self.stage_num == 1, "single_env_rollout only supports pipeline_stage_num == 1"
         # Derived properties
         self.total_envs = self.env_wg.world_size * self.num_envs_per_worker
         if self.total_envs % self.stage_num != 0:
@@ -92,8 +95,12 @@ class EnvLoop:
             DataProto: A batch containing the complete trajectories.
         """
         initial_state_ids = prompts.non_tensor_batch["state_ids"]
+        if self.single_env_rollout:
+            initial_state_ids = initial_state_ids[:1]
 
         staged_obs = self._restructure_obs_data(reset_results)
+        if self.single_env_rollout:
+            staged_obs = [staged_obs[0].repeat(repeat_times=len(prompts), interleave=True)]
         # --- Pipeline state ---
         trajectories = {i: [] for i in range(self.stage_num)}  # To store (obs, action, rew, done) tuples
         rollout_futures = {}
@@ -112,20 +119,31 @@ class EnvLoop:
                     logger.info(f"[{step_idx}/{self.max_interactions - 1}] rollout step")
                 action_result: DataProto = await asyncio.to_thread(rollout_futures[stage_id].get)
 
-                trajectories[stage_id][-1]["action"] = action_result
+                stored_action_result = action_result[:1] if self.single_env_rollout else action_result
+                trajectories[stage_id][-1]["action"] = stored_action_result
+                action_batch_size = len(action_result)
+                if self.single_env_rollout:
+                    env_action = action_result.batch["action"][:1].cpu().numpy()
+                    env_critic_values = action_result.batch["critic_value"][:1].cpu().numpy()
+                else:
+                    env_action = action_result.batch["action"].cpu().numpy()
+                    env_critic_values = action_result.batch["critic_value"].cpu().numpy()
                 action_data = DataProto.from_dict(
                     non_tensors={
-                        "actions": action_result.batch["action"].cpu().numpy(),
-                        "critic_values": action_result.batch["critic_value"].cpu().numpy(),
+                        "actions": env_action,
+                        "critic_values": env_critic_values,
                     },
                     meta_info={"stage_id": stage_id},
                 )
 
                 env_ref = self.env_wg.env_interact_step(action_data)
                 env_result: DataProto = await asyncio.to_thread(env_ref.get)
+                stored_env_result = env_result[:1] if self.single_env_rollout else env_result
+                if self.single_env_rollout:
+                    env_result = env_result.repeat(repeat_times=action_batch_size, interleave=True)
 
-                trajectories[stage_id][-1]["rew"] = env_result.batch["rews"]
-                trajectories[stage_id][-1]["done"] = env_result.batch["terminations"]
+                trajectories[stage_id][-1]["rew"] = stored_env_result.batch["rews"]
+                trajectories[stage_id][-1]["done"] = stored_env_result.batch["terminations"]
 
                 next_obs = DataProto(
                     batch=env_result.batch.select("full_image", "wrist_image", "state"),
