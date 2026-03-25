@@ -13,6 +13,7 @@ import gymnasium as gym
 import numpy as np
 import torch
 
+from .ipc_channel import clear_ipc, send_obj
 
 logger = logging.getLogger(__name__)
 _LEROBOT_RUNTIME_SESSION_PREFIX = "lerobot_runtime"
@@ -61,10 +62,11 @@ class LeRobotEnv(gym.Env):
         if shutil.which("tmux") is None:
             raise RuntimeError("`tmux` is required for LeRobotEnv runtime process.")
 
-        session_name = f"{_LEROBOT_RUNTIME_SESSION_PREFIX}_{socket.gethostname()}"
+        session_name = f"{_LEROBOT_RUNTIME_SESSION_PREFIX}_{socket.gethostname()}_rank{self.rank}_stage{self.stage_id}"
         runtime_cmd = (
             f"{sys.executable} -u -m verl.experimental.vla.envs.lerobot_env.lerobot_runtime "
-            f"--config_path {shlex.quote(str(lerobot_config_path))}"
+            f"--config_path {shlex.quote(str(lerobot_config_path))} "
+            f"--rank {self.rank} --stage_id {self.stage_id}"
         )
 
         has_session = subprocess.run(
@@ -76,6 +78,8 @@ class LeRobotEnv(gym.Env):
         if has_session.returncode == 0:
             logger.info("LeRobot runtime tmux session already exists: %s", session_name)
             return
+
+        clear_ipc(rank=self.rank, stage_id=self.stage_id)
 
         subprocess.run(
             ["tmux", "new-session", "-d", "-s", session_name, runtime_cmd],
@@ -111,10 +115,33 @@ class LeRobotEnv(gym.Env):
         self._episode_steps[:] = 0
         self._episode_returns[:] = 0.0
         self.task_descriptions = [self._task_description(task_id) for task_id in self._task_ids]
+        reply = send_obj(
+            type="reset",
+            content={
+                "state_ids": self._state_ids.tolist(),
+                "task_ids": self._task_ids.tolist(),
+            },
+            rank=self.rank,
+            stage_id=self.stage_id,
+            timeout_s=10.0,
+        )
+        if not isinstance(reply, dict) or reply.get("status") != "ok":
+            raise RuntimeError(f"Invalid runtime reply: {reply}")
         return self._build_obs(), {}
 
     def chunk_step(self, chunk_actions, chunk_values=None):
         logger.warning(f"LeRobotEnv.chunk_step received chunk_actions with shape {chunk_actions.shape}")
+
+        reply = send_obj(
+            type="step",
+            content=None,
+            rank=self.rank,
+            stage_id=self.stage_id,
+            timeout_s=10.0,
+        )
+        if not isinstance(reply, dict) or reply.get("status") != "ok":
+            raise RuntimeError(f"Invalid runtime reply: {reply}")
+
 
         chunk_size = int(chunk_actions.shape[1])
         rewards = torch.zeros((self.num_envs, chunk_size), dtype=torch.float32)

@@ -16,6 +16,7 @@ from lerobot.rl.gym_manipulator import (
 from lerobot.processor import TransitionKey
 from lerobot.teleoperators.utils import TeleopEvents
 from lerobot.utils.transition import Transition
+from .ipc_channel import clear_ipc, recv_obj, reply_obj, setup_ipc
 
 
 logger = logging.getLogger(__name__)
@@ -28,75 +29,82 @@ def _handle_stop_signal(signum, frame):
     _STOP = True
     logger.info("Received signal %s, stopping lerobot runtime.", signum)
 
-
-def start_lerobot_runtime(config_path: str) -> None:
-    logger.info("LeRobot runtime started with config: %s", config_path)
-
-    lerobot_config = draccus.parse(
-        config_class=GymManipulatorConfig,
-        config_path=config_path,
-        args=[],
-    )
-
-    online_env, teleop_device = make_robot_env(lerobot_config.env)
-    env_processor, action_processor = make_processors(online_env, teleop_device, lerobot_config.env)
-
-    obs, info = online_env.reset()
-    env_processor.reset()
-    action_processor.reset()
-
-    # Process initial observation
-    transition = create_transition(observation=obs, info=info)
-    transition = env_processor(transition)
-
-    # NOTE: For the moment we will solely handle the case of a single environment
-    sum_reward_episode = 0
-    list_transition_to_send_to_learner = []
-    episode_intervention = False
-    # Add counters for intervention rate calculation
-    episode_intervention_steps = 0
-    episode_total_steps = 0
-
-
-    for interaction_step in range(10000):
-        obs = transition[TransitionKey.OBSERVATION]
-
-        raw = online_env.get_raw_joint_positions()
-        neutral_action = torch.tensor(
-            [raw[f"{k}.pos"] for k in online_env.robot.bus.motors], dtype=torch.float32
+class LerobotRuntime:
+    def __init__(self, config_path: str, rank: int, stage_id: int):
+        self.rank = rank
+        self.stage_id = stage_id
+        
+        self.lerobot_config = draccus.parse(
+            config_class=GymManipulatorConfig,
+            config_path=config_path,
+            args=[],
         )
-        def policy(obs):
-            import time
-            time.sleep(0.2)
-            return neutral_action
+        self.online_env, self.teleop_device = make_robot_env(self.lerobot_config.env)
+        self.env_processor, self.action_processor = make_processors(self.online_env, self.teleop_device, self.lerobot_config.env)
 
-        action = policy(obs)
+
+        self.obs = None
+        self.info = None
+        self.transition = None
+        self.sum_reward_episode = 0
+        self.list_transition_to_send_to_learner = []
+        self.episode_intervention = False
+        self.episode_intervention_steps = 0
+        self.episode_total_steps = 0
+    
+    def reset(self, task_ids, state_ids):
+        logger.info("Resetting LeRobot runtime.")
+        self.obs, self.info = self.online_env.reset()
+        self.env_processor.reset()
+        self.action_processor.reset()
+
+        self.transition = create_transition(observation=self.obs, info=self.info)
+        self.transition = self.env_processor(self.transition)
+        self.sum_reward_episode = 0
+        self.list_transition_to_send_to_learner = []
+        self.episode_intervention = False
+        self.episode_intervention_steps = 0
+        self.episode_total_steps = 0
+
+        # obs = self.transition[TransitionKey.OBSERVATION]
+        # return obs
+
+        return {"status": "ok"}
+    
+    def step(self, actions):
+        raw = self.online_env.get_raw_joint_positions()
+        neutral_action = torch.tensor(
+            [raw[f"{k}.pos"] for k in self.online_env.robot.bus.motors], dtype=torch.float32
+        )
+        time.sleep(0.1)
+        actions = neutral_action
+
+        # ====
 
         new_transition = step_env_and_process_transition(
-            env=online_env,
-            transition=transition,
-            action=action,
-            env_processor=env_processor,
-            action_processor=action_processor,
+            env=self.online_env,
+            transition=self.transition,
+            action=actions,
+            env_processor=self.env_processor,
+            action_processor=self.action_processor,
         )
 
         next_obs = new_transition[TransitionKey.OBSERVATION]
         executed_action = new_transition[TransitionKey.COMPLEMENTARY_DATA]["teleop_action"]
 
-
         reward = new_transition[TransitionKey.REWARD]
         done = new_transition.get(TransitionKey.DONE, False)
         truncated = new_transition.get(TransitionKey.TRUNCATED, False)
 
-        sum_reward_episode += float(reward)
-        episode_total_steps += 1
+        self.sum_reward_episode += float(reward)
+        self.episode_total_steps += 1
 
         # Check for intervention from transition info
         intervention_info = new_transition[TransitionKey.INFO]
         if intervention_info.get(TeleopEvents.IS_INTERVENTION, False):
-            episode_intervention = True
-            episode_intervention_steps += 1
-        
+            self.episode_intervention = True
+            self.episode_intervention_steps += 1
+
 
         complementary_info = {
             "discrete_penalty": torch.tensor(
@@ -104,9 +112,9 @@ def start_lerobot_runtime(config_path: str) -> None:
             ),
         }
         # Create transition for learner (convert to old format)
-        list_transition_to_send_to_learner.append(
+        self.list_transition_to_send_to_learner.append(
             Transition(
-                state=obs,
+                state=self.obs,
                 action=executed_action,
                 reward=reward,
                 next_state=next_obs,
@@ -115,67 +123,94 @@ def start_lerobot_runtime(config_path: str) -> None:
                 complementary_info=complementary_info,
             )
         )
+        self.transition = new_transition
 
-        transition = new_transition
+        # if done or truncated:
+        #     logging.info(f"[ACTOR] Global step {interaction_step}: Episode reward: {sum_reward_episode}")
 
-        if done or truncated:
-            logging.info(f"[ACTOR] Global step {interaction_step}: Episode reward: {sum_reward_episode}")
-
-            if len(list_transition_to_send_to_learner) > 0:
-                # TODO: send list_transition_to_send_to_learner to learner
-                list_transition_to_send_to_learner = []
+        #     if len(self.list_transition_to_send_to_learner) > 0:
+        #         # TODO: send self.list_transition_to_send_to_learner to learner
+        #         self.list_transition_to_send_to_learner = []
             
-            # Calculate intervention rate
-            intervention_rate = 0.0
-            if episode_total_steps > 0:
-                intervention_rate = episode_intervention_steps / episode_total_steps
+        #     # Calculate intervention rate
+        #     intervention_rate = 0.0
+        #     if self.episode_total_steps > 0:
+        #         intervention_rate = self.episode_intervention_steps / self.episode_total_steps
 
-            interactions_queue = []
-            interactions_queue.append(
-                {
-                    "Episodic reward": sum_reward_episode,
-                    "Interaction step": interaction_step,
-                    "Episode intervention": int(episode_intervention),
-                    "Intervention rate": intervention_rate,
-                }
-            )
-            # TODO: send interactions_queue 
+        #     interactions_queue = []
+        #     interactions_queue.append(
+        #         {
+        #             "Episodic reward": self.sum_reward_episode,
+        #             "Interaction step": interaction_step,
+        #             "Episode intervention": int(self.episode_intervention),
+        #             "Intervention rate": intervention_rate,
+        #         }
+        #     )
+        #     # TODO: send interactions_queue 
 
-            # Reset intervention counters and environment
-            sum_reward_episode = 0.0
-            episode_intervention = False
-            episode_intervention_steps = 0
-            episode_total_steps = 0
+        #     # Reset intervention counters and environment
+        #     sum_reward_episode = 0.0
+        #     episode_intervention = False
+        #     episode_intervention_steps = 0
+        #     episode_total_steps = 0
 
-            # Reset environment and processors
-            obs, info = online_env.reset()
-            env_processor.reset()
-            action_processor.reset()
+        #     # Reset environment and processors
+        #     obs, info = self.online_env.reset()
+        #     self.env_processor.reset()
+        #     self.action_processor.reset()
 
-            # Process initial observation
-            transition = create_transition(observation=obs, info=info)
-            transition = env_processor(transition)
+        #     # Process initial observation
+        #     transition = create_transition(observation=obs, info=info)
+        #     transition = self.env_processor(transition)
 
+
+        return {"status": "ok"}
+    
+    def close(self):
+        if self.teleop_device is not None and hasattr(self.teleop_device, "disconnect"):
+            self.teleop_device.disconnect()
+        if self.online_env is not None and hasattr(self.online_env, "close"):
+            self.online_env.close()
+        
+
+
+def start_lerobot_runtime(config_path: str, rank: int, stage_id: int) -> None:
+    logger.info("LeRobot runtime started with config: %s", config_path)
+    setup_ipc(rank=rank, stage_id=stage_id)
+    runtime = LerobotRuntime(config_path=config_path, rank=rank, stage_id=stage_id)
 
 
     while not _STOP:
-        time.sleep(1.0)
+        msg = recv_obj(rank=rank, stage_id=stage_id)
+        reply = None
+        if msg.get("type") == "reset":
+            reply = runtime.reset(
+                task_ids=msg.get("content", {}).get("task_ids"),
+                state_ids=msg.get("content", {}).get("state_ids")
+            )
+        elif msg.get("type") == "step":
+            reply = runtime.step(actions=None)
+        else:
+            logger.warning("Received unknown message type: %s", msg.get("type"))
+            reply = {"status": "error", "message": f"Unknown message type: {msg.get('type')}"}
 
-    if teleop_device is not None and hasattr(teleop_device, "disconnect"):
-        teleop_device.disconnect()
-    if online_env is not None and hasattr(online_env, "close"):
-        online_env.close()
+        reply_obj(reply, rank=rank, stage_id=stage_id)
+    
+    runtime.close()
+    clear_ipc(rank=rank, stage_id=stage_id)
 
 
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--config_path", required=True, type=str)
+    parser.add_argument("--rank", required=True, type=int)
+    parser.add_argument("--stage_id", required=True, type=int)
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO)
     signal.signal(signal.SIGTERM, _handle_stop_signal)
     signal.signal(signal.SIGINT, _handle_stop_signal)
-    start_lerobot_runtime(args.config_path)
+    start_lerobot_runtime(args.config_path, args.rank, args.stage_id)
 
 
 if __name__ == "__main__":
