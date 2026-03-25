@@ -39,9 +39,9 @@ class LerobotRuntime:
             config_path=config_path,
             args=[],
         )
+        self.interaction_step = 0
         self.online_env, self.teleop_device = make_robot_env(self.lerobot_config.env)
         self.env_processor, self.action_processor = make_processors(self.online_env, self.teleop_device, self.lerobot_config.env)
-
 
         self.obs = None
         self.info = None
@@ -98,6 +98,7 @@ class LerobotRuntime:
 
         self.sum_reward_episode += float(reward)
         self.episode_total_steps += 1
+        self.interaction_step += 1
 
         # Check for intervention from transition info
         intervention_info = new_transition[TransitionKey.INFO]
@@ -105,12 +106,6 @@ class LerobotRuntime:
             self.episode_intervention = True
             self.episode_intervention_steps += 1
 
-
-        complementary_info = {
-            "discrete_penalty": torch.tensor(
-                [new_transition[TransitionKey.COMPLEMENTARY_DATA].get("discrete_penalty", 0.0)]
-            ),
-        }
         # Create transition for learner (convert to old format)
         self.list_transition_to_send_to_learner.append(
             Transition(
@@ -120,49 +115,19 @@ class LerobotRuntime:
                 next_state=next_obs,
                 done=done,
                 truncated=truncated,
-                complementary_info=complementary_info,
+                complementary_info={},
             )
         )
         self.transition = new_transition
 
-        # if done or truncated:
-        #     logging.info(f"[ACTOR] Global step {interaction_step}: Episode reward: {sum_reward_episode}")
+        if done or truncated:
+            intervention_rate = 0.0
+            if self.episode_total_steps > 0:
+                intervention_rate = self.episode_intervention_steps / self.episode_total_steps
 
-        #     if len(self.list_transition_to_send_to_learner) > 0:
-        #         # TODO: send self.list_transition_to_send_to_learner to learner
-        #         self.list_transition_to_send_to_learner = []
-            
-        #     # Calculate intervention rate
-        #     intervention_rate = 0.0
-        #     if self.episode_total_steps > 0:
-        #         intervention_rate = self.episode_intervention_steps / self.episode_total_steps
-
-        #     interactions_queue = []
-        #     interactions_queue.append(
-        #         {
-        #             "Episodic reward": self.sum_reward_episode,
-        #             "Interaction step": interaction_step,
-        #             "Episode intervention": int(self.episode_intervention),
-        #             "Intervention rate": intervention_rate,
-        #         }
-        #     )
-        #     # TODO: send interactions_queue 
-
-        #     # Reset intervention counters and environment
-        #     sum_reward_episode = 0.0
-        #     episode_intervention = False
-        #     episode_intervention_steps = 0
-        #     episode_total_steps = 0
-
-        #     # Reset environment and processors
-        #     obs, info = self.online_env.reset()
-        #     self.env_processor.reset()
-        #     self.action_processor.reset()
-
-        #     # Process initial observation
-        #     transition = create_transition(observation=obs, info=info)
-        #     transition = self.env_processor(transition)
-
+            logger.info(f"Global step {self.interaction_step}: Episode reward: {self.sum_reward_episode} \
+                        Episode reward: {self.sum_reward_episode}, Episode steps: {self.episode_total_steps}, \
+                        Episode intervention: {self.episode_intervention}, Intervention rate: {intervention_rate:.2f}")
 
         return {"status": "ok"}
     
@@ -173,12 +138,10 @@ class LerobotRuntime:
             self.online_env.close()
         
 
-
 def start_lerobot_runtime(config_path: str, rank: int, stage_id: int) -> None:
     logger.info("LeRobot runtime started with config: %s", config_path)
     setup_ipc(rank=rank, stage_id=stage_id)
     runtime = LerobotRuntime(config_path=config_path, rank=rank, stage_id=stage_id)
-
 
     while not _STOP:
         msg = recv_obj(rank=rank, stage_id=stage_id)

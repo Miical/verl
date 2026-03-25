@@ -128,19 +128,28 @@ class LeRobotEnv(gym.Env):
         if not isinstance(reply, dict) or reply.get("status") != "ok":
             raise RuntimeError(f"Invalid runtime reply: {reply}")
         return self._build_obs(), {}
-
-    def chunk_step(self, chunk_actions, chunk_values=None):
-        logger.warning(f"LeRobotEnv.chunk_step received chunk_actions with shape {chunk_actions.shape}")
-
+    
+    def step(self, action):
         reply = send_obj(
             type="step",
-            content=None,
+            content={
+                "actions": action.tolist(),
+            },
             rank=self.rank,
             stage_id=self.stage_id,
             timeout_s=10.0,
         )
+
         if not isinstance(reply, dict) or reply.get("status") != "ok":
             raise RuntimeError(f"Invalid runtime reply: {reply}")
+        
+
+    def chunk_step(self, chunk_actions, chunk_values=None):
+        chunk_size = chunk_actions.shape[1]
+        for step_idx in range(chunk_size):
+            action = chunk_actions[:, step_idx, :]
+            self.step(action)
+
 
 
         chunk_size = int(chunk_actions.shape[1])
