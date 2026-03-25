@@ -1,14 +1,21 @@
-# Copyright 2025 The RLinf Authors.
 # Copyright 2024 Bytedance Ltd. and/or its affiliates
 
 import logging
+from pathlib import Path
+import shlex
+import shutil
+import socket
+import subprocess
+import sys
 from typing import Optional
 
 import gymnasium as gym
 import numpy as np
 import torch
 
+
 logger = logging.getLogger(__name__)
+_LEROBOT_RUNTIME_SESSION_PREFIX = "lerobot_runtime"
 
 
 class LeRobotEnv(gym.Env):
@@ -43,6 +50,39 @@ class LeRobotEnv(gym.Env):
         self.task_descriptions = [self._task_description(0) for _ in range(self.num_envs)]
         self.total_num_group_envs = max(self.num_envs * self.world_size * 32, 1024)
 
+        lerobot_config_path = getattr(cfg, "lerobot_config_path", None)
+        if not lerobot_config_path:
+            raise ValueError("`cfg.lerobot_config_path` is required for LeRobotEnv.")
+        if not Path(lerobot_config_path).exists():
+            raise FileNotFoundError(f"LeRobot config not found: {lerobot_config_path}")
+        self._ensure_tmux_lerobot_runtime(lerobot_config_path)
+
+    def _ensure_tmux_lerobot_runtime(self, lerobot_config_path: str) -> None:
+        if shutil.which("tmux") is None:
+            raise RuntimeError("`tmux` is required for LeRobotEnv runtime process.")
+
+        session_name = f"{_LEROBOT_RUNTIME_SESSION_PREFIX}_{socket.gethostname()}"
+        runtime_cmd = (
+            f"{sys.executable} -u -m verl.experimental.vla.envs.lerobot_env.lerobot_runtime "
+            f"--config_path {shlex.quote(str(lerobot_config_path))}"
+        )
+
+        has_session = subprocess.run(
+            ["tmux", "has-session", "-t", session_name],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+        if has_session.returncode == 0:
+            logger.info("LeRobot runtime tmux session already exists: %s", session_name)
+            return
+
+        subprocess.run(
+            ["tmux", "new-session", "-d", "-s", session_name, runtime_cmd],
+            check=True,
+        )
+        logger.info("Started LeRobot runtime in tmux session: %s", session_name)
+
     def _task_description(self, task_id: int) -> str:
         return f"lerobot_task_{task_id}"
 
@@ -74,6 +114,8 @@ class LeRobotEnv(gym.Env):
         return self._build_obs(), {}
 
     def chunk_step(self, chunk_actions, chunk_values=None):
+        logger.warning(f"LeRobotEnv.chunk_step received chunk_actions with shape {chunk_actions.shape}")
+
         chunk_size = int(chunk_actions.shape[1])
         rewards = torch.zeros((self.num_envs, chunk_size), dtype=torch.float32)
         terminations = torch.zeros((self.num_envs, chunk_size), dtype=torch.bool)

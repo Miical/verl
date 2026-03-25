@@ -17,6 +17,7 @@ env:
       action_dim: 7
   train:
     simulator_type: libero
+    lerobot_config_path: null
     max_episode_steps: 512
     reward_coef: 1.0
     step_penalty: 0.001
