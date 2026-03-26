@@ -13,7 +13,7 @@ import gymnasium as gym
 import numpy as np
 import torch
 
-from verl.experimental.vla.envs.action_utils import to_tensor
+from verl.experimental.vla.envs.action_utils import put_info_on_image, save_rollout_video, to_tensor
 
 from .ipc_channel import clear_ipc, send_obj
 
@@ -138,6 +138,14 @@ class LeRobotEnv(gym.Env):
             "task_descriptions": list(self.task_descriptions),
         }
 
+    def add_new_frames(self, obs, plot_infos):
+        info_item = {k: v if np.size(v) == 1 else v[0] for k, v in plot_infos.items()}
+        top_image = (obs["images_and_states"]["full_image"][0].detach().cpu().numpy() * 255).clip(0, 255).astype(np.uint8)
+        wrist_image = (obs["images_and_states"]["wrist_image"][0].detach().cpu().numpy() * 255).clip(0, 255).astype(np.uint8)
+        top_image = put_info_on_image(top_image, info_item)
+        wrist_image = put_info_on_image(wrist_image, info_item)
+        self.render_images.append(np.concatenate([top_image, wrist_image], axis=1))
+
     def get_all_state_ids(self):
         return np.arange(self.total_num_group_envs)
 
@@ -160,7 +168,7 @@ class LeRobotEnv(gym.Env):
         obs = self._wrap_runtime_obs(obs)
         return obs, {}
     
-    def step(self, action):
+    def step(self, action, critic_values=None):
         self._assert_runtime_alive()
         reply = send_obj(
             type="step",
@@ -185,6 +193,17 @@ class LeRobotEnv(gym.Env):
         raw_truncations = np.logical_or(raw_truncations, self._episode_steps >= self.max_episode_steps)
         truncations = to_tensor(raw_truncations)
 
+        if self.video_cfg.save_video:
+            plot_infos = {
+                "rewards": reward.numpy(),
+                "terminations": terminations.numpy(),
+                "truncations": truncations.numpy(),
+                "task": self.task_descriptions,
+            }
+            if critic_values is not None:
+                plot_infos["critic_value"] = np.asarray(critic_values, dtype=np.float32)
+            self.add_new_frames(obs, plot_infos)
+
         infos = {}
         done_mask = torch.logical_or(terminations, truncations)
         if done_mask.any():
@@ -208,7 +227,13 @@ class LeRobotEnv(gym.Env):
 
         for step_idx in range(chunk_size):
             action = chunk_actions[:, step_idx, :]
-            extracted_obs, step_reward, terminations, truncations, infos = self.step(action)
+            step_values = None
+            if chunk_values is not None:
+                if len(chunk_values.shape) == 1:
+                    step_values = chunk_values
+                elif len(chunk_values.shape) == 2:
+                    step_values = chunk_values[:, step_idx]
+            extracted_obs, step_reward, terminations, truncations, infos = self.step(action, critic_values=step_values)
             chunk_rewards.append(step_reward)
             raw_chunk_terminations.append(terminations)
             raw_chunk_truncations.append(truncations)
@@ -220,7 +245,16 @@ class LeRobotEnv(gym.Env):
         return extracted_obs, chunk_rewards, chunk_terminations, chunk_truncations, infos
 
     def flush_video(self, video_sub_dir: Optional[str] = None):
-        logger.debug("LeRobotEnv.flush_video is a no-op scaffold")
+        output_dir = os.path.join(self.video_cfg.video_base_dir, f"rank_{self.rank}")
+        if video_sub_dir is not None:
+            output_dir = os.path.join(output_dir, f"{video_sub_dir}")
+        save_rollout_video(
+            self.render_images,
+            output_dir=output_dir,
+            video_name=f"{self.video_cnt}",
+        )
+        self.video_cnt += 1
+        self.render_images = []
 
     def load_state(self, state_buffer: bytes):
         logger.debug("LeRobotEnv.load_state is a no-op scaffold")
