@@ -13,6 +13,8 @@ import gymnasium as gym
 import numpy as np
 import torch
 
+from verl.experimental.vla.envs.action_utils import to_tensor
+
 from .ipc_channel import clear_ipc, send_obj
 
 logger = logging.getLogger(__name__)
@@ -124,19 +126,15 @@ class LeRobotEnv(gym.Env):
     def _task_description(self, task_id: int) -> str:
         return f"lerobot_task_{task_id}"
 
-    def _build_obs(self):
-        full_image = torch.zeros((self.num_envs, self.image_height, self.image_width, 3), dtype=torch.uint8)
-        wrist_image = torch.zeros((self.num_envs, self.image_height, self.image_width, 3), dtype=torch.uint8)
-        state = torch.zeros((self.num_envs, self.state_dim), dtype=torch.float32)
-        state[:, 0] = torch.as_tensor(self._state_ids, dtype=torch.float32)
-        state[:, 1] = torch.as_tensor(self._task_ids, dtype=torch.float32)
-        state[:, 2] = torch.as_tensor(self._episode_steps, dtype=torch.float32)
+    def _wrap_runtime_obs(self, runtime_obs: dict) -> dict:
         return {
-            "images_and_states": {
-                "full_image": full_image,
-                "wrist_image": wrist_image,
-                "state": state,
-            },
+            "images_and_states": to_tensor(
+                {
+                    "full_image": runtime_obs["observation.images.top"].permute(0, 2, 3, 1),
+                    "wrist_image": runtime_obs["observation.images.wrist"].permute(0, 2, 3, 1),
+                    "state": runtime_obs["observation.state"],
+                }
+            ),
             "task_descriptions": list(self.task_descriptions),
         }
 
@@ -150,17 +148,18 @@ class LeRobotEnv(gym.Env):
         self._episode_returns[:] = 0.0
         self.task_descriptions = [self._task_description(task_id) for task_id in self._task_ids]
         self._assert_runtime_alive()
-        reply = send_obj(
+        obs = send_obj(
             type="reset",
             content={
                 "state_ids": self._state_ids.tolist(),
                 "task_ids": self._task_ids.tolist(),
             },
             rank=self.rank,
-            stage_id=self.stage_id,
+            stage_id=self.stage_id
         )
-        logger.warning(f"!!!!!!!!! Reset complete, obs from reset reply: {reply}")
-        return self._build_obs(), {}
+        obs = self._wrap_runtime_obs(obs)
+        logger.warning(f"LeRobotEnv.reset_envs_to_state_ids is currently a scaffold that does not actually reset the environment. Received obs: {obs}")
+        return obs, {}
     
     def step(self, action):
         self._assert_runtime_alive()
