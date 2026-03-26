@@ -36,14 +36,24 @@ def _send_raw_obj(path: str, obj: Any) -> None:
 
 
 def _recv_raw_obj(path: str) -> Any:
+    def _read_exact(fifo, size: int) -> bytes:
+        chunks = []
+        remaining = size
+        while remaining > 0:
+            chunk = fifo.read(remaining)
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        data = b"".join(chunks)
+        if len(data) != size:
+            raise RuntimeError(f"Failed to read {size} bytes from FIFO, got {len(data)} bytes")
+        return data
+
     with open(path, "rb", buffering=0) as fifo:
-        header = fifo.read(4)
-        if len(header) != 4:
-            raise RuntimeError("Failed to read object header from FIFO")
+        header = _read_exact(fifo, 4)
         size = struct.unpack("!I", header)[0]
-        payload = fifo.read(size)
-        if len(payload) != size:
-            raise RuntimeError("Failed to read object payload from FIFO")
+        payload = _read_exact(fifo, size)
         return pickle.loads(payload)
 
 
@@ -59,7 +69,7 @@ def clear_ipc(rank: int, stage_id: int) -> None:
     _remove_fifo(resp_path)
 
 
-def send_obj(type: str, content: Any, rank: int, stage_id: int, timeout_s: float = 60.0) -> Any:
+def send_obj(type: str, content: Any, rank: int, stage_id: int, timeout_s: float = 10.0) -> Any:
     req_path, resp_path = _ipc_paths(rank=rank, stage_id=stage_id)
     deadline = time.time() + timeout_s
     while not (Path(req_path).exists() and Path(resp_path).exists()):
