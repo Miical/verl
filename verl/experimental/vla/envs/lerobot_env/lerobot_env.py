@@ -158,7 +158,6 @@ class LeRobotEnv(gym.Env):
             stage_id=self.stage_id
         )
         obs = self._wrap_runtime_obs(obs)
-        logger.warning(f"LeRobotEnv.reset_envs_to_state_ids is currently a scaffold that does not actually reset the environment. Received obs: {obs}")
         return obs, {}
     
     def step(self, action):
@@ -173,42 +172,52 @@ class LeRobotEnv(gym.Env):
             timeout_s=10.0,
         )
 
-        if not isinstance(reply, dict) or reply.get("status") != "ok":
+        if not isinstance(reply, dict):
             raise RuntimeError(f"Invalid runtime reply: {reply}")
-        
+        obs = self._wrap_runtime_obs(reply["obs"])
+        reward = to_tensor(np.asarray([reply["reward"]], dtype=np.float32))
 
-    def chunk_step(self, chunk_actions, chunk_values=None):
-        chunk_size = chunk_actions.shape[1]
-        for step_idx in range(chunk_size):
-            action = chunk_actions[:, step_idx, :]
-            self.step(action)
+        self._episode_steps += 1
+        self._episode_returns += reward.numpy()
 
+        terminations = to_tensor(np.asarray([reply["done"]], dtype=bool))
+        raw_truncations = np.asarray([reply["truncated"]], dtype=bool)
+        raw_truncations = np.logical_or(raw_truncations, self._episode_steps >= self.max_episode_steps)
+        truncations = to_tensor(raw_truncations)
 
-        chunk_size = int(chunk_actions.shape[1])
-        rewards = torch.zeros((self.num_envs, chunk_size), dtype=torch.float32)
-        terminations = torch.zeros((self.num_envs, chunk_size), dtype=torch.bool)
-        truncations = torch.zeros((self.num_envs, chunk_size), dtype=torch.bool)
-
-        for step_idx in range(chunk_size):
-            self._episode_steps += 1
-            reached_limit = self._episode_steps >= self.max_episode_steps
-            truncations[:, step_idx] = torch.as_tensor(reached_limit, dtype=torch.bool)
-
-        self._episode_returns += rewards.sum(dim=1).numpy()
         infos = {}
-        if truncations[:, -1].any():
-            done_mask = truncations[:, -1]
+        done_mask = torch.logical_or(terminations, truncations)
+        if done_mask.any():
             infos["final_info"] = {
                 "episode": {
                     "return": torch.as_tensor(self._episode_returns, dtype=torch.float32),
                     "episode_len": torch.as_tensor(self._episode_steps, dtype=torch.int32),
-                    "success_once": torch.zeros(self.num_envs, dtype=torch.bool),
+                    "success_once": terminations.clone(),
                 }
             }
             self._episode_steps[done_mask.numpy()] = 0
             self._episode_returns[done_mask.numpy()] = 0.0
 
-        return self._build_obs(), rewards, terminations, truncations, infos
+        return obs, reward, terminations, truncations, infos
+
+    def chunk_step(self, chunk_actions, chunk_values=None):
+        chunk_size = chunk_actions.shape[1]
+        chunk_rewards = []
+        raw_chunk_terminations = []
+        raw_chunk_truncations = []
+
+        for step_idx in range(chunk_size):
+            action = chunk_actions[:, step_idx, :]
+            extracted_obs, step_reward, terminations, truncations, infos = self.step(action)
+            chunk_rewards.append(step_reward)
+            raw_chunk_terminations.append(terminations)
+            raw_chunk_truncations.append(truncations)
+
+        chunk_rewards = torch.stack(chunk_rewards, dim=1)
+        chunk_terminations = torch.stack(raw_chunk_terminations, dim=1)
+        chunk_truncations = torch.stack(raw_chunk_truncations, dim=1)
+
+        return extracted_obs, chunk_rewards, chunk_terminations, chunk_truncations, infos
 
     def flush_video(self, video_sub_dir: Optional[str] = None):
         logger.debug("LeRobotEnv.flush_video is a no-op scaffold")

@@ -53,7 +53,6 @@ class LerobotRuntime:
         self.episode_total_steps = 0
     
     def reset(self, task_ids, state_ids):
-        logger.info("Resetting LeRobot runtime.")
         self.obs, self.info = self.online_env.reset()
         self.env_processor.reset()
         self.action_processor.reset()
@@ -66,20 +65,13 @@ class LerobotRuntime:
         self.episode_intervention_steps = 0
         self.episode_total_steps = 0
 
-        # obs = self.transition[TransitionKey.OBSERVATION]
-        # return obs
-
-        return {"status": "ok"}
+        obs = self.transition[TransitionKey.OBSERVATION]
+        return obs
     
     def step(self, actions):
-        raw = self.online_env.get_raw_joint_positions()
-        neutral_action = torch.tensor(
-            [raw[f"{k}.pos"] for k in self.online_env.robot.bus.motors], dtype=torch.float32
-        )
-        time.sleep(0.1)
-        actions = neutral_action
-
-        # ====
+        actions = torch.as_tensor(actions, dtype=torch.float32)
+        if actions.ndim > 1:
+            actions = actions[0]
 
         new_transition = step_env_and_process_transition(
             env=self.online_env,
@@ -118,6 +110,7 @@ class LerobotRuntime:
                 complementary_info={},
             )
         )
+        self.obs = next_obs
         self.transition = new_transition
 
         if done or truncated:
@@ -129,7 +122,12 @@ class LerobotRuntime:
                         Episode reward: {self.sum_reward_episode}, Episode steps: {self.episode_total_steps}, \
                         Episode intervention: {self.episode_intervention}, Intervention rate: {intervention_rate:.2f}")
 
-        return {"status": "ok"}
+        return {
+            "obs": next_obs,
+            "reward": float(reward),
+            "done": bool(done),
+            "truncated": bool(truncated),
+        }
     
     def close(self):
         if self.teleop_device is not None and hasattr(self.teleop_device, "disconnect"):
@@ -152,7 +150,7 @@ def start_lerobot_runtime(config_path: str, rank: int, stage_id: int) -> None:
                 state_ids=msg.get("content", {}).get("state_ids")
             )
         elif msg.get("type") == "step":
-            reply = runtime.step(actions=None)
+            reply = runtime.step(actions=msg.get("content", {}).get("actions"))
         else:
             logger.warning("Received unknown message type: %s", msg.get("type"))
             reply = {"status": "error", "message": f"Unknown message type: {msg.get('type')}"}
