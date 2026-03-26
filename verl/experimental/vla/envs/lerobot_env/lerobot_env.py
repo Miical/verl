@@ -1,7 +1,7 @@
 # Copyright 2024 Bytedance Ltd. and/or its affiliates
 
 import logging
-from pathlib import Path
+import os
 import shlex
 import shutil
 import socket
@@ -43,6 +43,7 @@ class LeRobotEnv(gym.Env):
         self.video_cfg = cfg.video_cfg
         self.video_cnt = 0
         self.render_images = []
+        self._runtime_session_name = f"{_LEROBOT_RUNTIME_SESSION_PREFIX}_{socket.gethostname()}_rank{self.rank}_stage{self.stage_id}"
 
         self._episode_steps = np.zeros(self.num_envs, dtype=np.int32)
         self._episode_returns = np.zeros(self.num_envs, dtype=np.float32)
@@ -54,7 +55,7 @@ class LeRobotEnv(gym.Env):
         lerobot_config_path = getattr(cfg, "lerobot_config_path", None)
         if not lerobot_config_path:
             raise ValueError("`cfg.lerobot_config_path` is required for LeRobotEnv.")
-        if not Path(lerobot_config_path).exists():
+        if not os.path.exists(lerobot_config_path):
             raise FileNotFoundError(f"LeRobot config not found: {lerobot_config_path}")
         self._ensure_tmux_lerobot_runtime(lerobot_config_path)
 
@@ -62,30 +63,63 @@ class LeRobotEnv(gym.Env):
         if shutil.which("tmux") is None:
             raise RuntimeError("`tmux` is required for LeRobotEnv runtime process.")
 
-        session_name = f"{_LEROBOT_RUNTIME_SESSION_PREFIX}_{socket.gethostname()}_rank{self.rank}_stage{self.stage_id}"
         runtime_cmd = (
-            f"{sys.executable} -u -m verl.experimental.vla.envs.lerobot_env.lerobot_runtime "
+            f"exec {sys.executable} -u -m verl.experimental.vla.envs.lerobot_env.lerobot_runtime "
             f"--config_path {shlex.quote(str(lerobot_config_path))} "
             f"--rank {self.rank} --stage_id {self.stage_id}"
         )
 
-        has_session = subprocess.run(
-            ["tmux", "has-session", "-t", session_name],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            check=False,
-        )
+        has_session = self._tmux_has_session()
         if has_session.returncode == 0:
-            logger.info("LeRobot runtime tmux session already exists: %s", session_name)
+            self._enable_tmux_log_forwarding()
+            logger.info(
+                "LeRobot runtime tmux session already exists: %s (forwarding to pid=%s stdout)",
+                self._runtime_session_name,
+                os.getpid(),
+            )
             return
 
         clear_ipc(rank=self.rank, stage_id=self.stage_id)
 
         subprocess.run(
-            ["tmux", "new-session", "-d", "-s", session_name, runtime_cmd],
+            ["tmux", "new-session", "-d", "-s", self._runtime_session_name],
             check=True,
         )
-        logger.info("Started LeRobot runtime in tmux session: %s", session_name)
+        self._enable_tmux_log_forwarding()
+        subprocess.run(
+            ["tmux", "send-keys", "-t", self._runtime_session_name, runtime_cmd, "C-m"],
+            check=True,
+        )
+        logger.info(
+            "Started LeRobot runtime in tmux session: %s (forwarding to pid=%s stdout)",
+            self._runtime_session_name,
+            os.getpid(),
+        )
+
+    def _tmux_has_session(self) -> subprocess.CompletedProcess:
+        return subprocess.run(
+            ["tmux", "has-session", "-t", self._runtime_session_name],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+
+    def _assert_runtime_alive(self) -> None:
+        has_session = self._tmux_has_session()
+        if has_session.returncode != 0:
+            raise RuntimeError(
+                f"LeRobot runtime tmux session exited unexpectedly: {self._runtime_session_name}"
+            )
+
+    def _enable_tmux_log_forwarding(self) -> None:
+        stdout_path = f"/proc/{os.getpid()}/fd/1"
+        prefix = f"[LeRobot runtime rank={self.rank} stage={self.stage_id}] "
+        pipe_cmd = f"awk -v p={shlex.quote(prefix)} '{{print p $0; fflush();}}' >> {shlex.quote(stdout_path)}"
+        subprocess.run(["tmux", "pipe-pane", "-t", self._runtime_session_name], check=True)
+        subprocess.run(
+            ["tmux", "pipe-pane", "-t", self._runtime_session_name, pipe_cmd],
+            check=True,
+        )
 
     def _task_description(self, task_id: int) -> str:
         return f"lerobot_task_{task_id}"
@@ -115,6 +149,7 @@ class LeRobotEnv(gym.Env):
         self._episode_steps[:] = 0
         self._episode_returns[:] = 0.0
         self.task_descriptions = [self._task_description(task_id) for task_id in self._task_ids]
+        self._assert_runtime_alive()
         reply = send_obj(
             type="reset",
             content={
@@ -123,13 +158,12 @@ class LeRobotEnv(gym.Env):
             },
             rank=self.rank,
             stage_id=self.stage_id,
-            timeout_s=10.0,
         )
-        if not isinstance(reply, dict) or reply.get("status") != "ok":
-            raise RuntimeError(f"Invalid runtime reply: {reply}")
+        logger.warning(f"!!!!!!!!! Reset complete, obs from reset reply: {reply}")
         return self._build_obs(), {}
     
     def step(self, action):
+        self._assert_runtime_alive()
         reply = send_obj(
             type="step",
             content={
@@ -149,7 +183,6 @@ class LeRobotEnv(gym.Env):
         for step_idx in range(chunk_size):
             action = chunk_actions[:, step_idx, :]
             self.step(action)
-
 
 
         chunk_size = int(chunk_actions.shape[1])
@@ -185,4 +218,11 @@ class LeRobotEnv(gym.Env):
         logger.debug("LeRobotEnv.load_state is a no-op scaffold")
 
     def close(self):
+        if shutil.which("tmux") is not None and self._tmux_has_session().returncode == 0:
+            subprocess.run(
+                ["tmux", "kill-session", "-t", self._runtime_session_name],
+                check=False,
+            )
+            logger.info("Stopped LeRobot runtime tmux session: %s", self._runtime_session_name)
+        clear_ipc(rank=self.rank, stage_id=self.stage_id)
         return None
