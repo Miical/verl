@@ -7,7 +7,7 @@ Run the **Pi0.5 VLA model** in **Isaac Lab** with the **DiffIK absolute action**
 | Repo | Branch |
 |------|--------|
 | [**verl**](https://github.com/Miical/verl/tree/yujie/fix-isaac-verl) (this repo) | `yujie/fix-isaac-verl` |
-| [**RobotLearningLab**](https://github.com/nvidia-china-sae/RobotLearningLab/tree/yujie/update/2.3.0-verl) | `yujie/update/2.3.0-verl` (commit `b97fa8bb`) |
+| [**RobotLearningLab**](https://github.com/nvidia-china-sae/RobotLearningLab/tree/yujie/update/2.3.0-verl) | `yujie/update/2.3.0-verl` |
 
 ## Option A: Clean Build (Recommended)
 
@@ -76,22 +76,6 @@ A convenience script is provided:
 cd ~/iCode/RL/verl/docker && ./run_isaaclab323.sh
 ```
 
-Or run manually:
-
-```bash
-docker run \
-    --entrypoint /root/entrypoint.sh \
-    -e "ACCEPT_EULA=Y" \
-    -it --gpus all \
-    -v /dev/shm:/dev/shm:rw \
-    -v ~/iCode/RL/verl:/root/code/verl \
-    -v ~/iCode/RL/RobotLearningLab:/root/RobotLearningLab \
-    -v ~/iDataset/VLA/openpi/checkpoint/pi05_libero_torch:/root/data/pi05_libero_torch \
-    -v ~/iDataset/VLA/openpi/libero_rl:/root/data/libero_rl \
-    verl-isaac-vla:latest \
-    bash
-```
-
 Inside the container:
 
 ```bash
@@ -107,6 +91,34 @@ bash verl/experimental/vla/run_pi05_libero_sac.sh
 | `~/iCode/RL/RobotLearningLab` | `/root/RobotLearningLab` | Isaac Lab playground + USD assets (branch `yujie/update/2.3.0-verl`) |
 | `~/iDataset/VLA/openpi/checkpoint/pi05_libero_torch` | `/root/data/pi05_libero_torch` | PyTorch model checkpoint (13G) |
 | `~/iDataset/VLA/openpi/libero_rl` | `/root/data/libero_rl` | train/test parquet files |
+
+### Attaching to a Running Container & Saving Ray Timeline
+
+To open a new shell inside the running container (e.g. `isaac-rl`):
+
+```bash
+docker exec -it isaac-rl bash
+```
+
+**Saving a Ray timeline** — `save_ray_timeline.py` (located at `/root/code/verl/save_ray_timeline.py`) dumps the recent Ray scheduling events (task submission, queuing, execution) from the cluster's internal ring buffer into a Chrome-tracing-compatible JSON file.
+
+**When to run it:** Wait until the RL pipeline has been running for a while (e.g. a few episodes have completed, so there are actual Ray tasks to record). Running it during Isaac Sim initialization will produce an empty or near-empty file.
+
+```bash
+# Inside the container (via docker exec)
+cd /root/code/verl
+python save_ray_timeline.py                          # default output path
+python save_ray_timeline.py -o /tmp/timeline.json    # custom output path
+```
+
+Copy the file to the host for analysis:
+
+```bash
+# On the host
+docker cp isaac-rl:/workspace/verl_vla/logs/ray_timeline_<timestamp>.json ~/
+```
+
+Open `chrome://tracing` in Chrome and load the JSON file to visualize the Ray task scheduling timeline.
 
 ### Dockerfile.isaaclab323 vs Dockerfile.isaaclab230
 

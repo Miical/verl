@@ -1,5 +1,10 @@
 #!/bin/bash
+CONTAINER_NAME="${1:-isaac-rl}"
+
+docker rm -f "$CONTAINER_NAME" 2>/dev/null
+
 docker run \
+    --name "$CONTAINER_NAME" \
     --entrypoint /root/entrypoint.sh \
     -e "ACCEPT_EULA=Y" \
     -it --gpus all \

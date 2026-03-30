@@ -91,7 +91,7 @@ class IsaacEnv(gym.Env):
             os.environ["LIBERO_TASK_ID"] = str(task_id)
 
             if not self.task_name:
-                self.task_name = "Isaac-Libero-Franka-IK-Abs-v0"
+                self.task_name = "Isaac-Libero-Franka-IK-Abs-RL-v0"
 
             # For OSC-based tasks, set the controller type env var that
             # OscPoseLiberoCameraEnvCfg reads during __post_init__.
