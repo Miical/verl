@@ -145,26 +145,20 @@ class EnvLoop:
 
                 # get results from env worker
                 env_result: DataProto = await asyncio.to_thread(env_ref.get)
-                trajectories[stage_id][-1][FEEDBACK_KEY] = DataProto.from_dict(
-                    tensors={field: env_result.batch[field] for field in FEEDBACK_FIELDS}
+                feedback = DataProto.from_dict(tensors={field: env_result.batch[field] for field in FEEDBACK_FIELDS})
+                next_obs = DataProto.from_dict(
+                    tensors={key[len(OBS_KEY + "."):]: value for key, value in env_result.batch.items() if key.startswith(OBS_KEY + ".")},  
+                    non_tensors={key[len(OBS_KEY + "."):]: value for key, value in env_result.non_tensor_batch.items() if key.startswith(OBS_KEY + ".")}
                 )
+                trajectories[stage_id][-1][FEEDBACK_KEY] = feedback
                 if step_idx < self.max_interactions - 1:
-                    trajectories[stage_id].append({OBS_KEY: DataProto.from_dict(
-                        tensors={key[len(OBS_KEY + "."):]: value for key, value in env_result.batch.items() if key.startswith(OBS_KEY + ".")},  
-                        non_tensors={key[len(OBS_KEY + "."):]: value for key, value in env_result.non_tensor_batch.items() if key.startswith(OBS_KEY + ".")}
-                    )})
-                if self.single_env_rollout:
-                    env_result = env_result.repeat(repeat_times=action_batch_size, interleave=True)
+                    trajectories[stage_id].append({OBS_KEY: next_obs})
 
                 # send next obs to rollout worker for next step
-                obs_tensors = { key[len(OBS_KEY + "."):]: value for key, value in env_result.batch.items() if key.startswith(OBS_KEY + ".") }
-                non_tensor_batch = { key[len(OBS_KEY + "."):]: value for key, value in env_result.non_tensor_batch.items() if key.startswith(OBS_KEY + ".") }
-                next_obs = DataProto.from_dict(
-                    tensors=obs_tensors,
-                    non_tensors=non_tensor_batch,
-                )
                 if step_idx < self.max_interactions - 1:
                     vla_input = next_obs
+                    if self.single_env_rollout:
+                        vla_input = vla_input.repeat(repeat_times=action_batch_size, interleave=True)
                     vla_input.meta_info = prompts.meta_info
                     rollout_futures[stage_id] = self.rollout_wg.generate_sequences(vla_input)
 
