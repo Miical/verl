@@ -4,10 +4,12 @@ Run the **Pi0.5 VLA model** in **Isaac Lab** with the **DiffIK absolute action**
 
 ## Repository Info
 
-| Repo | Branch |
-|------|--------|
-| [**verl**](https://github.com/Miical/verl/tree/yujie/fix-isaac-verl) (this repo) | `yujie/fix-isaac-verl` |
-| [**RobotLearningLab**](https://github.com/nvidia-china-sae/RobotLearningLab/tree/yujie/update/2.3.0-verl) | `yujie/update/2.3.0-verl` |
+
+| Repo                                                                                                      | Branch                    |
+| --------------------------------------------------------------------------------------------------------- | ------------------------- |
+| **[verl](https://github.com/Miical/verl/tree/yujie/fix-isaac-verl)** (this repo)                          | `yujie/fix-isaac-verl`    |
+| **[RobotLearningLab](https://github.com/nvidia-china-sae/RobotLearningLab/tree/yujie/update/2.3.0-verl)** | `yujie/update/2.3.0-verl` |
+
 
 ## Option A: Clean Build (Recommended)
 
@@ -85,12 +87,14 @@ bash verl/experimental/vla/run_pi05_libero_sac.sh
 
 ### Host → Container Mount Mapping
 
-| Host Path | Container Path | Content |
-|---|---|---|
-| `~/iCode/RL/verl` | `/root/code/verl` | verl framework (branch `yujie/fix-isaac-verl`) |
-| `~/iCode/RL/RobotLearningLab` | `/root/RobotLearningLab` | Isaac Lab playground + USD assets (branch `yujie/update/2.3.0-verl`) |
-| `~/iDataset/VLA/openpi/checkpoint/pi05_libero_torch` | `/root/data/pi05_libero_torch` | PyTorch model checkpoint (13G) |
-| `~/iDataset/VLA/openpi/libero_rl` | `/root/data/libero_rl` | train/test parquet files |
+
+| Host Path                                            | Container Path                 | Content                                                              |
+| ---------------------------------------------------- | ------------------------------ | -------------------------------------------------------------------- |
+| `~/iCode/RL/verl`                                    | `/root/code/verl`              | verl framework (branch `yujie/fix-isaac-verl`)                       |
+| `~/iCode/RL/RobotLearningLab`                        | `/root/RobotLearningLab`       | Isaac Lab playground + USD assets (branch `yujie/update/2.3.0-verl`) |
+| `~/iDataset/VLA/openpi/checkpoint/pi05_libero_torch` | `/root/data/pi05_libero_torch` | PyTorch model checkpoint (13G)                                       |
+| `~/iDataset/VLA/openpi/libero_rl`                    | `/root/data/libero_rl`         | train/test parquet files                                             |
+
 
 ### Attaching to a Running Container & Saving Ray Timeline
 
@@ -118,20 +122,22 @@ Copy the file to the host for analysis:
 docker cp isaac-rl:/workspace/verl_vla/logs/ray_timeline_<timestamp>.json ~/
 ```
 
-Open `chrome://tracing` in Chrome and load the JSON file to visualize the Ray task scheduling timeline.
+Open `https://ui.perfetto.dev/` in web browser and open the JSON file to visualize the Ray task scheduling timeline.
 
 ### Dockerfile.isaaclab323 vs Dockerfile.isaaclab230
 
 `Dockerfile.isaaclab323` is based on `Dockerfile.isaaclab230` with the following changes:
 
-| Change | Why |
-|--------|-----|
-| Removed `COPY RobotLearningLab/` and its `pip install -e` | Repos are mounted at runtime via `-v`, not baked into the image |
-| Added VLA pip deps (`diffusers`, `draccus`, `einops`, `wandb`, `lerobot`, etc.) | Required by the PyTorch VLA inference pipeline |
-| Added pip re-bootstrap after `pip install --upgrade` | Upgrading `packaging` corrupts `pip._vendor.packaging`; fixed by re-installing pip via `get-pip.py` |
-| Pin `numpy==1.26.4` after all pip installs | Later deps pull in numpy 2.x which breaks Isaac Sim's C extensions (pinocchio, etc.) |
-| `libgl1-mesa-glx` → `libgl1` | `libgl1-mesa-glx` is unavailable on Ubuntu 24.04 (base image OS) |
-| Added `entrypoint.sh` with `ENTRYPOINT`/`CMD` | Symlinks mounted repos and runs `pip install -e` at container start; also patches `torch._vendor.packaging._structures` (broken symlink from packaging upgrade) |
+
+| Change                                                                          | Why                                                                                                                                                             |
+| ------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Removed `COPY RobotLearningLab/` and its `pip install -e`                       | Repos are mounted at runtime via `-v`, not baked into the image                                                                                                 |
+| Added VLA pip deps (`diffusers`, `draccus`, `einops`, `wandb`, `lerobot`, etc.) | Required by the PyTorch VLA inference pipeline                                                                                                                  |
+| Added pip re-bootstrap after `pip install --upgrade`                            | Upgrading `packaging` corrupts `pip._vendor.packaging`; fixed by re-installing pip via `get-pip.py`                                                             |
+| Pin `numpy==1.26.4` after all pip installs                                      | Later deps pull in numpy 2.x which breaks Isaac Sim's C extensions (pinocchio, etc.)                                                                            |
+| `libgl1-mesa-glx` → `libgl1`                                                    | `libgl1-mesa-glx` is unavailable on Ubuntu 24.04 (base image OS)                                                                                                |
+| Added `entrypoint.sh` with `ENTRYPOINT`/`CMD`                                   | Symlinks mounted repos and runs `pip install -e` at container start; also patches `torch._vendor.packaging._structures` (broken symlink from packaging upgrade) |
+
 
 ### What the entrypoint does
 
@@ -182,32 +188,38 @@ Videos are saved to `$HOME/video/`.
 
 ## Environment Prerequisites (without Docker)
 
-| Component | Version / Path | Notes |
-|-----------|---------------|-------|
-| Python | 3.11 | Isaac Sim bundled Python |
-| Isaac Sim | `/workspace/isaaclab/_isaac_sim/` | Must be pre-installed |
-| CUDA | 12.x (bundled with Isaac Sim) | GPU required (tested on NVIDIA L20) |
-| PyTorch | 2.7.0+cu128 | Isaac Sim bundled |
-| verl | editable install from this repo | `pip install -e .` |
-| RobotLearningLab | `pip install -e` from `source/isaaclab_playground/` | See repo info above |
+
+| Component        | Version / Path                                      | Notes                               |
+| ---------------- | --------------------------------------------------- | ----------------------------------- |
+| Python           | 3.11                                                | Isaac Sim bundled Python            |
+| Isaac Sim        | `/workspace/isaaclab/_isaac_sim/`                   | Must be pre-installed               |
+| CUDA             | 12.x (bundled with Isaac Sim)                       | GPU required (tested on NVIDIA L20) |
+| PyTorch          | 2.7.0+cu128                                         | Isaac Sim bundled                   |
+| verl             | editable install from this repo                     | `pip install -e .`                  |
+| RobotLearningLab | `pip install -e` from `source/isaaclab_playground/` | See repo info above                 |
+
 
 **Critical:** numpy must be < 2.0. Isaac Lab and verl are incompatible with numpy 2.x.
 
 ### Required Data Files
 
-| Path | Description |
-|------|-------------|
-| `$HOME/data/pi05_libero_torch/` | PyTorch model checkpoint (safetensors + corrected config.json) |
+
+| Path                                 | Description                                                               |
+| ------------------------------------ | ------------------------------------------------------------------------- |
+| `$HOME/data/pi05_libero_torch/`      | PyTorch model checkpoint (safetensors + corrected config.json)            |
 | `$HOME/data/libero_rl/train.parquet` | Prompt metadata for RL rollouts (task_id, state_id, language instruction) |
-| `$HOME/data/libero_rl/test.parquet` | Test prompt metadata |
+| `$HOME/data/libero_rl/test.parquet`  | Test prompt metadata                                                      |
+
 
 From **RobotLearningLab**:
 
-| Path | Description |
-|------|-------------|
-| `benchmarks/datasets/libero/config/` | Task definitions (e.g., `libero_object.json`) |
-| `benchmarks/datasets/libero/USD/` | USD scene assets — download from [HuggingFace](https://huggingface.co/datasets/china-sae-robotics/RobotLearningLab_Dataset/tree/main/libero/USD) |
-| `benchmarks/datasets/libero/assembled_hdf5/` | HDF5 demo files (for `RESET_MODE=hdf5` only) |
+
+| Path                                         | Description                                                                                                                                      |
+| -------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `benchmarks/datasets/libero/config/`         | Task definitions (e.g., `libero_object.json`)                                                                                                    |
+| `benchmarks/datasets/libero/USD/`            | USD scene assets — download from [HuggingFace](https://huggingface.co/datasets/china-sae-robotics/RobotLearningLab_Dataset/tree/main/libero/USD) |
+| `benchmarks/datasets/libero/assembled_hdf5/` | HDF5 demo files (for `RESET_MODE=hdf5` only)                                                                                                     |
+
 
 ## Action Flow
 
@@ -233,10 +245,12 @@ The model predicts **delta** actions (relative to current state). The pipeline a
 
 Controlled by `RESET_MODE` environment variable (default: `random`).
 
-| Mode | Command | Description |
-|------|---------|-------------|
-| `random` | `bash run_pi05_libero_sac.sh` | Isaac Lab built-in randomization within narrow pose ranges (~1cm). Preferred for RL training. |
-| `hdf5` | `RESET_MODE=hdf5 bash run_pi05_libero_sac.sh` | Load exact initial state from HDF5 demo data. Useful for reproducible evaluation. |
+
+| Mode     | Command                                       | Description                                                                                   |
+| -------- | --------------------------------------------- | --------------------------------------------------------------------------------------------- |
+| `random` | `bash run_pi05_libero_sac.sh`                 | Isaac Lab built-in randomization within narrow pose ranges (~1cm). Preferred for RL training. |
+| `hdf5`   | `RESET_MODE=hdf5 bash run_pi05_libero_sac.sh` | Load exact initial state from HDF5 demo data. Useful for reproducible evaluation.             |
+
 
 Both modes run a 10-step arm stabilization loop after reset (hold current EEF pose).
 
@@ -244,24 +258,28 @@ Both modes run a 10-step arm stabilization loop after reset (hold current EEF po
 
 ### Environment Variables
 
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `SFT_MODEL_PATH` | `$HOME/data/pi05_libero_torch` | Path to PyTorch model checkpoint |
-| `SIM_TYPE` | `isaac` | Simulator type (`isaac` or `libero`) |
-| `RESET_MODE` | `random` | Reset mode: `random` or `hdf5` |
-| `NUM_ENV` | `8` | Number of parallel environments per worker |
-| `MAX_EPISODE_STEPS` | `300` | Max steps per episode |
-| `NUM_ACTION_CHUNKS` | `10` | Action chunk size |
+
+| Variable            | Default                        | Description                                |
+| ------------------- | ------------------------------ | ------------------------------------------ |
+| `SFT_MODEL_PATH`    | `$HOME/data/pi05_libero_torch` | Path to PyTorch model checkpoint           |
+| `SIM_TYPE`          | `isaac`                        | Simulator type (`isaac` or `libero`)       |
+| `RESET_MODE`        | `random`                       | Reset mode: `random` or `hdf5`             |
+| `NUM_ENV`           | `8`                            | Number of parallel environments per worker |
+| `MAX_EPISODE_STEPS` | `300`                          | Max steps per episode                      |
+| `NUM_ACTION_CHUNKS` | `10`                           | Action chunk size                          |
+
 
 ### Key Parameters
 
-| Parameter | Value | Constraint |
-|-----------|-------|------------|
-| `TRAIN_BATCH_SIZE` | 4 | Must satisfy: `TRAIN_BATCH_SIZE * ROLLOUT_N == NUM_ENV_GPUS * NUM_STAGE * NUM_ENV` |
-| `ROLLOUT_N` | 8 | Response number per prompt (`== NUM_ENV` for Isaac) |
-| `NUM_STAGE` | 2 | Pipeline stages |
-| `NUM_ENV_GPUS` | 2 | GPUs for environment workers |
-| `NUM_ROLLOUT_GPUS` | 2 | GPUs for rollout workers (`= NUM_GPUS - NUM_ENV_GPUS`) |
+
+| Parameter          | Value | Constraint                                                                         |
+| ------------------ | ----- | ---------------------------------------------------------------------------------- |
+| `TRAIN_BATCH_SIZE` | 4     | Must satisfy: `TRAIN_BATCH_SIZE * ROLLOUT_N == NUM_ENV_GPUS * NUM_STAGE * NUM_ENV` |
+| `ROLLOUT_N`        | 8     | Response number per prompt (`== NUM_ENV` for Isaac)                                |
+| `NUM_STAGE`        | 2     | Pipeline stages                                                                    |
+| `NUM_ENV_GPUS`     | 2     | GPUs for environment workers                                                       |
+| `NUM_ROLLOUT_GPUS` | 2     | GPUs for rollout workers (`= NUM_GPUS - NUM_ENV_GPUS`)                             |
+
 
 ## Key Code Changes
 
@@ -269,40 +287,50 @@ All changes are relative to commit `b738b410` (fix: resolve franka can not move 
 
 ### `envs/isaac_env/isaac_env.py`
 
-| Change | Why |
-|--------|-----|
-| Task name → `Isaac-Libero-Franka-IK-Abs-v0` | Use DiffIK absolute controller instead of OSC |
-| Added `_convert_actions_for_ik_abs()` (axis-angle → quaternion) | Isaac Lab IK-Abs expects quaternion input |
+
+| Change                                                           | Why                                                |
+| ---------------------------------------------------------------- | -------------------------------------------------- |
+| Task name → `Isaac-Libero-Franka-IK-Abs-v0`                      | Use DiffIK absolute controller instead of OSC      |
+| Added `_convert_actions_for_ik_abs()` (axis-angle → quaternion)  | Isaac Lab IK-Abs expects quaternion input          |
 | Fixed state extraction: `eef_pos(3) + axisangle(3) + gripper(1)` | Was passing raw quaternion pose without conversion |
-| Stabilization loop: hold current EEF pose instead of zero action | Zero = move to origin in absolute mode |
-| Added dual reset mode (`hdf5` / `random`) | Configurable initial state strategy |
-| OSC backward compatibility (`LIBERO_OSC_TYPE` auto-set) | Won't break if switching back to OSC task |
+| Stabilization loop: hold current EEF pose instead of zero action | Zero = move to origin in absolute mode             |
+| Added dual reset mode (`hdf5` / `random`)                        | Configurable initial state strategy                |
+| OSC backward compatibility (`LIBERO_OSC_TYPE` auto-set)          | Won't break if switching back to OSC task          |
+
 
 ### `sac/naive_rollout_pi05.py`
 
-| Change | Why |
-|--------|-----|
+
+| Change                                                                 | Why                                                |
+| ---------------------------------------------------------------------- | -------------------------------------------------- |
 | `output.action[:, :, :6] += raw_state[:, :6]` after `sample_actions()` | Delta-to-absolute conversion for PyTorch inference |
+
 
 ### `fsdp_workers.py`
 
-| Change | Why |
-|--------|-----|
+
+| Change                               | Why                   |
+| ------------------------------------ | --------------------- |
 | JAX/PyTorch inference path branching | Support both backends |
-| `asyncio.get_event_loop()` fallback | Fix crash from uvloop |
+| `asyncio.get_event_loop()` fallback  | Fix crash from uvloop |
+
 
 ### `run_pi05_libero_sac.sh`
 
-| Change | Why |
-|--------|-----|
-| Process cleanup (`pkill -9`) at script start | Prevent GPU OOM from zombies |
-| `SIM_TYPE=isaac`, `RESET_MODE`, JAX config variables | Configurable pipeline |
+
+| Change                                               | Why                          |
+| ---------------------------------------------------- | ---------------------------- |
+| Process cleanup (`pkill -9`) at script start         | Prevent GPU OOM from zombies |
+| `SIM_TYPE=isaac`, `RESET_MODE`, JAX config variables | Configurable pipeline        |
+
 
 ### `config/rob_sac_trainer.yaml`
 
-| Change | Why |
-|--------|-----|
+
+| Change                                                | Why                |
+| ----------------------------------------------------- | ------------------ |
 | `task_suite_name`: `libero_spatial` → `libero_object` | Correct task suite |
+
 
 ## Common Pitfalls
 
@@ -339,6 +367,7 @@ All changes are relative to commit `b738b410` (fix: resolve franka can not move 
 **Symptom:** `DomeLightCfg(intensity=200)` is set and prints correctly, but video still looks overexposed.
 
 **Workaround:** Re-run the pipeline. Isaac Sim may cache scene state internally. Clearing `__pycache__` under `isaaclab_playground` may help:
+
 ```bash
 find /root/RobotLearningLab/source/isaaclab_playground -type d -name __pycache__ -exec rm -rf {} +
 ```
@@ -360,6 +389,7 @@ The JAX path was developed first for validation. It is **rollout-only** (no RL t
 ### Setup
 
 Install JAX dependencies:
+
 ```bash
 pip install -r verl/experimental/vla/requirements_isaac_jax.txt
 ```
@@ -367,6 +397,7 @@ pip install -r verl/experimental/vla/requirements_isaac_jax.txt
 **Version constraints:** `jax==0.5.3`, `jaxlib==0.5.3`, `jax-cuda12-pjrt==0.5.3`, `jax-cuda12-plugin==0.5.3`. Mismatched versions cause silent GPU failures.
 
 Clone OpenPI source:
+
 ```bash
 git clone https://github.com/Physical-Intelligence/openpi.git /root/openpi
 cd /root/openpi && git checkout e6b0441
@@ -383,20 +414,25 @@ USE_JAX_INFERENCE=true bash verl/experimental/vla/run_pi05_libero_sac.sh
 
 ### JAX-Specific Environment Variables
 
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `USE_JAX_INFERENCE` | `false` | Set to `true` for JAX path |
-| `JAX_CHECKPOINT_DIR` | `$HOME/data/pi05_libero_absik/checkpoint-30000` | JAX checkpoint path |
-| `JAX_CONFIG_NAME` | `pi05_libero` | OpenPI config name |
+
+| Variable             | Default                                         | Description                |
+| -------------------- | ----------------------------------------------- | -------------------------- |
+| `USE_JAX_INFERENCE`  | `false`                                         | Set to `true` for JAX path |
+| `JAX_CHECKPOINT_DIR` | `$HOME/data/pi05_libero_absik/checkpoint-30000` | JAX checkpoint path        |
+| `JAX_CONFIG_NAME`    | `pi05_libero`                                   | OpenPI config name         |
+
 
 ### Limitation: Rollout-Only (No Training)
 
-The JAX model (~6.2 GB) + PyTorch FSDP model (~9.7 GB) exceed L20's 44 GB VRAM when both are on GPU. JAX mode skips SAC critic and training, returning dummy zeros. Sufficient for evaluating inference quality but not for RL training. Use the PyTorch path for training.
+The JAX model (~~6.2 GB) + PyTorch FSDP model (~~9.7 GB) exceed L20's 44 GB VRAM when both are on GPU. JAX mode skips SAC critic and training, returning dummy zeros. Sufficient for evaluating inference quality but not for RL training. Use the PyTorch path for training.
 
 ### JAX-Specific Files
 
-| File | Purpose |
-|------|---------|
+
+| File                                     | Purpose                                             |
+| ---------------------------------------- | --------------------------------------------------- |
 | `models/openpi_jax/openpi_jax_policy.py` | JAX inference wrapper, delta-to-absolute conversion |
-| `sac/naive_rollout_jax.py` | JAX rollout class (`PI0JaxRolloutRob`) |
-| `requirements_isaac_jax.txt` | Pinned JAX dependency versions |
+| `sac/naive_rollout_jax.py`               | JAX rollout class (`PI0JaxRolloutRob`)              |
+| `requirements_isaac_jax.txt`             | Pinned JAX dependency versions                      |
+
+
