@@ -1,7 +1,9 @@
 import torch
 import argparse
 import logging
+import os
 import signal
+import threading
 import time
 
 import draccus
@@ -26,6 +28,7 @@ from .ipc_channel import clear_ipc, recv_obj, reply_obj, setup_ipc
 
 logger = logging.getLogger(__name__)
 _STOP = False
+_RUNTIME = None
 
 
 def _handle_stop_signal(signum, frame):
@@ -200,12 +203,59 @@ class LerobotRuntime:
             self.teleop_device.disconnect()
         if self.online_env is not None and hasattr(self.online_env, "close"):
             self.online_env.close()
-        
 
-def start_lerobot_runtime(config_path: str, rank: int, stage_id: int) -> None:
+
+def _terminate_runtime_process(rank: int, stage_id: int) -> None:
+    global _RUNTIME
+    try:
+        if _RUNTIME is not None:
+            _RUNTIME.close()
+    except Exception:
+        logger.exception("Failed to close LeRobot runtime during forced termination")
+
+    try:
+        clear_ipc(rank=rank, stage_id=stage_id)
+    except Exception:
+        logger.exception("Failed to clear IPC during forced termination")
+
+    os._exit(0)
+
+
+def _watch_owner_process(owner_pid: int, rank: int, stage_id: int) -> None:
+    while True:
+        if _STOP:
+            return
+
+        try:
+            os.kill(owner_pid, 0)
+        except ProcessLookupError:
+            logger.warning(
+                "Owner process %s is gone, shutting down LeRobot runtime for rank=%s stage=%s",
+                owner_pid,
+                rank,
+                stage_id,
+            )
+            _terminate_runtime_process(rank=rank, stage_id=stage_id)
+        except PermissionError:
+            return
+
+        time.sleep(1.0)
+
+
+def start_lerobot_runtime(config_path: str, rank: int, stage_id: int, owner_pid: int | None = None) -> None:
+    global _RUNTIME
     logger.info("LeRobot runtime started with config: %s", config_path)
     setup_ipc(rank=rank, stage_id=stage_id)
     runtime = LerobotRuntime(config_path=config_path, rank=rank, stage_id=stage_id)
+    _RUNTIME = runtime
+
+    if owner_pid is not None:
+        threading.Thread(
+            target=_watch_owner_process,
+            args=(owner_pid, rank, stage_id),
+            name=f"lerobot-runtime-owner-watchdog-{rank}-{stage_id}",
+            daemon=True,
+        ).start()
 
     while not _STOP:
         msg = recv_obj(rank=rank, stage_id=stage_id)
@@ -232,12 +282,13 @@ def main() -> None:
     parser.add_argument("--config_path", required=True, type=str)
     parser.add_argument("--rank", required=True, type=int)
     parser.add_argument("--stage_id", required=True, type=int)
+    parser.add_argument("--owner_pid", type=int, default=None)
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO)
     signal.signal(signal.SIGTERM, _handle_stop_signal)
     signal.signal(signal.SIGINT, _handle_stop_signal)
-    start_lerobot_runtime(args.config_path, args.rank, args.stage_id)
+    start_lerobot_runtime(args.config_path, args.rank, args.stage_id, owner_pid=args.owner_pid)
 
 
 if __name__ == "__main__":

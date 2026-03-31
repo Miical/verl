@@ -68,7 +68,8 @@ class LeRobotEnv(gym.Env):
         runtime_cmd = (
             f"exec {sys.executable} -u -m verl.experimental.vla.envs.lerobot_env.lerobot_runtime "
             f"--config_path {shlex.quote(str(lerobot_config_path))} "
-            f"--rank {self.rank} --stage_id {self.stage_id}"
+            f"--rank {self.rank} --stage_id {self.stage_id} "
+            f"--owner_pid {os.getpid()}"
         )
 
         has_session = self._tmux_has_session()
