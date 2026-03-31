@@ -53,8 +53,26 @@ def create_env_batch_dataproto(obs, rewards, terminations, truncations, infos, m
         "terminations": ret_dict["terminations"],
         "truncations": ret_dict["truncations"],
     }
-    non_tensor_batch = {"obs.task_descriptions": obs["task_descriptions"]}
+    non_tensor_batch = {
+        "obs.task_descriptions": obs["task_descriptions"],
+    }
+    if "intervention_info" in infos:
+        intervention_batch = {
+            f"intervention_info.{key}": value
+            for key, value in infos["intervention_info"].items()
+            if isinstance(value, torch.Tensor)
+        }
+        intervention_non_tensor_batch = {
+            f"intervention_info.{key}": value
+            for key, value in infos["intervention_info"].items()
+            if not isinstance(value, torch.Tensor)
+        }
+        tensor_batch.update(intervention_batch)
+        non_tensor_batch.update(intervention_non_tensor_batch)
+
     output = DataProto.from_dict(tensors=tensor_batch, non_tensors=non_tensor_batch)
+
+    print(output)
 
     return output
 

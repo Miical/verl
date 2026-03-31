@@ -29,8 +29,37 @@ logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 OBS_KEY = "obs"
 ACTION_KEY = "action"
 FEEDBACK_KEY = "feedback"
+INTERVENTION_INFO_KEY = "intervention_info"
 
 FEEDBACK_FIELDS = ["rewards", "terminations", "truncations"]
+
+
+
+def get_dataproto_from_prefix(data: DataProto, prefix: str, separator: str = "") -> DataProto:
+    """Extract a sub-DataProto from a DataProto based on a given prefix.
+
+    Args:
+        data: The input DataProto containing various keys.
+        prefix: The prefix string to filter keys.
+        separator: Optional separator appended after prefix when matching keys.
+    Returns:
+        A DataProto containing tensor and non-tensor entries whose keys start
+        with the specified prefix. The prefix is removed from the result keys.
+    """
+
+    match_prefix = prefix if not separator or prefix.endswith(separator) else f"{prefix}{separator}"
+    prefix_length = len(match_prefix)
+    tensor_batch = {}
+    non_tensor_batch = {}
+    for key in data.batch.keys():
+        if key.startswith(match_prefix):
+            new_key = key[prefix_length:]
+            tensor_batch[new_key] = data.batch[key]
+    for key in data.non_tensor_batch.keys():
+        if key.startswith(match_prefix):
+            new_key = key[prefix_length:]
+            non_tensor_batch[new_key] = data.non_tensor_batch[key]
+    return DataProto.from_dict(tensors=tensor_batch, non_tensors=non_tensor_batch, meta_info=data.meta_info)
 
 
 class EnvLoop:
@@ -67,6 +96,73 @@ class EnvLoop:
 
         self.env_wg.init_worker()
         self.env_wg.init_simulator()
+
+    def _extract_intervention_obs_at(self, intervention_info: DataProto, obs_idx: int) -> DataProto:
+        tensor_batch = {
+            key.removeprefix(OBS_KEY + "."): value[:, obs_idx]
+            for key, value in intervention_info.batch.items()
+            if key.startswith(OBS_KEY + ".")
+        }
+        non_tensor_batch = {
+            key.removeprefix(OBS_KEY + "."): value[:, obs_idx]
+            for key, value in intervention_info.non_tensor_batch.items()
+            if key.startswith(OBS_KEY + ".")
+        }
+        return DataProto.from_dict(tensors=tensor_batch, non_tensors=non_tensor_batch)
+
+    def _expand_single_env_intervention_steps(
+        self,
+        current_obs: DataProto,
+        rollout_action: DataProto,
+        feedback: DataProto,
+        intervention_info: DataProto,
+        max_chunks: int,
+    ) -> list[dict]:
+        total_steps = intervention_info.batch["actions"].shape[1]
+        aligned_steps = (total_steps // self.num_action_chunks) * self.num_action_chunks
+        if aligned_steps == 0 or max_chunks <= 0:
+            return []
+
+        num_chunks = min(aligned_steps // self.num_action_chunks, max_chunks)
+        full_action_template = rollout_action.batch["full_action"][:1]
+        critic_value_template = rollout_action.batch["critic_value"][:1]
+
+        expanded_steps = []
+        chunk_obs = current_obs
+        for chunk_idx in range(num_chunks):
+            start = chunk_idx * self.num_action_chunks
+            end = start + self.num_action_chunks
+
+            action_chunk = intervention_info.batch["actions"][:, start:end].clone()
+            if chunk_idx == 0:
+                intervention_mask = intervention_info.batch["is_intervention"][:, start:end].to(torch.bool)
+                rollout_action_chunk = rollout_action.batch["action"][:1, : action_chunk.shape[1], : action_chunk.shape[2]]
+                action_chunk = torch.where(
+                    intervention_mask.unsqueeze(-1).to(action_chunk.device),
+                    action_chunk,
+                    rollout_action_chunk.to(device=action_chunk.device, dtype=action_chunk.dtype),
+                )
+            full_action_chunk = full_action_template.new_zeros(full_action_template.shape)
+            full_action_chunk[:, : action_chunk.shape[1], : action_chunk.shape[2]] = action_chunk.to(
+                device=full_action_chunk.device,
+                dtype=full_action_chunk.dtype,
+            )
+            action_dp = DataProto.from_dict(
+                tensors={
+                    "action": action_chunk,
+                    "full_action": full_action_chunk,
+                    "critic_value": critic_value_template.new_zeros(critic_value_template.shape),
+                }
+            )
+            feedback_dp = DataProto.from_dict(
+                tensors={field: feedback.batch[field][:, start:end] for field in FEEDBACK_FIELDS}
+            )
+            expanded_steps.append({OBS_KEY: chunk_obs, ACTION_KEY: action_dp, FEEDBACK_KEY: feedback_dp})
+
+            if chunk_idx < num_chunks - 1:
+                chunk_obs = self._extract_intervention_obs_at(intervention_info, chunk_idx)
+
+        return expanded_steps
 
     def generate_sequences(self, prompts: DataProto, reset_future: asyncio.Future) -> DataProto:
         """Split input batch and dispatch to env loop workers.
@@ -118,7 +214,8 @@ class EnvLoop:
             rollout_futures[stage_id] = self.rollout_wg.generate_sequences(vla_input)
 
         async def _stage_loop(stage_id: int):
-            for step_idx in range(self.max_interactions):
+            step_idx = 0
+            while step_idx < self.max_interactions:
                 # get actions from rollout worker
                 if stage_id == 0:
                     logger.info(f"[{step_idx}/{self.max_interactions - 1}] rollout step")
@@ -143,19 +240,39 @@ class EnvLoop:
                 )
                 env_ref = self.env_wg.env_interact_step(action_data)
 
-                # get results from env worker
+                # get results from env worker and process human intervention
                 env_result: DataProto = await asyncio.to_thread(env_ref.get)
                 feedback = DataProto.from_dict(tensors={field: env_result.batch[field] for field in FEEDBACK_FIELDS})
-                next_obs = DataProto.from_dict(
-                    tensors={key[len(OBS_KEY + "."):]: value for key, value in env_result.batch.items() if key.startswith(OBS_KEY + ".")},  
-                    non_tensors={key[len(OBS_KEY + "."):]: value for key, value in env_result.non_tensor_batch.items() if key.startswith(OBS_KEY + ".")}
-                )
-                trajectories[stage_id][-1][FEEDBACK_KEY] = feedback
-                if step_idx < self.max_interactions - 1:
+                intervention_info = get_dataproto_from_prefix(env_result, INTERVENTION_INFO_KEY, ".")
+                next_obs = get_dataproto_from_prefix(env_result, OBS_KEY, ".")
+
+                expanded_steps = []
+                effective_steps = 1
+                current_slot = trajectories[stage_id].pop()
+                has_intervention = self.single_env_rollout and intervention_info.batch is not None
+                if has_intervention:
+                    expanded_steps = self._expand_single_env_intervention_steps(
+                        current_obs=current_slot[OBS_KEY],
+                        rollout_action=stored_action_result,
+                        feedback=feedback,
+                        intervention_info=intervention_info,
+                        max_chunks=self.max_interactions - step_idx,
+                    )
+
+                if expanded_steps:
+                    trajectories[stage_id].extend(expanded_steps)
+                    effective_steps = len(expanded_steps)
+                else:
+                    current_slot[FEEDBACK_KEY] = feedback
+                    current_slot[INTERVENTION_INFO_KEY] = intervention_info
+                    trajectories[stage_id].append(current_slot)
+
+                step_idx += effective_steps
+                if step_idx < self.max_interactions:
                     trajectories[stage_id].append({OBS_KEY: next_obs})
 
                 # send next obs to rollout worker for next step
-                if step_idx < self.max_interactions - 1:
+                if step_idx < self.max_interactions:
                     vla_input = next_obs
                     if self.single_env_rollout:
                         vla_input = vla_input.repeat(repeat_times=action_batch_size, interleave=True)
@@ -211,5 +328,5 @@ class EnvLoop:
                 per_step_values = [step[field_key].non_tensor_batch[key] for step in flat_trajs]
                 batch_dict[f"{field_key}.{key}"] = np.stack(per_step_values, axis=1)
 
-
+        print(f"Final batch dict: {DataProto.from_single_dict(batch_dict, meta_info=meta_info)}")
         return DataProto.from_single_dict(batch_dict, meta_info=meta_info)

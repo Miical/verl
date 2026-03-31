@@ -195,10 +195,8 @@ class PI0ForActionPrediction(PreTrainedModel, SupportSACTraining):
             A tuple of (pi0_output, s, a):
                 - pi0_output: The Pi0Output containing the predicted actions.
                 - s: Dictionary of tensors representing the states, with keys
-                    - "images": torch.Tensor of shape (B, n_images, C, H, W)
-                    - "image_masks": torch.Tensor of shape (B, n_images)
-                    - "lang_tokens": torch.Tensor of shape (B, L)
-                    - "lang_masks": torch.Tensor of shape (B, L)
+                    - "full_image": torch.Tensor of shape (B, H, W, C)
+                    - "wrist_image": torch.Tensor of shape (B, H, W, C)
                     - "states": torch.Tensor of shape (B, state_dim)
                 - a: Dictionary of tensors representing actions, with key:
                     - "full_action": torch.Tensor of shape (B, action_steps, action_dim)
@@ -569,6 +567,9 @@ class PI0ForActionPrediction(PreTrainedModel, SupportSACTraining):
     def sac_forward_state_features(
         self, s: dict[str, torch.Tensor]
     ) -> tuple[tuple[torch.Tensor, torch.Tensor, torch.Tensor], torch.Tensor]:
+
+        from .policy.libero_policy import LiberoPi0Input
+
         with torch.no_grad():
             pi0_input = LiberoPi0Input.from_env_obs(s)
             state = self.state_normalize_transform(pi0_input.state)
@@ -577,12 +578,12 @@ class PI0ForActionPrediction(PreTrainedModel, SupportSACTraining):
                 {"task": pi0_input.task, "observation.state": state}, tokenizer
             )
             prefix_features = self.model.embed_prefix(
-                images=s["images"].unbind(dim=1),
-                img_masks=s["image_masks"].unbind(dim=1),
-                lang_tokens=s["lang_tokens"],
-                lang_masks=s["lang_masks"],
+                images=images,
+                img_masks=pi0_input.img_masks,
+                lang_tokens=lang_tokens,
+                lang_masks=lang_masks,
             )
-        return (prefix_features, s["states"])
+        return (prefix_features, state)
 
     @override
     @torch.no_grad()

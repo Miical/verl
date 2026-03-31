@@ -5,6 +5,7 @@ import signal
 import time
 
 import draccus
+import gymnasium as gym
 
 from lerobot.rl.gym_manipulator import (
     GymManipulatorConfig, 
@@ -16,6 +17,10 @@ from lerobot.rl.gym_manipulator import (
 from lerobot.processor import TransitionKey
 from lerobot.teleoperators.utils import TeleopEvents
 from lerobot.utils.transition import Transition
+from lerobot.processor import (
+    DataProcessorPipeline,
+    EnvTransition,
+)
 from .ipc_channel import clear_ipc, recv_obj, reply_obj, setup_ipc
 
 
@@ -28,6 +33,63 @@ def _handle_stop_signal(signum, frame):
     global _STOP
     _STOP = True
     logger.info("Received signal %s, stopping lerobot runtime.", signum)
+
+def step_env_and_process_transition(
+    env: gym.Env,
+    transition: EnvTransition,
+    action: torch.Tensor,
+    env_processor: DataProcessorPipeline[EnvTransition, EnvTransition],
+    action_processor: DataProcessorPipeline[EnvTransition, EnvTransition],
+) -> EnvTransition:
+    """
+    Execute one step with processor pipeline.
+
+    Args:
+        env: The robot environment
+        transition: Current transition state
+        action: Action to execute
+        env_processor: Environment processor
+        action_processor: Action processor
+
+    Returns:
+        Processed transition with updated state.
+    """
+
+    raw = env.get_raw_joint_positions()
+    neutral_action = torch.tensor(
+        [raw[f"{k}.pos"] for k in env.robot.bus.motors], dtype=torch.float32
+    )
+    action = neutral_action
+    # Create action transition
+    transition[TransitionKey.ACTION] = action
+    transition[TransitionKey.OBSERVATION] = (
+        env.get_raw_joint_positions() if hasattr(env, "get_raw_joint_positions") else {}
+    )
+    processed_action_transition = action_processor(transition)
+    processed_action = processed_action_transition[TransitionKey.ACTION]
+
+    obs, reward, terminated, truncated, info = env.step(processed_action)
+
+    reward = reward + processed_action_transition[TransitionKey.REWARD]
+    terminated = terminated or processed_action_transition[TransitionKey.DONE]
+    truncated = truncated or processed_action_transition[TransitionKey.TRUNCATED]
+    complementary_data = processed_action_transition[TransitionKey.COMPLEMENTARY_DATA].copy()
+    # patch: Let action-processor info (teleop events) override env defaults when keys collide.
+    new_info = info.copy()
+    new_info.update(processed_action_transition[TransitionKey.INFO])
+
+    new_transition = create_transition(
+        observation=obs,
+        action=processed_action,
+        reward=reward,
+        done=terminated,
+        truncated=truncated,
+        info=new_info,
+        complementary_data=complementary_data,
+    )
+    new_transition = env_processor(new_transition)
+
+    return new_transition
 
 class LerobotRuntime:
     def __init__(self, config_path: str, rank: int, stage_id: int):
@@ -127,6 +189,10 @@ class LerobotRuntime:
             "reward": float(reward),
             "done": bool(done),
             "truncated": bool(truncated),
+            "extra_info": {
+                "is_intervention": intervention_info.get(TeleopEvents.IS_INTERVENTION, False),
+                "executed_action": executed_action,
+            }
         }
     
     def close(self):

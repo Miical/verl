@@ -184,6 +184,8 @@ class LeRobotEnv(gym.Env):
             raise RuntimeError(f"Invalid runtime reply: {reply}")
         obs = self._wrap_runtime_obs(reply["obs"])
         reward = to_tensor(np.asarray([reply["reward"]], dtype=np.float32))
+        is_intervention = reply["extra_info"]["is_intervention"]
+        executed_action = reply["extra_info"]["executed_action"]
 
         self._episode_steps += 1
         self._episode_returns += reward.numpy()
@@ -198,6 +200,7 @@ class LeRobotEnv(gym.Env):
                 "rewards": reward.numpy(),
                 "terminations": terminations.numpy(),
                 "truncations": truncations.numpy(),
+                "is_intervention": is_intervention,
                 "task": self.task_descriptions,
             }
             if critic_values is not None:
@@ -205,6 +208,8 @@ class LeRobotEnv(gym.Env):
             self.add_new_frames(obs, plot_infos)
 
         infos = {}
+        infos["is_intervention"] = is_intervention
+        infos["executed_action"] = executed_action
         done_mask = torch.logical_or(terminations, truncations)
         if done_mask.any():
             infos["final_info"] = {
@@ -224,24 +229,47 @@ class LeRobotEnv(gym.Env):
         chunk_rewards = []
         raw_chunk_terminations = []
         raw_chunk_truncations = []
+        intervention_info = {"obs": [], "actions": [], "is_intervention": []}
+        last_step_is_intervention = False
 
-        for step_idx in range(chunk_size):
-            action = chunk_actions[:, step_idx, :]
-            step_values = None
-            if chunk_values is not None:
-                if len(chunk_values.shape) == 1:
-                    step_values = chunk_values
-                elif len(chunk_values.shape) == 2:
-                    step_values = chunk_values[:, step_idx]
-            extracted_obs, step_reward, terminations, truncations, infos = self.step(action, critic_values=step_values)
+        step_idx = 0
+        while step_idx < chunk_size or last_step_is_intervention:
+            extracted_obs, step_reward, terminations, truncations, infos = self.step(
+                chunk_actions[:, min(step_idx, chunk_size - 1), :],
+                critic_values= None if last_step_is_intervention else chunk_values
+            )
+
             chunk_rewards.append(step_reward)
             raw_chunk_terminations.append(terminations)
             raw_chunk_truncations.append(truncations)
+            intervention_info["actions"].append(to_tensor(infos["executed_action"]).unsqueeze(0))
+            intervention_info["is_intervention"].append(to_tensor(infos["is_intervention"]).unsqueeze(0))
+            if (step_idx + 1) % chunk_size == 0:
+                intervention_info["obs"].append(extracted_obs)
+
+            last_step_is_intervention = infos["is_intervention"]
+            step_idx += 1
 
         chunk_rewards = torch.stack(chunk_rewards, dim=1)
         chunk_terminations = torch.stack(raw_chunk_terminations, dim=1)
         chunk_truncations = torch.stack(raw_chunk_truncations, dim=1)
 
+        infos = {}
+        intervention_obs = {
+            f"obs.{key}": torch.stack([step_obs["images_and_states"][key] for step_obs in intervention_info["obs"]], dim=1)
+            for key in intervention_info["obs"][0]["images_and_states"]
+        }
+
+        is_intervention_tensor = torch.stack(intervention_info["is_intervention"], dim=1)
+        if is_intervention_tensor.any():
+            infos["intervention_info"] = {
+                **intervention_obs,
+                "obs.task_descriptions": np.array(
+                    [step_obs["task_descriptions"] for step_obs in intervention_info["obs"]], dtype=object
+                ).transpose(1, 0),
+                "actions": torch.stack(intervention_info["actions"], dim=1),
+                "is_intervention": is_intervention_tensor
+            }
         return extracted_obs, chunk_rewards, chunk_terminations, chunk_truncations, infos
 
     def flush_video(self, video_sub_dir: Optional[str] = None):
