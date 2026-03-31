@@ -58,12 +58,12 @@ class PI0RolloutRob(NaiveRolloutRob):
         with torch.autocast(device_type=get_device_name(), dtype=torch.bfloat16):
             prompts.to(get_device_id())
             validate = bool(prompts.meta_info.get("validate", False))
-            output, s, a = self.module.sample_actions(
+            output, _, a = self.module.sample_actions(
                 prompts,
                 tokenizer=self.tokenizer,
                 validate=validate,
             )
-            state_features = self.module.sac_forward_state_features(s)
+            state_features = self.module.sac_forward_state_features(prompts, self.tokenizer)
             critic_value = (
                 self.module.sac_forward_critic(
                     {"full_action": a["full_action"]},
@@ -80,11 +80,6 @@ class PI0RolloutRob(NaiveRolloutRob):
         tensor_batch = {
             "action": output.action,
             "full_action": a["full_action"],
-            "images": s["images"],
-            "image_masks": s["image_masks"],
-            "lang_tokens": s["lang_tokens"],
-            "lang_masks": s["lang_masks"],
-            "states": s["states"],
             "critic_value": critic_value,
         }
 

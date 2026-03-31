@@ -32,8 +32,8 @@ from verl.utils.metric import reduce_metrics
 
 
 def compute_avg_positive_trajectory_length(batch: DataProto) -> float:
-    dones = batch.batch["dones"].bool()  # (B, T)
-    positive_mask = batch.batch["positive_sample_mask"]  # (B, T)
+    dones = batch.batch["info.dones"].bool()  # (B, T)
+    positive_mask = batch.batch["info.positive_sample_mask"]  # (B, T)
     positive_traj = positive_mask.any(dim=1)  # (B,)
 
     if positive_traj.sum() == 0:
@@ -47,8 +47,9 @@ def compute_avg_positive_trajectory_length(batch: DataProto) -> float:
 
 
 def flatten_trajectories(data: DataProto) -> DataProto:
-    batch_size, num_steps = data.batch["action"].shape[:2]
+    batch_size, num_steps = data.batch["action.action"].shape[:2]
     new_batch_fields = {}
+    new_non_tensor_fields = {}
     for key, tensor in data.batch.items():
         if len(tensor.shape) >= 2 and tensor.shape[0] == batch_size and tensor.shape[1] == num_steps:
             # (B, S, H, W) -> (B*S, H, W)
@@ -59,13 +60,25 @@ def flatten_trajectories(data: DataProto) -> DataProto:
             new_batch_fields[key] = tensor.repeat_interleave(num_steps)
         else:
             new_batch_fields[key] = tensor
-    new_data = DataProto.from_dict(tensors=new_batch_fields, meta_info=data.meta_info)
+    for key, array in data.non_tensor_batch.items():
+        if array.ndim >= 2 and array.shape[0] == batch_size and array.shape[1] == num_steps:
+            new_non_tensor_fields[key] = array.reshape(batch_size * num_steps, *array.shape[2:])
+        elif array.ndim == 1 and array.shape[0] == batch_size:
+            new_non_tensor_fields[key] = np.repeat(array, num_steps, axis=0)
+        else:
+            new_non_tensor_fields[key] = array
+    new_data = DataProto.from_dict(
+        tensors=new_batch_fields,
+        non_tensors=new_non_tensor_fields,
+        meta_info=data.meta_info,
+    )
     return new_data
 
 
 def add_transition_prefixes(data: DataProto) -> DataProto:
     batch = data.batch
-    step_key = "action" if "action" in batch else "full_action"
+    non_tensor_batch = data.non_tensor_batch
+    step_key = "action.full_action" if "action.full_action" in batch else "action.action"
     if step_key not in batch:
         return data
 
@@ -73,29 +86,30 @@ def add_transition_prefixes(data: DataProto) -> DataProto:
     if num_steps <= 1:
         return data
 
-    def drop_last(tensor: torch.Tensor) -> torch.Tensor:
-        return tensor[:, :-1, ...]
+    def slice_steps(x, start: int, end: int | None):
+        return x[:, slice(start, end), ...]
 
-    def shift_next(tensor: torch.Tensor) -> torch.Tensor:
-        return tensor[:, 1:, ...]
+    keys = ["obs.full_image", "obs.wrist_image", "obs.state", "action.full_action", "action.action"]
+    non_tensor_keys = ["obs.task_descriptions"]
 
-    state_keys = ["states", "images", "image_masks", "lang_tokens", "lang_masks"]
-    action_keys = ["full_action", "action"]
-
-    for key in state_keys:
+    for key in keys:
         if key in batch:
-            batch[f"s0.{key}"] = drop_last(batch[key])
-            batch[f"s1.{key}"] = shift_next(batch[key])
+            batch[f"t0.{key}"] = slice_steps(batch[key], 0, -1)
+            batch[f"t1.{key}"] = slice_steps(batch[key], 1, None)
 
-    for key in action_keys:
-        if key in batch:
-            batch[f"a0.{key}"] = drop_last(batch[key])
-            batch[f"a1.{key}"] = shift_next(batch[key])
+    for key in non_tensor_keys:
+        if key in non_tensor_batch:
+            non_tensor_batch[f"t0.{key}"] = slice_steps(non_tensor_batch[key], 0, -1)
+            non_tensor_batch[f"t1.{key}"] = slice_steps(non_tensor_batch[key], 1, None)
 
     batch_size = batch[step_key].shape[0]
     for key, tensor in list(batch.items()):
         if tensor.ndim >= 2 and tensor.shape[0] == batch_size and tensor.shape[1] == num_steps:
-            batch[key] = drop_last(tensor)
+            batch[key] = slice_steps(tensor, 0, -1)
+
+    for key, array in list(non_tensor_batch.items()):
+        if array.ndim >= 2 and array.shape[0] == batch_size and array.shape[1] == num_steps:
+            non_tensor_batch[key] = slice_steps(array, 0, -1)
 
     return data
 
@@ -223,31 +237,31 @@ class RobRaySACTrainer(RayPPOTrainer):
 
     def _prepare_actor_input(self, rollout_output: Optional[DataProto]) -> DataProto:
         # dones
-        complete_any = rollout_output.batch["complete"].any(dim=-1)  # (B, T)
+        complete_any = rollout_output.batch["feedback.terminations"].any(dim=-1)  # (B, T)
         dones_step = complete_any.clone()
         dones_step[:, -2] = True
-        rollout_output.batch["dones"] = dones_step.float()
+        rollout_output.batch["info.dones"] = dones_step.float()
 
         # reward (sparse reward with step penalty)
         sparse_rewards = complete_any.float()
-        rollout_output.batch["valids"] = (~rollout_output.batch["complete"]).any(dim=-1).float()
+        rollout_output.batch["info.valids"] = (~rollout_output.batch["feedback.terminations"]).any(dim=-1).float()
         step_penalty = float(self.config.env.train.get("step_penalty", 0.0))
-        rollout_output.batch["rewards"] = sparse_rewards - step_penalty * rollout_output.batch["valids"]
-        rollout_output.batch["rewards"][:, -2] = -1.0
+        rollout_output.batch["info.rewards"] = sparse_rewards - step_penalty * rollout_output.batch["info.valids"]
+        rollout_output.batch["info.rewards"][:, -2] = -1.0
 
         # mark samples in successful trajectories as positive samples
-        rollout_output.batch["positive_sample_mask"] = (
-            sparse_rewards.any(dim=-1).unsqueeze(-1).repeat_interleave(rollout_output.batch["action"].shape[1], dim=-1)
+        rollout_output.batch["info.positive_sample_mask"] = (
+            sparse_rewards.any(dim=-1).unsqueeze(-1).repeat_interleave(rollout_output.batch["action.action"].shape[1], dim=-1)
         )
 
         # task id
         task_ids = rollout_output.meta_info["task_ids"]
         if self.config.env.train.get("single_env_rollout", False):
             task_ids = task_ids[:1]
-        rollout_output.batch["task_ids"] = torch.as_tensor(
+        rollout_output.batch["info.task_ids"] = torch.as_tensor(
             task_ids,
             dtype=torch.long,
-            device=rollout_output.batch["action"].device,
+            device=rollout_output.batch["action.action"].device,
         )
 
         rollout_output.meta_info["global_token_num"] = [0]

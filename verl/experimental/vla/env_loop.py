@@ -26,6 +26,12 @@ from verl.single_controller.ray import RayWorkerGroup
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
+OBS_KEY = "obs"
+ACTION_KEY = "action"
+FEEDBACK_KEY = "feedback"
+
+FEEDBACK_FIELDS = ["rewards", "terminations", "truncations"]
+
 
 class EnvLoop:
     """An env loop manages interactions between models and vectorized environments. It's designed for computationally
@@ -43,6 +49,7 @@ class EnvLoop:
         self.env_wg = env_wg
         self.rollout_wg = rollout_wg
         self.config = config
+
         # Extract relevant configuration
         self.max_interactions = config.env.train.max_episode_steps // config.env.actor.model.num_action_chunks
         self.stage_num = config.env.rollout.pipeline_stage_num
@@ -94,33 +101,32 @@ class EnvLoop:
         Returns:
             DataProto: A batch containing the complete trajectories.
         """
-        initial_state_ids = prompts.non_tensor_batch["state_ids"]
-        if self.single_env_rollout:
-            initial_state_ids = initial_state_ids[:1]
+        trajectories = {i: [] for i in range(self.stage_num)}  
 
+        initial_state_ids = prompts.non_tensor_batch["state_ids"]
         staged_obs = self._restructure_obs_data(reset_results)
+        for stage_id in range(self.stage_num):
+            trajectories[stage_id].append({OBS_KEY: staged_obs[stage_id]})
         if self.single_env_rollout:
             staged_obs = [staged_obs[0].repeat(repeat_times=len(prompts), interleave=True)]
-        # --- Pipeline state ---
-        trajectories = {i: [] for i in range(self.stage_num)}  # To store (obs, action, rew, done) tuples
-        rollout_futures = {}
-        # is_complete = torch.zeros((self.total_envs,), dtype=torch.bool)
 
+        # --- Pipeline state ---
+        rollout_futures = {}
         for stage_id in range(self.stage_num):
-            # trajectories[stage_id].append({'obs': staged_obs[stage_id]})
-            trajectories[stage_id].append({})
             vla_input = staged_obs[stage_id]
             vla_input.meta_info = prompts.meta_info  # Pass along rollout config
             rollout_futures[stage_id] = self.rollout_wg.generate_sequences(vla_input)
 
         async def _stage_loop(stage_id: int):
             for step_idx in range(self.max_interactions):
+                # get actions from rollout worker
                 if stage_id == 0:
                     logger.info(f"[{step_idx}/{self.max_interactions - 1}] rollout step")
                 action_result: DataProto = await asyncio.to_thread(rollout_futures[stage_id].get)
 
+                # send actions to env worker 
                 stored_action_result = action_result[:1] if self.single_env_rollout else action_result
-                trajectories[stage_id][-1]["action"] = stored_action_result
+                trajectories[stage_id][-1][ACTION_KEY] = stored_action_result
                 action_batch_size = len(action_result)
                 if self.single_env_rollout:
                     env_action = action_result.batch["action"][:1].cpu().numpy()
@@ -135,23 +141,29 @@ class EnvLoop:
                     },
                     meta_info={"stage_id": stage_id},
                 )
-
                 env_ref = self.env_wg.env_interact_step(action_data)
+
+                # get results from env worker
                 env_result: DataProto = await asyncio.to_thread(env_ref.get)
-                stored_env_result = env_result[:1] if self.single_env_rollout else env_result
+                trajectories[stage_id][-1][FEEDBACK_KEY] = DataProto.from_dict(
+                    tensors={field: env_result.batch[field] for field in FEEDBACK_FIELDS}
+                )
+                if step_idx < self.max_interactions - 1:
+                    trajectories[stage_id].append({OBS_KEY: DataProto.from_dict(
+                        tensors={key[len(OBS_KEY + "."):]: value for key, value in env_result.batch.items() if key.startswith(OBS_KEY + ".")},  
+                        non_tensors={key[len(OBS_KEY + "."):]: value for key, value in env_result.non_tensor_batch.items() if key.startswith(OBS_KEY + ".")}
+                    )})
                 if self.single_env_rollout:
                     env_result = env_result.repeat(repeat_times=action_batch_size, interleave=True)
 
-                trajectories[stage_id][-1]["rew"] = stored_env_result.batch["rews"]
-                trajectories[stage_id][-1]["done"] = stored_env_result.batch["terminations"]
-
-                next_obs = DataProto(
-                    batch=env_result.batch.select("full_image", "wrist_image", "state"),
-                    non_tensor_batch={"task_descriptions": env_result.non_tensor_batch["task_descriptions"]},
+                # send next obs to rollout worker for next step
+                obs_tensors = { key[len(OBS_KEY + "."):]: value for key, value in env_result.batch.items() if key.startswith(OBS_KEY + ".") }
+                non_tensor_batch = { key[len(OBS_KEY + "."):]: value for key, value in env_result.non_tensor_batch.items() if key.startswith(OBS_KEY + ".") }
+                next_obs = DataProto.from_dict(
+                    tensors=obs_tensors,
+                    non_tensors=non_tensor_batch,
                 )
-
                 if step_idx < self.max_interactions - 1:
-                    trajectories[stage_id].append({})
                     vla_input = next_obs
                     vla_input.meta_info = prompts.meta_info
                     rollout_futures[stage_id] = self.rollout_wg.generate_sequences(vla_input)
@@ -196,14 +208,14 @@ class EnvLoop:
                         elif isinstance(value, torch.Tensor):
                             flat_trajs[step_idx][key] = torch.cat([flat_trajs[step_idx][key], value], dim=0)
 
-        # iterate all action batch keys (e.g., action, images, pixel_values, input_ids, ...)
         batch_dict = {}
-        action_batch_keys = list(flat_trajs[0]["action"].batch.keys())
-        for key in action_batch_keys:
-            per_step_values = [step["action"].batch[key] for step in flat_trajs]
-            batch_dict[key] = torch.stack(per_step_values, dim=1)
+        for field_key in [OBS_KEY, ACTION_KEY, FEEDBACK_KEY]:
+            for key in flat_trajs[0][field_key].batch.keys():
+                per_step_values = [step[field_key].batch[key] for step in flat_trajs]
+                batch_dict[f"{field_key}.{key}"] = torch.stack(per_step_values, dim=1)
+            for key in flat_trajs[0][field_key].non_tensor_batch.keys():
+                per_step_values = [step[field_key].non_tensor_batch[key] for step in flat_trajs]
+                batch_dict[f"{field_key}.{key}"] = np.stack(per_step_values, axis=1)
 
-        batch_dict["complete"] = torch.stack([step["done"] for step in flat_trajs], dim=1).squeeze(-1)
-        batch_dict["env_state_id"] = torch.from_numpy(initial_state_ids.astype(int))
 
         return DataProto.from_single_dict(batch_dict, meta_info=meta_info)

@@ -17,17 +17,23 @@ import os
 from dataclasses import dataclass
 from typing import Any, Optional, Sequence
 
+import numpy as np
 import torch
 from tensordict import TensorDict
+
+from verl.protocol import DataProto
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
+VALID_KEY = "info.valids"
+POSITIVE_SAMPLE_MASK_KEY = "info.positive_sample_mask"
+
 
 @dataclass
 class _DualPoolState:
-    positive_pool: Optional[TensorDict] = None
-    negative_pool: Optional[TensorDict] = None
+    positive_pool: Optional[DataProto] = None
+    negative_pool: Optional[DataProto] = None
     positive_size: int = 0
     negative_size: int = 0
     positive_position: int = 0
@@ -62,28 +68,28 @@ class SACReplayPool:
 
         self.rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
 
-    def add_batch(self, batch: TensorDict, task_ids: Sequence[Any]):
+    def add_batch(self, batch: DataProto, task_ids: Sequence[Any]):
         """Add a batch of samples into task-specific positive/negative pools."""
 
-        if batch.batch_size[0] == 0:
+        if len(batch) == 0:
             return
 
-        if len(task_ids) != batch.batch_size[0]:
-            raise ValueError(f"task_ids length ({len(task_ids)}) must match batch size ({batch.batch_size[0]}).")
+        if len(task_ids) != len(batch):
+            raise ValueError(f"task_ids length ({len(task_ids)}) must match batch size ({len(batch)}).")
 
-        valid_mask = batch["valids"].to(torch.bool)
+        valid_mask = batch.batch[VALID_KEY].to(torch.bool)
         valid_indices = torch.nonzero(valid_mask, as_tuple=False).squeeze(-1)
         if valid_indices.numel() == 0:
             return
 
-        batch = self._index_select_batch(batch, valid_indices.to(batch.device))
+        batch = self._index_select_batch(batch, valid_indices)
         selected = valid_indices.cpu().tolist()
         task_ids = [task_ids[i] for i in selected]
 
         positive_mask = self._extract_positive_mask(batch)
 
         grouped_indices: dict[str, dict[str, list[int]]] = {}
-        for idx in range(batch.batch_size[0]):
+        for idx in range(len(batch)):
             task_key = self._normalize_task_id(task_ids[idx])
             if task_key not in grouped_indices:
                 grouped_indices[task_key] = {"positive": [], "negative": []}
@@ -96,12 +102,12 @@ class SACReplayPool:
             pool_state = self._get_or_create_task_pool(task_key, batch)
 
             if groups["positive"]:
-                positive_idx = torch.tensor(groups["positive"], device=batch.device, dtype=torch.long)
+                positive_idx = torch.tensor(groups["positive"], device=valid_indices.device, dtype=torch.long)
                 positive_batch = self._index_select_batch(batch, positive_idx)
                 self._insert_block_to_pool(pool_state, positive_batch, is_positive_pool=True)
 
             if groups["negative"]:
-                negative_idx = torch.tensor(groups["negative"], device=batch.device, dtype=torch.long)
+                negative_idx = torch.tensor(groups["negative"], device=valid_indices.device, dtype=torch.long)
                 negative_batch = self._index_select_batch(batch, negative_idx)
                 self._insert_block_to_pool(pool_state, negative_batch, is_positive_pool=False)
 
@@ -112,7 +118,7 @@ class SACReplayPool:
         batch_size: int,
         positive_sample_ratio: float = 0.5,
         return_sample_info: bool = False,
-    ) -> TensorDict | tuple[TensorDict, dict]:
+    ) -> DataProto | tuple[DataProto, dict]:
         """Sample a batch from all task-specific pools."""
 
         if self.size == 0:
@@ -157,27 +163,13 @@ class SACReplayPool:
         if len(sampled_parts) == 1:
             sampled_batch = sampled_parts[0]
         else:
-            sampled_batch = TensorDict(
-                {key: torch.cat([part[key] for part in sampled_parts], dim=0) for key in sampled_parts[0].keys()},
-                batch_size=[sampled_count],
-                device=self.sample_device,
-            )
+            sampled_batch = DataProto.concat(sampled_parts)
 
         if sampled_count < batch_size:
             sampled_batch = self._pad_sampled_batch(sampled_batch, target_batch_size=batch_size)
-        else:
-            sampled_batch = TensorDict(
-                {key: value for key, value in sampled_batch.items()},
-                batch_size=[batch_size],
-                device=self.sample_device,
-            )
 
         shuffle_idx = torch.randperm(batch_size, device=self.sample_device)
-        sampled_batch = TensorDict(
-            {key: value.index_select(0, shuffle_idx) for key, value in sampled_batch.items()},
-            batch_size=[batch_size],
-            device=self.sample_device,
-        )
+        sampled_batch = self._index_select_batch(sampled_batch, shuffle_idx)
 
         if not return_sample_info:
             return sampled_batch
@@ -192,13 +184,13 @@ class SACReplayPool:
 
     def insert_and_resample(
         self,
-        source: TensorDict,
+        source: DataProto,
         task_ids: Sequence[Any],
-    ) -> TensorDict:
+    ) -> DataProto:
         """Insert source into replay pool and sample a batch with the same size."""
 
         self.add_batch(source, task_ids=task_ids)
-        return self.sample_batch(source.batch_size[0])
+        return self.sample_batch(len(source))
 
     def save(self, directory: str):
         """Save the replay pool to a directory."""
@@ -211,8 +203,10 @@ class SACReplayPool:
             assert pool_state.positive_pool is not None
             assert pool_state.negative_pool is not None
             tasks_payload[task_id] = {
-                "positive_pool": pool_state.positive_pool.cpu(),
-                "negative_pool": pool_state.negative_pool.cpu(),
+                "positive_pool_batch": pool_state.positive_pool.batch.cpu(),
+                "positive_pool_non_tensor_batch": pool_state.positive_pool.non_tensor_batch,
+                "negative_pool_batch": pool_state.negative_pool.batch.cpu(),
+                "negative_pool_non_tensor_batch": pool_state.negative_pool.non_tensor_batch,
                 "positive_size": pool_state.positive_size,
                 "negative_size": pool_state.negative_size,
                 "positive_position": pool_state.positive_position,
@@ -221,7 +215,7 @@ class SACReplayPool:
 
         payload = {
             "meta_info": {
-                "version": 3,
+                "version": 4,
                 "single_pool_capacity": self.single_pool_capacity,
                 "pool_device": self.pool_device,
                 "sample_device": self.sample_device,
@@ -249,14 +243,28 @@ class SACReplayPool:
         payload = torch.load(filepath, weights_only=False)
         meta_info = payload["meta_info"]
         tasks_payload = payload["tasks"]
+        version = int(meta_info.get("version", 3))
 
         self.single_pool_capacity = int(meta_info["single_pool_capacity"])
         self.task_pools = {}
 
         for task_id, task_payload in tasks_payload.items():
+            if version >= 4:
+                positive_pool = DataProto(
+                    batch=task_payload["positive_pool_batch"].to(self.pool_device),
+                    non_tensor_batch=task_payload["positive_pool_non_tensor_batch"],
+                )
+                negative_pool = DataProto(
+                    batch=task_payload["negative_pool_batch"].to(self.pool_device),
+                    non_tensor_batch=task_payload["negative_pool_non_tensor_batch"],
+                )
+            else:
+                positive_pool = DataProto(batch=task_payload["positive_pool"].to(self.pool_device), non_tensor_batch={})
+                negative_pool = DataProto(batch=task_payload["negative_pool"].to(self.pool_device), non_tensor_batch={})
+
             pool_state = _DualPoolState(
-                positive_pool=task_payload["positive_pool"].to(self.pool_device),
-                negative_pool=task_payload["negative_pool"].to(self.pool_device),
+                positive_pool=positive_pool,
+                negative_pool=negative_pool,
                 positive_size=int(task_payload["positive_size"]),
                 negative_size=int(task_payload["negative_size"]),
                 positive_position=int(task_payload["positive_position"]),
@@ -299,57 +307,75 @@ class SACReplayPool:
     def _insert_block_to_pool(
         self,
         pool_state: _DualPoolState,
-        source: TensorDict,
+        source: DataProto,
         is_positive_pool: bool,
     ):
         """Insert a block of data from source into one task pool."""
 
-        source_size = source.batch_size[0]
+        source_size = len(source)
         if source_size == 0:
             return
 
         length = min(source_size, self.single_pool_capacity)
         idx = torch.arange(length, device=self.pool_device)
+        idx_np = idx.cpu().numpy()
 
         if is_positive_pool:
             assert pool_state.positive_pool is not None
             idx = (pool_state.positive_position + idx) % self.single_pool_capacity
-            for key in source.keys():
-                pool_state.positive_pool[key].index_copy_(0, idx, source[key][:length].to(self.pool_device))
+            idx_np = idx.cpu().numpy()
+            for key in source.batch.keys():
+                pool_state.positive_pool.batch[key].index_copy_(0, idx, source.batch[key][:length].to(self.pool_device))
+            for key in source.non_tensor_batch.keys():
+                pool_state.positive_pool.non_tensor_batch[key][idx_np] = source.non_tensor_batch[key][:length]
 
             pool_state.positive_position = (pool_state.positive_position + length) % self.single_pool_capacity
             pool_state.positive_size = min(pool_state.positive_size + length, self.single_pool_capacity)
         else:
             assert pool_state.negative_pool is not None
             idx = (pool_state.negative_position + idx) % self.single_pool_capacity
-            for key in source.keys():
-                pool_state.negative_pool[key].index_copy_(0, idx, source[key][:length].to(self.pool_device))
+            idx_np = idx.cpu().numpy()
+            for key in source.batch.keys():
+                pool_state.negative_pool.batch[key].index_copy_(0, idx, source.batch[key][:length].to(self.pool_device))
+            for key in source.non_tensor_batch.keys():
+                pool_state.negative_pool.non_tensor_batch[key][idx_np] = source.non_tensor_batch[key][:length]
 
             pool_state.negative_position = (pool_state.negative_position + length) % self.single_pool_capacity
             pool_state.negative_size = min(pool_state.negative_size + length, self.single_pool_capacity)
 
-    def _get_or_create_task_pool(self, task_id: str, sample: TensorDict) -> _DualPoolState:
+    def _get_or_create_task_pool(self, task_id: str, sample: DataProto) -> _DualPoolState:
         if task_id in self.task_pools:
             return self.task_pools[task_id]
 
         logger.info(
             f"Initializing replay pools for task_id={task_id} with single_pool_capacity={self.single_pool_capacity}"
         )
-        pool_template = TensorDict(
+        batch_template = TensorDict(
             {
                 key: torch.zeros(
                     (self.single_pool_capacity, *value.shape[1:]),
                     dtype=value.dtype,
                     device=self.pool_device,
                 )
-                for key, value in sample.items()
+                for key, value in sample.batch.items()
             },
             batch_size=[self.single_pool_capacity],
             device=self.pool_device,
         )
+        non_tensor_template = {
+            key: np.empty((self.single_pool_capacity, *value.shape[1:]), dtype=value.dtype)
+            for key, value in sample.non_tensor_batch.items()
+        }
+        pool_template = DataProto(batch=batch_template, non_tensor_batch=non_tensor_template)
         pool_state = _DualPoolState(
-            positive_pool=pool_template.clone(),
-            negative_pool=pool_template.clone(),
+            positive_pool=DataProto(
+                batch=pool_template.batch.clone(),
+                non_tensor_batch={key: value.copy() for key, value in pool_template.non_tensor_batch.items()},
+            ),
+            negative_pool=DataProto(
+                batch=pool_template.batch.clone(),
+                non_tensor_batch={key: value.copy() for key, value in pool_template.non_tensor_batch.items()},
+            ),
             positive_size=0,
             negative_size=0,
             positive_position=0,
@@ -358,43 +384,44 @@ class SACReplayPool:
         self.task_pools[task_id] = pool_state
         return pool_state
 
-    def _extract_positive_mask(self, batch: TensorDict) -> torch.Tensor:
-        positive_mask = batch["positive_sample_mask"].to(torch.bool)
+    def _extract_positive_mask(self, batch: DataProto) -> torch.Tensor:
+        positive_mask = batch.batch[POSITIVE_SAMPLE_MASK_KEY].to(torch.bool)
         if positive_mask.ndim == 1:
             return positive_mask
         return positive_mask.reshape(positive_mask.shape[0], -1).any(dim=1)
 
-    def _pad_sampled_batch(self, sampled_batch: TensorDict, target_batch_size: int) -> TensorDict:
-        current_size = sampled_batch.batch_size[0]
+    def _pad_sampled_batch(self, sampled_batch: DataProto, target_batch_size: int) -> DataProto:
+        current_size = len(sampled_batch)
         if current_size >= target_batch_size:
             return sampled_batch
 
         pad_size = target_batch_size - current_size
-        pad_idx = torch.zeros(pad_size, dtype=torch.long, device=self.sample_device)
-        padded_batch = TensorDict(
-            {key: torch.cat([value, value.index_select(0, pad_idx)], dim=0) for key, value in sampled_batch.items()},
-            batch_size=[target_batch_size],
-            device=self.sample_device,
-        )
+        pad_idx = torch.zeros(pad_size, dtype=torch.long)
+        padded_batch = DataProto.concat([sampled_batch, self._index_select_batch(sampled_batch, pad_idx)])
 
-        valid_tensor = padded_batch["valids"].clone()
+        valid_tensor = padded_batch.batch[VALID_KEY].clone()
         if valid_tensor.dtype == torch.bool:
             valid_tensor[current_size:] = False
         else:
             valid_tensor[current_size:] = 0
-        padded_batch["valids"] = valid_tensor
+        padded_batch.batch[VALID_KEY] = valid_tensor
 
         return padded_batch
 
-    def _index_select_batch(self, batch: TensorDict, idx: torch.Tensor) -> TensorDict:
+    def _index_select_batch(self, batch: DataProto, idx: torch.Tensor) -> DataProto:
         length = int(idx.numel())
-        return TensorDict(
-            {key: value.index_select(0, idx) for key, value in batch.items()},
-            batch_size=[length],
-            device=batch.device,
+        idx = idx.to(torch.long)
+        idx_np = idx.detach().cpu().numpy()
+        return DataProto(
+            batch=TensorDict(
+                {key: value.index_select(0, idx.to(value.device)) for key, value in batch.batch.items()},
+                batch_size=[length],
+                device=batch.batch.device,
+            ),
+            non_tensor_batch={key: value[idx_np] for key, value in batch.non_tensor_batch.items()},
         )
 
-    def _sample_from_task_pools(self, batch_size: int, is_positive_pool: bool) -> TensorDict:
+    def _sample_from_task_pools(self, batch_size: int, is_positive_pool: bool) -> DataProto:
         task_sizes = {
             task_id: (pool_state.positive_size if is_positive_pool else pool_state.negative_size)
             for task_id, pool_state in self.task_pools.items()
@@ -412,27 +439,27 @@ class SACReplayPool:
         if len(sampled_parts) == 1:
             return sampled_parts[0]
 
-        return TensorDict(
-            {key: torch.cat([part[key] for part in sampled_parts], dim=0) for key in sampled_parts[0].keys()},
-            batch_size=[batch_size],
-            device=self.sample_device,
-        )
+        return DataProto.concat(sampled_parts)
 
     def _sample_from_single_task_pool(
         self,
         pool_state: _DualPoolState,
         batch_size: int,
         is_positive_pool: bool,
-    ) -> TensorDict:
+    ) -> DataProto:
         pool = pool_state.positive_pool if is_positive_pool else pool_state.negative_pool
         size = pool_state.positive_size if is_positive_pool else pool_state.negative_size
         assert pool is not None
 
         idx = torch.randperm(size, device=self.pool_device)[:batch_size]
-        return TensorDict(
-            {key: value.index_select(0, idx).to(self.sample_device) for key, value in pool.items()},
-            batch_size=[batch_size],
-            device=self.sample_device,
+        idx_np = idx.cpu().numpy()
+        return DataProto(
+            batch=TensorDict(
+                {key: value.index_select(0, idx).to(self.sample_device) for key, value in pool.batch.items()},
+                batch_size=[batch_size],
+                device=self.sample_device,
+            ),
+            non_tensor_batch={key: value[idx_np] for key, value in pool.non_tensor_batch.items()},
         )
 
     def _allocate_counts_across_tasks(self, task_sizes: dict[str, int], total_count: int) -> dict[str, int]:

@@ -22,7 +22,6 @@ from typing import Optional
 import numpy as np
 import torch
 import torch.nn.functional as F
-from tensordict import TensorDict
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from typing_extensions import override
 
@@ -36,25 +35,29 @@ logger = logging.getLogger(__name__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 
-def get_dict_from_prefix(tensordict: TensorDict, prefix: str) -> dict:
-    """Extract a sub-dictionary from a TensorDict based on a given prefix.
+def get_dataproto_from_prefix(data: DataProto, prefix: str) -> DataProto:
+    """Extract a sub-DataProto from a DataProto based on a given prefix.
 
     Args:
-        tensordict: The input TensorDict containing various keys.
+        data: The input DataProto containing various keys.
         prefix: The prefix string to filter keys.
     Returns:
-        A dictionary containing key-value pairs from the TensorDict
-        where the keys start with the specified prefix. The prefix is removed
-        from the keys in the resulting dictionary.
+        A DataProto containing tensor and non-tensor entries whose keys start
+        with the specified prefix. The prefix is removed from the result keys.
     """
 
-    result = {}
     prefix_length = len(prefix)
-    for key in tensordict.keys():
+    tensor_batch = {}
+    non_tensor_batch = {}
+    for key in data.batch.keys():
         if key.startswith(prefix):
             new_key = key[prefix_length:]
-            result[new_key] = tensordict[key]
-    return result
+            tensor_batch[new_key] = data.batch[key]
+    for key in data.non_tensor_batch.keys():
+        if key.startswith(prefix):
+            new_key = key[prefix_length:]
+            non_tensor_batch[new_key] = data.non_tensor_batch[key]
+    return DataProto.from_dict(tensors=tensor_batch, non_tensors=non_tensor_batch, meta_info=data.meta_info)
 
 
 def merge_nested_dicts_or_tuples(a: dict | tuple, b: dict | tuple) -> dict | tuple:
@@ -315,17 +318,17 @@ class RobDataParallelSACActor(BaseSACActor):
         return critic_loss
 
     def _forward_critic(
-        self, micro_batch: TensorDict, resample=True
+        self, micro_batch: DataProto, resample=True
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        s0 = get_dict_from_prefix(micro_batch, "s0.")
-        s1 = get_dict_from_prefix(micro_batch, "s1.")
-        a0 = get_dict_from_prefix(micro_batch, "a0.")
-        a1 = get_dict_from_prefix(micro_batch, "a1.")
+        s0 = get_dataproto_from_prefix(micro_batch, "t0.obs.")
+        s1 = get_dataproto_from_prefix(micro_batch, "t1.obs.")
+        a0 = get_dataproto_from_prefix(micro_batch, "t0.action.").batch
+        a1 = get_dataproto_from_prefix(micro_batch, "t1.action.").batch
 
         with torch.autocast(device_type=get_device_name(), dtype=torch.bfloat16):
             with torch.no_grad():
-                s = merge_nested_dicts_or_tuples(s0, s1)
-                state_features = self.actor_module.sac_forward_state_features(s)
+                s = DataProto.concat([s0, s1])
+                state_features = self.actor_module.sac_forward_state_features(s, self.tokenizer)
                 s0_state_features, s1_state_features = split_nested_dicts_or_tuples(state_features, 2)
                 if resample:
                     a1_actions, log_probs_1, _ = self.actor_module.sac_forward_actor(
@@ -354,23 +357,23 @@ class RobDataParallelSACActor(BaseSACActor):
             critic_loss = self._calculate_critic_loss(
                 q_predict=q_values_0,
                 q_target=q_values_1,
-                rewards=micro_batch["rewards"],
-                dones=micro_batch["dones"],
+                rewards=micro_batch.batch["info.rewards"],
+                dones=micro_batch.batch["info.dones"],
                 next_log_prob=log_probs_1,
-                valids=micro_batch["valids"],
+                valids=micro_batch.batch["info.valids"],
             )
         return critic_loss, q_values_0, q_values_1
 
     def _forward_actor(
         self,
-        micro_batch: TensorDict,
+        micro_batch: DataProto,
         is_first_micro_batch: bool,
     ) -> tuple[torch.Tensor, Optional[torch.Tensor], torch.Tensor, dict[str, float]]:
         micro_batch = micro_batch.to(get_device_id())
-        s0 = get_dict_from_prefix(micro_batch, "s0.")
+        s0 = get_dataproto_from_prefix(micro_batch, "t0.obs.")
 
         with torch.autocast(device_type=get_device_name(), dtype=torch.bfloat16):
-            s0_state_features = self.actor_module.sac_forward_state_features(s0)
+            s0_state_features = self.actor_module.sac_forward_state_features(s0, self.tokenizer)
             a0_actions, log_probs_0, actor_forward_metrics = self.actor_module.sac_forward_actor(
                 s0_state_features,
                 is_first_micro_batch=is_first_micro_batch,
@@ -386,13 +389,13 @@ class RobDataParallelSACActor(BaseSACActor):
             sac_loss = self._calculate_actor_loss(
                 log_probs=log_probs_0,
                 q_values=q_values_0,
-                valids=micro_batch["valids"],
+                valids=micro_batch.batch["info.valids"],
             )
             if self.bc_loss_coef > 0:
                 bc_loss = self.actor_module.bc_loss(
                     state_features=s0_state_features,
                     actions={"full_action": a0_actions},
-                    valids=micro_batch["valids"],
+                    valids=micro_batch.batch["info.valids"],
                 )
                 actor_loss = sac_loss + self.bc_loss_coef * bc_loss
             else:
@@ -408,32 +411,34 @@ class RobDataParallelSACActor(BaseSACActor):
         if not self.actor_ema_initialized:
             self._init_actor_ema()
 
-        # self._force_set_lr(self.actor_optimizer, 5e-6)
-        # self._force_set_lr(self.critic_optimizer, 1e-4)
+        self._force_set_lr(self.actor_optimizer, 5e-6)
+        self._force_set_lr(self.critic_optimizer, 1e-4)
 
         if "empty_batch" not in data.meta_info:
-            task_ids = data.batch["task_ids"]
+            print(f"add batch: {data}")
+
+            task_ids = data.batch["info.task_ids"]
             self.replay_pool.add_batch(
                 data.select(
-                    [
-                        "a0.full_action",
-                        "a1.full_action",
-                        "s0.states",
-                        "s1.states",
-                        "s0.images",
-                        "s1.images",
-                        "s0.image_masks",
-                        "s1.image_masks",
-                        "s0.lang_tokens",
-                        "s1.lang_tokens",
-                        "s0.lang_masks",
-                        "s1.lang_masks",
-                        "rewards",
-                        "dones",
-                        "valids",
-                        "positive_sample_mask",
-                    ]
-                ).batch,
+                    batch_keys=[
+                        "t0.obs.state",
+                        "t0.obs.full_image",
+                        "t0.obs.wrist_image",
+                        "t0.action.full_action",
+                        "info.rewards",
+                        "info.dones",
+                        "info.valids",
+                        "info.positive_sample_mask",
+                        "t1.obs.state",
+                        "t1.obs.full_image",
+                        "t1.obs.wrist_image",
+                        "t1.action.full_action",
+                    ],
+                    non_tensor_batch_keys=[
+                        "t0.obs.task_descriptions", 
+                        "t1.obs.task_descriptions"
+                    ],
+                ),
                 task_ids=task_ids,
             )
 
@@ -509,7 +514,7 @@ class RobDataParallelSACActor(BaseSACActor):
                 self.alpha_optimizer.zero_grad()
                 for micro_batch, log_probs in zip(micro_batches, actor_logprobs_list, strict=False):
                     micro_batch = micro_batch.to(get_device_id())
-                    raw_alpha_loss = self._calculate_alpha_loss(log_probs, micro_batch["valids"])
+                    raw_alpha_loss = self._calculate_alpha_loss(log_probs, micro_batch.batch["info.valids"])
                     (raw_alpha_loss / grad_accum_steps).backward()
                     alpha_loss_list.append(raw_alpha_loss.detach().item())
                 torch.distributed.all_reduce(self.raw_alpha.grad, op=torch.distributed.ReduceOp.SUM)
@@ -525,35 +530,35 @@ class RobDataParallelSACActor(BaseSACActor):
             self.replay_pool.save(self.config.replay_pool_save_dir)
 
         # Log metrics
+        critic_positive_mask = critic_batch.batch["info.positive_sample_mask"].to(torch.bool)
+        critic_valid_mask = critic_batch.batch["info.valids"].to(torch.bool)
         positive_qvalue_mean = (
             torch.cat(critic_qvalues_0_list)[
-                (critic_batch["positive_sample_mask"].to(torch.bool) & critic_batch["valids"].to(torch.bool)).to(
-                    torch.cat(critic_qvalues_0_list).device
-                )
+                (critic_positive_mask & critic_valid_mask).to(torch.cat(critic_qvalues_0_list).device)
             ]
             .mean()
             .detach()
             .item()
             if critic_qvalues_0_list
-            and (critic_batch["positive_sample_mask"].to(torch.bool) & critic_batch["valids"].to(torch.bool)).any()
+            and (critic_positive_mask & critic_valid_mask).any()
             else 0.0
         )
         negative_qvalue_mean = (
             torch.cat(critic_qvalues_0_list)[
-                (~critic_batch["positive_sample_mask"].to(torch.bool) & critic_batch["valids"].to(torch.bool)).to(
-                    torch.cat(critic_qvalues_0_list).device
-                )
+                (~critic_positive_mask & critic_valid_mask).to(torch.cat(critic_qvalues_0_list).device)
             ]
             .mean()
             .detach()
             .item()
             if critic_qvalues_0_list
-            and (~critic_batch["positive_sample_mask"].to(torch.bool) & critic_batch["valids"].to(torch.bool)).any()
+            and (~critic_positive_mask & critic_valid_mask).any()
             else 0.0
         )
         metrics = {
-            "data/reward_mean": valid_mean(critic_batch["rewards"], critic_batch["valids"]).detach().item(),
-            "data/valid_ratio": critic_batch["valids"].float().mean().item(),
+            "data/reward_mean": valid_mean(
+                critic_batch.batch["info.rewards"], critic_batch.batch["info.valids"]
+            ).detach().item(),
+            "data/valid_ratio": critic_batch.batch["info.valids"].float().mean().item(),
             "sac/critic_replay_sampled_ratio": critic_replay_sample_info["actual_positive_sample_ratio"],
             "sac/actor_replay_sampled_ratio": actor_replay_sample_info["actual_positive_sample_ratio"]
             if update_actor
@@ -569,12 +574,12 @@ class RobDataParallelSACActor(BaseSACActor):
             "critic/lr": self.critic_optimizer.param_groups[0]["lr"],
             "critic/grad_norm": critic_grad_norm.detach().item(),
             "critic/qvalue0_mean": (
-                valid_mean(torch.cat(critic_qvalues_0_list), critic_batch["valids"]).detach().item()
+                valid_mean(torch.cat(critic_qvalues_0_list), critic_batch.batch["info.valids"]).detach().item()
                 if critic_qvalues_0_list
                 else 0.0
             ),
             "critic/qvalue1_mean": (
-                valid_mean(torch.cat(critic_qvalues_1_list), critic_batch["valids"]).detach().item()
+                valid_mean(torch.cat(critic_qvalues_1_list), critic_batch.batch["info.valids"]).detach().item()
                 if critic_qvalues_1_list
                 else 0.0
             ),
@@ -589,11 +594,11 @@ class RobDataParallelSACActor(BaseSACActor):
                     "actor/lr": self.actor_optimizer.param_groups[0]["lr"],
                     "actor/grad_norm": actor_grad_norm.detach().item(),
                     "actor/logprob_mean": (
-                        valid_mean(torch.cat(actor_logprobs_list), actor_batch["valids"]).detach().item()
+                        valid_mean(torch.cat(actor_logprobs_list), actor_batch.batch["info.valids"]).detach().item()
                         if actor_logprobs_list
                         else 0.0
                     ),
-                    "actor/qvalue_mean": valid_mean(torch.cat(actor_qvalues_list), actor_batch["valids"])
+                    "actor/qvalue_mean": valid_mean(torch.cat(actor_qvalues_list), actor_batch.batch["info.valids"])
                     .detach()
                     .item(),
                     "sac/alpha_lr": self.alpha_optimizer.param_groups[0]["lr"]

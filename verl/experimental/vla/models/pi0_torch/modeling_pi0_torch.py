@@ -570,6 +570,12 @@ class PI0ForActionPrediction(PreTrainedModel, SupportSACTraining):
         self, s: dict[str, torch.Tensor]
     ) -> tuple[tuple[torch.Tensor, torch.Tensor, torch.Tensor], torch.Tensor]:
         with torch.no_grad():
+            pi0_input = LiberoPi0Input.from_env_obs(s)
+            state = self.state_normalize_transform(pi0_input.state)
+            images, _ = self.image_transform.call_batch(pi0_input.images)
+            lang_tokens, lang_masks = self.prompt_tokenizer_transform.call_batch(
+                {"task": pi0_input.task, "observation.state": state}, tokenizer
+            )
             prefix_features = self.model.embed_prefix(
                 images=s["images"].unbind(dim=1),
                 img_masks=s["image_masks"].unbind(dim=1),

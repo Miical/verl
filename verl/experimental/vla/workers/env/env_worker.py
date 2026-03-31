@@ -40,30 +40,20 @@ def put_tensor_cpu(data_dict):
     return data_dict
 
 
-def create_env_batch(obs, rews, dones, infos, meta=None):
-    ret_dict = {"obs": obs, "rews": rews, "dones": dones, "infos": infos}
+def create_env_batch_dataproto(obs, rewards, terminations, truncations, infos, meta=None):
+    ret_dict = {"obs": obs, "rewards": rewards, "terminations": terminations, "truncations": truncations, "infos": infos}
     if meta is not None:
         ret_dict.update(meta=meta)
 
     ret_dict = put_tensor_cpu(ret_dict)
-    return ret_dict
-
-
-def create_env_batch_dataproto(obs, rews, terminations, truncations, infos, meta=None):
-    ret_dict = {"obs": obs, "rews": rews, "terminations": terminations, "truncations": truncations, "infos": infos}
-    if meta is not None:
-        ret_dict.update(meta=meta)
-
-    ret_dict = put_tensor_cpu(ret_dict)
+    obs_tensor_batch = {f"obs.{key}": value for key, value in obs["images_and_states"].items()}
     tensor_batch = {
-        "full_image": ret_dict["obs"]["images_and_states"]["full_image"],
-        "wrist_image": ret_dict["obs"]["images_and_states"]["wrist_image"],
-        "state": ret_dict["obs"]["images_and_states"]["state"],
-        "rews": ret_dict["rews"],
+        **obs_tensor_batch,
+        "rewards": ret_dict["rewards"],
         "terminations": ret_dict["terminations"],
         "truncations": ret_dict["truncations"],
     }
-    non_tensor_batch = {"task_descriptions": obs["task_descriptions"]}
+    non_tensor_batch = {"obs.task_descriptions": obs["task_descriptions"]}
     output = DataProto.from_dict(tensors=tensor_batch, non_tensors=non_tensor_batch)
 
     return output
@@ -189,7 +179,7 @@ class EnvWorker(Worker, DistProfilerExtension):
 
         env_batch = create_env_batch_dataproto(
             obs=extracted_obs,
-            rews=chunk_rewards,
+            rewards=chunk_rewards,
             terminations=chunk_terminations,
             truncations=chunk_truncations,
             infos=infos,

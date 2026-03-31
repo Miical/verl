@@ -103,7 +103,7 @@ class SupportSACTraining:
 
         raise NotImplementedError("Subclasses must implement sac_forward_actor method.")
 
-    def sac_forward_state_features(self, s: dict[str, torch.Tensor]) -> Any:
+    def sac_forward_state_features(self, s: DataProto, tokenizer: torch.nn.Module) -> Any:
         """Compute state features needed for SAC actor and critic.
 
         Args:

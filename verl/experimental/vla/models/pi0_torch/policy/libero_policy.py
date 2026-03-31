@@ -33,13 +33,14 @@ class LiberoPi0Input(Pi0Input):
         # Process images
         images = env_obs.batch["full_image"]
         wrist_images = env_obs.batch["wrist_image"]
+        device = images.device
 
         batch_size = images.shape[0]
         cam_high = images.permute(0, 3, 1, 2)
         left_wrist = wrist_images.permute(0, 3, 1, 2)  # (B, H, W, C) -> (B, C, H, W)
         empty_images = torch.zeros(
             (batch_size, 3, cam_high.shape[2], cam_high.shape[3]),
-            device=env_obs.batch.device,
+            device=device,
             dtype=torch.bfloat16,
         )
 
@@ -49,9 +50,9 @@ class LiberoPi0Input(Pi0Input):
             "observation.images.cam_right_wrist": empty_images,
         }
         input.img_masks = [
-            torch.ones((batch_size,), device=env_obs.batch.device, dtype=torch.bool),
-            torch.ones((batch_size,), device=env_obs.batch.device, dtype=torch.bool),
-            torch.zeros((batch_size,), device=env_obs.batch.device, dtype=torch.bool),
+            torch.ones((batch_size,), device=device, dtype=torch.bool),
+            torch.ones((batch_size,), device=device, dtype=torch.bool),
+            torch.zeros((batch_size,), device=device, dtype=torch.bool),
         ]
 
         # Process other data
@@ -60,7 +61,7 @@ class LiberoPi0Input(Pi0Input):
         state = env_obs.batch["state"]
         input.state = torch.nn.functional.pad(
             state, (0, max(0, PI0_MAX_STATE_DIM - state.shape[-1])), "constant", 0
-        ).to(env_obs.batch.device, dtype=torch.float32)
+        ).to(device=device, dtype=torch.float32)
 
         return input
 
