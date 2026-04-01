@@ -19,6 +19,11 @@ import torch
 
 from verl import DataProto
 
+class ModelOutput(ABC):
+    @abstractmethod
+    def to_data_proto(self) -> DataProto:
+        """Convert the model output to a DataProto format for downstream processing."""
+        pass
 
 class SupportSACTraining:
     """
@@ -38,6 +43,30 @@ class SupportSACTraining:
 
     def sac_init(self):
         raise NotImplementedError("Subclasses must implement sac_init method.")
+
+    # methods for SAC rollout
+
+    def sac_sample_actions(
+        self,
+        obs: DataProto,
+        tokenizer: Optional[torch.nn.Module] = None,
+        validate: bool = False,
+    ) -> ModelOutput:
+        """Sample actions from the current policy given the input observations."""
+
+        raise NotImplementedError("Subclasses must implement sac_sample_actions method.")
+    
+    def sac_get_critic_value(
+        self,
+        obs: DataProto,
+        actions: ModelOutput,
+        tokenizer: Optional[torch.nn.Module] = None,
+    ) -> torch.Tensor: 
+        """Compute critic values for given state-action pairs."""
+
+        raise NotImplementedError("Subclasses must implement sac_get_critic_value method.")
+
+    # methods for SAC training
 
     def sac_get_critic_parameters(self) -> list[torch.nn.Parameter]:
         """Get the parameters of the critic head for optimization.
@@ -178,3 +207,20 @@ class BaseSACActor(ABC):
         """
 
         raise NotImplementedError("Subclasses must implement update_policy method.")
+
+class BaseSACRollout(ABC):
+    """Base class for SAC rollout, responsible for generating action sequences."""
+
+    @abstractmethod
+    def generate_sequences(self, obs: DataProto) -> DataProto:
+        """Batch generate action sequences in sync mode.
+
+        Args:
+            obs: The input observations containing state information.
+
+        Returns:
+            A DataProto containing generated action sequences and any additional info needed for SAC training,
+            such as log probabilities or critic values.
+        """
+        pass
+

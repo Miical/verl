@@ -94,10 +94,10 @@ class RobActorRolloutRefWorker(ActorRolloutRefWorker):
         self._register_dispatch_collect_info("rollout", dp_rank=self.rank, is_collect=True)
 
         if self.config.get("algorithm", "grpo") == "sac":
-            from verl.experimental.vla.sac.naive_rollout_pi05 import PI0RolloutRob
+            from verl.experimental.vla.sac.sac_rollout import RobSACRollout
 
-            self.rollout = PI0RolloutRob(
-                module=self.actor_module_fsdp, model_config=self.config.model, tokenizer=self.tokenizer
+            self.rollout = RobSACRollout(
+                model=self.actor_module_fsdp, model_config=self.config.model, tokenizer=self.tokenizer
             )
         else:
             from verl.experimental.vla.naive_rollout_rob import NaiveRolloutRob
@@ -216,7 +216,7 @@ class RobActorRolloutRefWorker(ActorRolloutRefWorker):
         timing_generate = {}
 
         with simple_timer("generate_sequences", timing_generate):
-            output = self.rollout.generate_sequences(prompts=prompts)
+            output = self.rollout.generate_sequences(obs=prompts)
 
         timing_generate_topk_ratio, timing_generate_min, timing_generate_max = topk_reduce_ratio_min_max(
             timing_generate["generate_sequences"]

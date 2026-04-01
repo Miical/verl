@@ -15,7 +15,7 @@
 from __future__ import annotations
 
 import math
-from typing import Literal
+from typing import Literal, cast
 
 import torch
 from onnx_ir import Tensor
@@ -27,7 +27,7 @@ from typing_extensions import override
 from verl.protocol import DataProto
 from verl.utils.device import get_device_name
 
-from ...sac.base import SupportSACTraining
+from ...sac.base import SupportSACTraining, ModelOutput
 from ..modules.mlp import MLP
 from .configuration_pi0_torch import PI0TorchConfig
 from .model.modeling_pi0 import PI0Model, make_att_2d_masks
@@ -107,7 +107,7 @@ class PI0ForActionPrediction(PreTrainedModel, SupportSACTraining):
             self.critic_heads = nn.ModuleList(
                 [
                     MLP(
-                        input_dim=2150,
+                        input_dim=2140,
                         hidden_dims=[2048, 1024, 256],
                         output_dim=1,
                         activation="relu",
@@ -120,7 +120,7 @@ class PI0ForActionPrediction(PreTrainedModel, SupportSACTraining):
             self.target_network_heads = nn.ModuleList(
                 [
                     MLP(
-                        input_dim=2150,
+                        input_dim=2140,
                         hidden_dims=[2048, 1024, 256],
                         output_dim=1,
                         activation="relu",
@@ -178,67 +178,6 @@ class PI0ForActionPrediction(PreTrainedModel, SupportSACTraining):
             timestep,
         )
 
-    @torch.no_grad()
-    def sample_actions(
-        self,
-        env_obs: DataProto,
-        tokenizer,
-        validate: bool = False,
-    ) -> tuple[Pi0Output, dict, dict]:
-        """Run one forward pass from raw inputs to final action sequence.
-
-        Args:
-            env_obs: The environment observations as DataProto.
-            tokenizer: The tokenizer used for prompt tokenization.
-
-        Returns:
-            A tuple of (pi0_output, s, a):
-                - pi0_output: The Pi0Output containing the predicted actions.
-                - s: Dictionary of tensors representing the states, with keys
-                    - "full_image": torch.Tensor of shape (B, H, W, C)
-                    - "wrist_image": torch.Tensor of shape (B, H, W, C)
-                    - "states": torch.Tensor of shape (B, state_dim)
-                - a: Dictionary of tensors representing actions, with key:
-                    - "full_action": torch.Tensor of shape (B, action_steps, action_dim)
-        """
-
-        from .policy.libero_policy import LiberoPi0Input
-
-        pi0_input = LiberoPi0Input.from_env_obs(env_obs)
-
-        # Input transforms
-        state = self.state_normalize_transform(pi0_input.state)
-        images, _ = self.image_transform.call_batch(pi0_input.images)
-        lang_tokens, lang_masks = self.prompt_tokenizer_transform.call_batch(
-            {"task": pi0_input.task, "observation.state": state}, tokenizer
-        )
-
-        if self.flow_sde_enable and not validate:
-            prefix_features = self.model.embed_prefix(
-                images=images,
-                img_masks=pi0_input.img_masks,
-                lang_tokens=lang_tokens,
-                lang_masks=lang_masks,
-            )
-            pred_action, rollout_log_probs = self._sample_actions_flow_sde(
-                state_features=(prefix_features, state),
-                noise_scale=self.flow_sde_rollout_noise_scale,
-                requires_grad=False,
-                return_log_prob=True,
-            )
-        else:
-            pred_action = self.model.sample_actions(images, pi0_input.img_masks, lang_tokens, lang_masks, state=state)
-            rollout_log_probs = torch.zeros(pred_action.shape[0], device=pred_action.device, dtype=torch.float32)
-
-        # Output transforms
-        from .policy.libero_policy import LiberoPi0Output
-
-        pi0_output = LiberoPi0Output.from_model_output({
-            "full_action": self.action_unnormalize_transform(pred_action),
-            "log_probs": rollout_log_probs
-        })
-
-        return pi0_output
 
     @classmethod
     def from_pretrained(cls, pretrained_model_name_or_path, *model_args, **kwargs):
@@ -251,13 +190,13 @@ class PI0ForActionPrediction(PreTrainedModel, SupportSACTraining):
         policy.model = PI0Model.from_pretrained(pretrained_model_name_or_path)
         return policy
 
-    # def load_state_dict(self, state_dict, strict: bool = True, assign: bool = False):
-    #     filtered_state_dict = {
-    #         key: value
-    #         for key, value in state_dict.items()
-    #         if key.startswith("model.")
-    #     }
-    #     return super().load_state_dict(filtered_state_dict, strict=False, assign=assign)
+    def load_state_dict(self, state_dict, strict: bool = True, assign: bool = False):
+        filtered_state_dict = {
+            key: value
+            for key, value in state_dict.items()
+            if key.startswith("model.")
+        }
+        return super().load_state_dict(filtered_state_dict, strict=False, assign=assign)
 
     def freeze_vision_tower(self) -> None:
         """Freeze the vision tower parameters."""
@@ -474,11 +413,100 @@ class PI0ForActionPrediction(PreTrainedModel, SupportSACTraining):
 
         self.freeze_vision_tower()
 
-        register_fsdp_forward_method(self, "bc_loss")
-        register_fsdp_forward_method(self, "sac_forward_critic")
-        register_fsdp_forward_method(self, "sac_forward_actor")
-        register_fsdp_forward_method(self, "sac_update_target_network")
-        register_fsdp_forward_method(self, "sac_forward_state_features")
+        forward_methods = [
+            "bc_loss",
+            "sac_sample_actions",
+            "sac_forward_critic",
+            "sac_forward_actor",
+            "sac_forward_state_features"
+        ]
+
+        for method in forward_methods:
+            register_fsdp_forward_method(self, method)
+
+    @torch.no_grad()
+    @override
+    def sac_sample_actions(
+        self,
+        obs: DataProto,
+        tokenizer: torch.nn.Module | None = None,
+        validate: bool = False,
+    ) -> Pi0Output:
+        """Run one forward pass from raw inputs to final action sequence.
+
+        Args:
+            obs: The environment observations as DataProto.
+            tokenizer: The tokenizer used for prompt tokenization.
+
+        Returns:
+            A tuple of (pi0_output, s, a):
+                - pi0_output: The Pi0Output containing the predicted actions.
+                - s: Dictionary of tensors representing the states, with keys
+                    - "full_image": torch.Tensor of shape (B, H, W, C)
+                    - "wrist_image": torch.Tensor of shape (B, H, W, C)
+                    - "states": torch.Tensor of shape (B, state_dim)
+                - a: Dictionary of tensors representing actions, with key:
+                    - "full_action": torch.Tensor of shape (B, action_steps, action_dim)
+        """
+
+        from .policy.libero_policy import LiberoPi0Input
+
+        pi0_input = LiberoPi0Input.from_env_obs(obs)
+
+        # Input transforms
+        state = self.state_normalize_transform(pi0_input.state)
+        images, _ = self.image_transform.call_batch(pi0_input.images)
+        lang_tokens, lang_masks = self.prompt_tokenizer_transform.call_batch(
+            {"task": pi0_input.task, "observation.state": state}, tokenizer
+        )
+
+        if self.flow_sde_enable and not validate:
+            prefix_features = self.model.embed_prefix(
+                images=images,
+                img_masks=pi0_input.img_masks,
+                lang_tokens=lang_tokens,
+                lang_masks=lang_masks,
+            )
+            pred_action, rollout_log_probs = self._sample_actions_flow_sde(
+                state_features=(prefix_features, state),
+                noise_scale=self.flow_sde_rollout_noise_scale,
+                requires_grad=False,
+                return_log_prob=True,
+            )
+        else:
+            pred_action = self.model.sample_actions(images, pi0_input.img_masks, lang_tokens, lang_masks, state=state)
+            rollout_log_probs = torch.zeros(pred_action.shape[0], device=pred_action.device, dtype=torch.float32)
+
+        # Output transforms
+        from .policy.libero_policy import LiberoPi0Output
+
+        pi0_output = LiberoPi0Output.from_model_output({
+            "full_action": self.action_unnormalize_transform(pred_action),
+            "log_probs": rollout_log_probs
+        })
+
+        return pi0_output
+    
+    @torch.no_grad()
+    @override
+    def sac_get_critic_value(
+        self, 
+        obs: DataProto, 
+        actions: ModelOutput, 
+        tokenizer: nn.Module | None = None) -> torch.Tensor:
+        """Compute Q-values for given raw observations and actions, used for critic target calculation."""
+
+        actions = cast(Pi0Output, actions)
+        state_features = self.sac_forward_state_features(obs, tokenizer)
+        critic_q_values = self.sac_forward_critic(
+            a={"action": actions.action},
+            state_features=state_features,
+            use_target_network=False,
+            method="min",
+            requires_grad=False,
+        )
+
+        return critic_q_values.detach().float()
 
     @override
     def sac_forward_actor(

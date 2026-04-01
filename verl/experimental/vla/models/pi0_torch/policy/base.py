@@ -13,9 +13,11 @@
 # limitations under the License.
 
 from abc import ABC, abstractmethod
+from typing_extensions import override
 
 import torch
-
+from verl.protocol import DataProto
+from verl.experimental.vla.sac.base import ModelOutput
 
 class Pi0Input(ABC):
     def __init__(self):
@@ -42,11 +44,20 @@ class Pi0Input(ABC):
     def from_env_obs(cls, env_obs) -> "Pi0Input": ...
 
 
-class Pi0Output:
+class Pi0Output(ModelOutput):
     def __init__(self):
+        super().__init__()
+
         self.action: torch.Tensor = None
         self.log_prob: torch.Tensor = None
 
     @classmethod
     @abstractmethod
     def from_model_output(cls, model_output) -> "Pi0Output": ...
+
+    @override
+    def to_data_proto(self) -> DataProto:
+        return DataProto.from_dict({
+            "action": self.action,
+            "log_prob": self.log_prob,
+        })
