@@ -86,7 +86,7 @@ class SupportSACTraining:
         self,
         state_features: Any,
         is_first_micro_batch: bool = False,
-    ) -> tuple[torch.Tensor, Optional[torch.Tensor], dict[str, float]]:
+    ) -> Any:
         """Compute actions and their log probabilities from state features.
 
         Args:

@@ -38,8 +38,8 @@ class PI0RolloutRob(NaiveRolloutRob):
     def __init__(
         self,
         model_config: dict,
-        module: torch.nn.Module,
-        tokenizer: Any,
+        module,
+        tokenizer,
     ):
         self.model_config = model_config
         self.module = module
@@ -58,7 +58,7 @@ class PI0RolloutRob(NaiveRolloutRob):
         with torch.autocast(device_type=get_device_name(), dtype=torch.bfloat16):
             prompts.to(get_device_id())
             validate = bool(prompts.meta_info.get("validate", False))
-            output, _, a = self.module.sample_actions(
+            output = self.module.sample_actions(
                 prompts,
                 tokenizer=self.tokenizer,
                 validate=validate,
@@ -66,7 +66,7 @@ class PI0RolloutRob(NaiveRolloutRob):
             state_features = self.module.sac_forward_state_features(prompts, self.tokenizer)
             critic_value = (
                 self.module.sac_forward_critic(
-                    {"full_action": a["full_action"]},
+                    {"action": output.action},
                     state_features,
                     use_target_network=False,
                     method="min",
@@ -77,12 +77,9 @@ class PI0RolloutRob(NaiveRolloutRob):
                 .reshape(-1)
             )
 
-        tensor_batch = {
+        ret = DataProto.from_dict({
             "action": output.action,
-            "full_action": a["full_action"],
             "critic_value": critic_value,
-        }
-
-        ret = DataProto.from_dict(tensor_batch)
+        })
 
         return ret

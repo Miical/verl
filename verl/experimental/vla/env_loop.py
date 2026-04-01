@@ -124,7 +124,6 @@ class EnvLoop:
             return []
 
         num_chunks = min(aligned_steps // self.num_action_chunks, max_chunks)
-        full_action_template = rollout_action.batch["full_action"][:1]
         critic_value_template = rollout_action.batch["critic_value"][:1]
 
         expanded_steps = []
@@ -142,15 +141,10 @@ class EnvLoop:
                     action_chunk,
                     rollout_action_chunk.to(device=action_chunk.device, dtype=action_chunk.dtype),
                 )
-            full_action_chunk = full_action_template.new_zeros(full_action_template.shape)
-            full_action_chunk[:, : action_chunk.shape[1], : action_chunk.shape[2]] = action_chunk.to(
-                device=full_action_chunk.device,
-                dtype=full_action_chunk.dtype,
-            )
+
             action_dp = DataProto.from_dict(
                 tensors={
                     "action": action_chunk,
-                    "full_action": full_action_chunk,
                     "critic_value": critic_value_template.new_zeros(critic_value_template.shape),
                 }
             )

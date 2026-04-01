@@ -72,4 +72,5 @@ class LiberoPi0Output(Pi0Output):
     def from_model_output(cls, model_output: dict) -> "LiberoPi0Output":
         output = cls()
         output.action = model_output["full_action"][:, :PI0_ACTION_CHUNK_SIZE, :LIBERO_ACTION_DIM]
+        output.log_prob = model_output["log_probs"]
         return output

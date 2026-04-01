@@ -45,6 +45,7 @@ class Pi0Input(ABC):
 class Pi0Output:
     def __init__(self):
         self.action: torch.Tensor = None
+        self.log_prob: torch.Tensor = None
 
     @classmethod
     @abstractmethod

@@ -233,20 +233,12 @@ class PI0ForActionPrediction(PreTrainedModel, SupportSACTraining):
         # Output transforms
         from .policy.libero_policy import LiberoPi0Output
 
-        pi0_output = LiberoPi0Output.from_model_output({"full_action": self.action_unnormalize_transform(pred_action)})
-        s = {
-            "states": state,
-            "images": torch.stack(images, dim=1),
-            "image_masks": torch.stack(pi0_input.img_masks, dim=1),
-            "lang_tokens": lang_tokens,
-            "lang_masks": lang_masks,
-        }
-        a = {
-            "full_action": pred_action,
-            "log_probs": rollout_log_probs,
-        }
+        pi0_output = LiberoPi0Output.from_model_output({
+            "full_action": self.action_unnormalize_transform(pred_action),
+            "log_probs": rollout_log_probs
+        })
 
-        return pi0_output, s, a
+        return pi0_output
 
     @classmethod
     def from_pretrained(cls, pretrained_model_name_or_path, *model_args, **kwargs):
@@ -511,7 +503,13 @@ class PI0ForActionPrediction(PreTrainedModel, SupportSACTraining):
                 "flow_sde_beta": float(self.flow_sde_beta().item()),
                 "flow_sde_step": float(self.flow_sde_step.item()),
             }
-        return actions, log_probs, actor_metrics
+        
+        from .policy.libero_policy import LiberoPi0Output
+        pi0_output = LiberoPi0Output.from_model_output({
+            "full_action": self.action_unnormalize_transform(actions),
+            "log_probs": log_probs,
+        })
+        return pi0_output.action, pi0_output.log_prob, actor_metrics
 
     @override
     def sac_forward_critic(
@@ -544,7 +542,7 @@ class PI0ForActionPrediction(PreTrainedModel, SupportSACTraining):
             prefix_pad_masks=prefix_pad_masks,
             use_target_network=use_target_network,
         )  # (B, 2048)
-        actions = a["full_action"][:, :10, :7]  # (B, 10, 7)
+        actions = a["action"] # (B, 10, 7)
         flattened_actions = actions.reshape(actions.shape[0], -1)  # (B, 70)
         critic_input = torch.cat([pooled_prefix_embs, states, flattened_actions], dim=-1)
 
@@ -565,7 +563,7 @@ class PI0ForActionPrediction(PreTrainedModel, SupportSACTraining):
 
     @override
     def sac_forward_state_features(
-        self, s: dict[str, torch.Tensor]
+        self, s: DataProto, tokenizer: torch.nn.Module
     ) -> tuple[tuple[torch.Tensor, torch.Tensor, torch.Tensor], torch.Tensor]:
 
         from .policy.libero_policy import LiberoPi0Input

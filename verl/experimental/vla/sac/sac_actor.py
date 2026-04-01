@@ -335,7 +335,7 @@ class RobDataParallelSACActor(BaseSACActor):
                         s1_state_features,
                         is_first_micro_batch=False,
                     )
-                    a1 = {"full_action": a1_actions}
+                    a1 = {"action": a1_actions}
                 else:
                     log_probs_1 = None
 
@@ -379,7 +379,7 @@ class RobDataParallelSACActor(BaseSACActor):
                 is_first_micro_batch=is_first_micro_batch,
             )
             q_values_0 = self.actor_module.sac_forward_critic(
-                {"full_action": a0_actions},
+                {"action": a0_actions},
                 s0_state_features,
                 use_target_network=False,
                 method="min",
@@ -424,7 +424,7 @@ class RobDataParallelSACActor(BaseSACActor):
                         "t0.obs.state",
                         "t0.obs.full_image",
                         "t0.obs.wrist_image",
-                        "t0.action.full_action",
+                        "t0.action.action",
                         "info.rewards",
                         "info.dones",
                         "info.valids",
@@ -432,7 +432,7 @@ class RobDataParallelSACActor(BaseSACActor):
                         "t1.obs.state",
                         "t1.obs.full_image",
                         "t1.obs.wrist_image",
-                        "t1.action.full_action",
+                        "t1.action.action",
                     ],
                     non_tensor_batch_keys=[
                         "t0.obs.task_descriptions", 
