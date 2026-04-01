@@ -72,8 +72,6 @@ def create_env_batch_dataproto(obs, rewards, terminations, truncations, infos, m
 
     output = DataProto.from_dict(tensors=tensor_batch, non_tensors=non_tensor_batch)
 
-    print(output)
-
     return output
 
 

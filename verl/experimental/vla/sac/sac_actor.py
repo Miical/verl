@@ -334,8 +334,6 @@ class RobDataParallelSACActor(BaseSACActor):
         self._force_set_lr(self.critic_optimizer, 1e-4)
 
         if "empty_batch" not in data.meta_info:
-            print(f"add batch: {data}")
-
             task_ids = data.batch["info.task_ids"]
             self.replay_pool.add_batch(
                 data.select(

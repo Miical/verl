@@ -37,6 +37,7 @@ from .pi0_utils import (
     PromptTokenizerTransform,
     Unnormalize,
 )
+from .policy import get_pi0_policy_classes
 from .policy.base import Pi0Output
 
 
@@ -56,6 +57,7 @@ class PI0ForActionPrediction(PreTrainedModel, SupportSACTraining):
         self.state_norm_stats = config.state_norm_stats
         self.action_norm_stats = config.action_norm_stats
         self.pi05_enabled = config.pi05_enabled
+        self.policy_type = config.policy_type
 
         assert self.state_norm_stats, "state_norm_stats must be provided in PI0TorchConfig"
         assert self.action_norm_stats, "action_norm_stats must be provided in PI0TorchConfig"
@@ -132,6 +134,9 @@ class PI0ForActionPrediction(PreTrainedModel, SupportSACTraining):
 
             self.target_network_heads.load_state_dict(self.critic_heads.state_dict())
             self.target_prefix_cross_attn.load_state_dict(self.critic_prefix_cross_attn.state_dict())
+
+    def _get_pi0_policy_classes(self):
+        return get_pi0_policy_classes(self.policy_type)
 
     def _to(self, device: torch.device | str):
         self.state_normalize_transform.to(device)
@@ -449,9 +454,8 @@ class PI0ForActionPrediction(PreTrainedModel, SupportSACTraining):
                     - "full_action": torch.Tensor of shape (B, action_steps, action_dim)
         """
 
-        from .policy.libero_policy import LiberoPi0Input
-
-        pi0_input = LiberoPi0Input.from_env_obs(obs)
+        pi0_input_cls, pi0_output_cls = self._get_pi0_policy_classes()
+        pi0_input = pi0_input_cls.from_env_obs(obs)
 
         # Input transforms
         state = self.state_normalize_transform(pi0_input.state)
@@ -478,9 +482,7 @@ class PI0ForActionPrediction(PreTrainedModel, SupportSACTraining):
             rollout_log_probs = torch.zeros(pred_action.shape[0], device=pred_action.device, dtype=torch.float32)
 
         # Output transforms
-        from .policy.libero_policy import LiberoPi0Output
-
-        pi0_output = LiberoPi0Output.from_model_output({
+        pi0_output = pi0_output_cls.from_model_output({
             "full_action": self.action_unnormalize_transform(pred_action),
             "log_probs": rollout_log_probs
         })
@@ -532,8 +534,8 @@ class PI0ForActionPrediction(PreTrainedModel, SupportSACTraining):
                 "flow_sde_step": float(self.flow_sde_step.item()),
             }
         
-        from .policy.libero_policy import LiberoPi0Output
-        pi0_output = LiberoPi0Output.from_model_output({
+        _, pi0_output_cls = self._get_pi0_policy_classes()
+        pi0_output = pi0_output_cls.from_model_output({
             "full_action": self.action_unnormalize_transform(actions),
             "log_probs": log_probs,
         })
@@ -591,13 +593,13 @@ class PI0ForActionPrediction(PreTrainedModel, SupportSACTraining):
 
     @override
     def sac_forward_state_features(
-        self, s: DataProto, tokenizer: torch.nn.Module
+        self, obs: DataProto, tokenizer: torch.nn.Module
     ) -> tuple[tuple[torch.Tensor, torch.Tensor, torch.Tensor], torch.Tensor]:
 
-        from .policy.libero_policy import LiberoPi0Input
+        pi0_input_cls, _ = self._get_pi0_policy_classes()
+        pi0_input = pi0_input_cls.from_env_obs(obs)
 
         with torch.no_grad():
-            pi0_input = LiberoPi0Input.from_env_obs(s)
             state = self.state_normalize_transform(pi0_input.state)
             images, _ = self.image_transform.call_batch(pi0_input.images)
             lang_tokens, lang_masks = self.prompt_tokenizer_transform.call_batch(

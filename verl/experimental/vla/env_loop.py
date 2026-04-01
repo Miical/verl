@@ -268,5 +268,4 @@ class EnvLoop:
         for field_key in [OBS_KEY, ACTION_KEY, FEEDBACK_KEY]:
             batch_dict.update(stack_dataproto_with_padding([step[field_key] for step in flat_trajs], field_key))
 
-        print(f"Final batch dict: {DataProto.from_single_dict(batch_dict, meta_info=meta_info)}")
         return DataProto.from_single_dict(batch_dict, meta_info=meta_info)
