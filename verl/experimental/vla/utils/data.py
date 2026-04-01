@@ -1,5 +1,6 @@
 import numpy as np
 import torch
+from verl.experimental.vla.sac.base import ACTION_KEY, OBS_KEY
 from verl.protocol import DataProto
 
 def get_dataproto_from_prefix(data: DataProto, prefix: str, separator: str = "") -> DataProto:
@@ -126,3 +127,72 @@ def stack_dataproto_with_padding(data_protos: list[DataProto], prefix: str) -> d
         merged[f"{prefix}.{key}"] = np.stack(per_step_values, axis=1)
 
     return merged
+
+
+def flatten_trajectories(data: DataProto) -> DataProto:
+    batch_size, num_steps = data.batch["action.action"].shape[:2]
+    new_batch_fields = {}
+    new_non_tensor_fields = {}
+    for key, tensor in data.batch.items():
+        if len(tensor.shape) >= 2 and tensor.shape[0] == batch_size and tensor.shape[1] == num_steps:
+            new_shape = (batch_size * num_steps, *tensor.shape[2:])
+            new_batch_fields[key] = tensor.reshape(new_shape)
+        elif len(tensor.shape) == 1 and tensor.shape[0] == batch_size:
+            new_batch_fields[key] = tensor.repeat_interleave(num_steps)
+        else:
+            new_batch_fields[key] = tensor
+    for key, array in data.non_tensor_batch.items():
+        if array.ndim >= 2 and array.shape[0] == batch_size and array.shape[1] == num_steps:
+            new_non_tensor_fields[key] = array.reshape(batch_size * num_steps, *array.shape[2:])
+        elif array.ndim == 1 and array.shape[0] == batch_size:
+            new_non_tensor_fields[key] = np.repeat(array, num_steps, axis=0)
+        else:
+            new_non_tensor_fields[key] = array
+    return DataProto.from_dict(
+        tensors=new_batch_fields,
+        non_tensors=new_non_tensor_fields,
+        meta_info=data.meta_info,
+    )
+
+
+def add_transition_prefixes(data: DataProto) -> DataProto:
+    batch = data.batch
+    non_tensor_batch = data.non_tensor_batch
+    step_key = "action.full_action" if "action.full_action" in batch else "action.action"
+    if step_key not in batch:
+        return data
+
+    num_steps = batch[step_key].shape[1]
+    if num_steps <= 1:
+        return data
+
+    def slice_steps(x, start: int, end: int | None):
+        return x[:, slice(start, end), ...]
+
+    obs_prefix = f"{OBS_KEY}."
+    action_prefix = f"{ACTION_KEY}."
+    keys = [key for key in batch.keys() if key.startswith(obs_prefix) or key.startswith(action_prefix)]
+    non_tensor_keys = [
+        key for key in non_tensor_batch.keys() if key.startswith(obs_prefix) or key.startswith(action_prefix)
+    ]
+
+    for key in keys:
+        if key in batch:
+            batch[f"t0.{key}"] = slice_steps(batch[key], 0, -1)
+            batch[f"t1.{key}"] = slice_steps(batch[key], 1, None)
+
+    for key in non_tensor_keys:
+        if key in non_tensor_batch:
+            non_tensor_batch[f"t0.{key}"] = slice_steps(non_tensor_batch[key], 0, -1)
+            non_tensor_batch[f"t1.{key}"] = slice_steps(non_tensor_batch[key], 1, None)
+
+    batch_size = batch[step_key].shape[0]
+    for key, tensor in list(batch.items()):
+        if tensor.ndim >= 2 and tensor.shape[0] == batch_size and tensor.shape[1] == num_steps:
+            batch[key] = slice_steps(tensor, 0, -1)
+
+    for key, array in list(non_tensor_batch.items()):
+        if array.ndim >= 2 and array.shape[0] == batch_size and array.shape[1] == num_steps:
+            non_tensor_batch[key] = slice_steps(array, 0, -1)
+
+    return data

@@ -21,15 +21,11 @@ import torch
 from omegaconf import DictConfig
 
 from verl import DataProto
+from verl.experimental.vla.sac.base import ACTION_KEY, FEEDBACK_KEY, INTERVENTION_INFO_KEY, OBS_KEY
 from verl.single_controller.ray import RayWorkerGroup
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
-
-OBS_KEY = "obs"
-ACTION_KEY = "action"
-FEEDBACK_KEY = "feedback"
-INTERVENTION_INFO_KEY = "intervention_info"
 
 INTERVENTION_ACTION_KEY = "action"
 

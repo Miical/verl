@@ -19,6 +19,12 @@ import torch
 
 from verl import DataProto
 
+OBS_KEY = "obs"
+ACTION_KEY = "action"
+FEEDBACK_KEY = "feedback"
+INTERVENTION_INFO_KEY = "intervention_info"
+
+
 class ModelOutput(ABC):
     @abstractmethod
     def to_data_proto(self) -> DataProto:
@@ -186,4 +192,3 @@ class BaseSACRollout(ABC):
             such as log probabilities or critic values.
         """
         pass
-
