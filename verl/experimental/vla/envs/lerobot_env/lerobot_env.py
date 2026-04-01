@@ -230,7 +230,7 @@ class LeRobotEnv(gym.Env):
         chunk_rewards = []
         raw_chunk_terminations = []
         raw_chunk_truncations = []
-        intervention_info = {"obs": [], "actions": [], "is_intervention": []}
+        intervention_info = {"obs": [], "action": [], "is_intervention": []}
         last_step_is_intervention = False
 
         step_idx = 0
@@ -243,7 +243,7 @@ class LeRobotEnv(gym.Env):
             chunk_rewards.append(step_reward)
             raw_chunk_terminations.append(terminations)
             raw_chunk_truncations.append(truncations)
-            intervention_info["actions"].append(to_tensor(infos["executed_action"]).unsqueeze(0))
+            intervention_info["action"].append(to_tensor(infos["executed_action"]).unsqueeze(0))
             intervention_info["is_intervention"].append(to_tensor(infos["is_intervention"]).unsqueeze(0))
             if (step_idx + 1) % chunk_size == 0:
                 intervention_info["obs"].append(extracted_obs)
@@ -268,7 +268,7 @@ class LeRobotEnv(gym.Env):
                 "obs.task_descriptions": np.array(
                     [step_obs["task_descriptions"] for step_obs in intervention_info["obs"]], dtype=object
                 ).transpose(1, 0),
-                "actions": torch.stack(intervention_info["actions"], dim=1),
+                "action": torch.stack(intervention_info["action"], dim=1),
                 "is_intervention": is_intervention_tensor
             }
         return extracted_obs, chunk_rewards, chunk_terminations, chunk_truncations, infos

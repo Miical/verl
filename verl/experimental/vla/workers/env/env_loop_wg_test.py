@@ -171,7 +171,7 @@ async def run():
             action = batch.batch["action"]
             action = action.cpu().numpy()
             # already in env
-            data = DataProto.from_dict(non_tensors={"actions": action}, meta_info={"stage_id": stage_id})
+            data = DataProto.from_dict(non_tensors={"action": action}, meta_info={"stage_id": stage_id})
             env_obs_refs[stage_id] = env_wg.env_interact_step(data)
 
     env_wg.finish_rollout()

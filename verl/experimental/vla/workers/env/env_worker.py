@@ -49,9 +49,9 @@ def create_env_batch_dataproto(obs, rewards, terminations, truncations, infos, m
     obs_tensor_batch = {f"obs.{key}": value for key, value in obs["images_and_states"].items()}
     tensor_batch = {
         **obs_tensor_batch,
-        "rewards": ret_dict["rewards"],
-        "terminations": ret_dict["terminations"],
-        "truncations": ret_dict["truncations"],
+        "feedback.rewards": ret_dict["rewards"],
+        "feedback.terminations": ret_dict["terminations"],
+        "feedback.truncations": ret_dict["truncations"],
     }
     non_tensor_batch = {
         "obs.task_descriptions": obs["task_descriptions"],
@@ -169,8 +169,12 @@ class EnvWorker(Worker, DistProfilerExtension):
         """
         This function is used to interact with the environment.
         """
-        chunk_actions: torch.Tensor = data.non_tensor_batch["actions"]
-        chunk_values = data.non_tensor_batch["critic_values"]
+        if data.batch is not None and "action" in data.batch.keys():
+            chunk_actions: torch.Tensor = data.batch["action"]
+            chunk_values = data.batch["critic_value"]
+        else:
+            chunk_actions = torch.as_tensor(data.non_tensor_batch["action"])
+            chunk_values = torch.as_tensor(data.non_tensor_batch["critic_value"])
         stage_id: int = data.meta_info["stage_id"]
 
         # Pi0.5 Libero is not required

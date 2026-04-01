@@ -18,7 +18,7 @@ from typing_extensions import override
 
 from verl import DataProto
 from .base import BaseSACRollout, SupportSACTraining
-from verl.utils.device import get_device_id, get_device_name
+from verl.utils.device import get_device_name
 
 CRITIC_VALUE_KEY = "critic_value"
 logger = logging.getLogger(__name__)

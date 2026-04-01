@@ -25,98 +25,17 @@ import torch.nn.functional as F
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from typing_extensions import override
 
-from verl.experimental.vla.sac.replay_pool import SACReplayPool
 from verl.protocol import DataProto
 from verl.utils.device import get_device_id, get_device_name
-
-from .base import BaseSACActor, SupportSACTraining
+from verl.experimental.vla.sac.replay_pool import SACReplayPool
+from verl.experimental.vla.sac.base import BaseSACActor, SupportSACTraining
+from verl.experimental.vla.utils.data import (
+    get_dataproto_from_prefix,
+    split_nested_dicts_or_tuples,
+    valid_mean,
+)
 
 logger = logging.getLogger(__name__)
-logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
-
-
-def get_dataproto_from_prefix(data: DataProto, prefix: str) -> DataProto:
-    """Extract a sub-DataProto from a DataProto based on a given prefix.
-
-    Args:
-        data: The input DataProto containing various keys.
-        prefix: The prefix string to filter keys.
-    Returns:
-        A DataProto containing tensor and non-tensor entries whose keys start
-        with the specified prefix. The prefix is removed from the result keys.
-    """
-
-    prefix_length = len(prefix)
-    tensor_batch = {}
-    non_tensor_batch = {}
-    for key in data.batch.keys():
-        if key.startswith(prefix):
-            new_key = key[prefix_length:]
-            tensor_batch[new_key] = data.batch[key]
-    for key in data.non_tensor_batch.keys():
-        if key.startswith(prefix):
-            new_key = key[prefix_length:]
-            non_tensor_batch[new_key] = data.non_tensor_batch[key]
-    return DataProto.from_dict(tensors=tensor_batch, non_tensors=non_tensor_batch, meta_info=data.meta_info)
-
-
-def merge_nested_dicts_or_tuples(a: dict | tuple, b: dict | tuple) -> dict | tuple:
-    """Merge two nested structures (dictionaries or tuples) by concatenating tensors
-    along the first dimension.
-    """
-
-    if isinstance(a, dict) and isinstance(b, dict):
-        merged = {}
-        for key in a.keys():
-            merged[key] = merge_nested_dicts_or_tuples(a[key], b[key])
-        return merged
-    elif isinstance(a, tuple) and isinstance(b, tuple):
-        merged = []
-        for item_a, item_b in zip(a, b, strict=False):
-            merged.append(merge_nested_dicts_or_tuples(item_a, item_b))
-        return tuple(merged)
-    else:
-        return torch.cat([a, b], dim=0)
-
-
-def split_nested_dicts_or_tuples(data: dict | tuple, split_num: int) -> list[dict | tuple]:
-    """Split a nested structure (dictionary or tuple) into smaller chunks along the first dimension."""
-
-    if isinstance(data, torch.Tensor):
-        split_tensors = torch.chunk(data, split_num, dim=0)
-        return list(split_tensors)
-    elif isinstance(data, dict):
-        split_dicts = [dict() for _ in range(split_num)]
-        for key, value in data.items():
-            split_values = split_nested_dicts_or_tuples(value, split_num)
-            for i in range(split_num):
-                split_dicts[i][key] = split_values[i]
-        return split_dicts
-    elif isinstance(data, tuple):
-        split_tuples = [list() for _ in range(split_num)]
-        for item in data:
-            split_items = split_nested_dicts_or_tuples(item, split_num)
-            for i in range(split_num):
-                split_tuples[i].append(split_items[i])
-        return [tuple(split_tuple) for split_tuple in split_tuples]
-    else:
-        raise TypeError("Input data must be a torch.Tensor, dict, or tuple.")
-
-
-def valid_mean(x: torch.Tensor, valid: torch.Tensor) -> torch.Tensor:
-    """Compute the mean of tensor `x` over valid entries indicated by `valid` mask.
-
-    Args:
-        x: Tensor of shape (B, ...) containing values to average.
-        valid: Tensor of shape (B,) indicating valid entries (1 for valid, 0 for invalid).
-
-    Returns:
-        Scalar tensor (mean over valid samples only)
-    """
-    x = x.squeeze(-1)
-    valid_f = valid.float().to(x.device)
-    denom = valid_f.sum().clamp_min(1.0)
-    return (x * valid_f).sum() / denom
 
 
 class RobDataParallelSACActor(BaseSACActor):

@@ -31,36 +31,9 @@ ACTION_KEY = "action"
 FEEDBACK_KEY = "feedback"
 INTERVENTION_INFO_KEY = "intervention_info"
 
-FEEDBACK_FIELDS = ["rewards", "terminations", "truncations"]
+INTERVENTION_ACTION_KEY = "action"
 
-
-
-def get_dataproto_from_prefix(data: DataProto, prefix: str, separator: str = "") -> DataProto:
-    """Extract a sub-DataProto from a DataProto based on a given prefix.
-
-    Args:
-        data: The input DataProto containing various keys.
-        prefix: The prefix string to filter keys.
-        separator: Optional separator appended after prefix when matching keys.
-    Returns:
-        A DataProto containing tensor and non-tensor entries whose keys start
-        with the specified prefix. The prefix is removed from the result keys.
-    """
-
-    match_prefix = prefix if not separator or prefix.endswith(separator) else f"{prefix}{separator}"
-    prefix_length = len(match_prefix)
-    tensor_batch = {}
-    non_tensor_batch = {}
-    for key in data.batch.keys():
-        if key.startswith(match_prefix):
-            new_key = key[prefix_length:]
-            tensor_batch[new_key] = data.batch[key]
-    for key in data.non_tensor_batch.keys():
-        if key.startswith(match_prefix):
-            new_key = key[prefix_length:]
-            non_tensor_batch[new_key] = data.non_tensor_batch[key]
-    return DataProto.from_dict(tensors=tensor_batch, non_tensors=non_tensor_batch, meta_info=data.meta_info)
-
+from verl.experimental.vla.utils.data import get_dataproto_from_prefix, slice_dataproto_batch, stack_dataproto_with_padding
 
 class EnvLoop:
     """An env loop manages interactions between models and vectorized environments. It's designed for computationally
@@ -118,39 +91,29 @@ class EnvLoop:
         intervention_info: DataProto,
         max_chunks: int,
     ) -> list[dict]:
-        total_steps = intervention_info.batch["actions"].shape[1]
+        total_steps = intervention_info.batch[INTERVENTION_ACTION_KEY].shape[1]
         aligned_steps = (total_steps // self.num_action_chunks) * self.num_action_chunks
         if aligned_steps == 0 or max_chunks <= 0:
             return []
 
         num_chunks = min(aligned_steps // self.num_action_chunks, max_chunks)
-        critic_value_template = rollout_action.batch["critic_value"][:1]
-
         expanded_steps = []
         chunk_obs = current_obs
         for chunk_idx in range(num_chunks):
             start = chunk_idx * self.num_action_chunks
             end = start + self.num_action_chunks
 
-            action_chunk = intervention_info.batch["actions"][:, start:end].clone()
-            if chunk_idx == 0:
+            action_chunk = intervention_info.batch[INTERVENTION_ACTION_KEY][:, start:end].clone()
+            if start == 0:
                 intervention_mask = intervention_info.batch["is_intervention"][:, start:end].to(torch.bool)
-                rollout_action_chunk = rollout_action.batch["action"][:1, : action_chunk.shape[1], : action_chunk.shape[2]]
+                rollout_action_chunk = rollout_action.batch[ACTION_KEY][:1, : action_chunk.shape[1], : action_chunk.shape[2]]
                 action_chunk = torch.where(
                     intervention_mask.unsqueeze(-1).to(action_chunk.device),
                     action_chunk,
                     rollout_action_chunk.to(device=action_chunk.device, dtype=action_chunk.dtype),
                 )
-
-            action_dp = DataProto.from_dict(
-                tensors={
-                    "action": action_chunk,
-                    "critic_value": critic_value_template.new_zeros(critic_value_template.shape),
-                }
-            )
-            feedback_dp = DataProto.from_dict(
-                tensors={field: feedback.batch[field][:, start:end] for field in FEEDBACK_FIELDS}
-            )
+            action_dp = DataProto.from_dict(tensors={INTERVENTION_ACTION_KEY: action_chunk})
+            feedback_dp = slice_dataproto_batch(feedback, start, end)
             expanded_steps.append({OBS_KEY: chunk_obs, ACTION_KEY: action_dp, FEEDBACK_KEY: feedback_dp})
 
             if chunk_idx < num_chunks - 1:
@@ -216,27 +179,15 @@ class EnvLoop:
                 action_result: DataProto = await asyncio.to_thread(rollout_futures[stage_id].get)
 
                 # send actions to env worker 
-                stored_action_result = action_result[:1] if self.single_env_rollout else action_result
-                trajectories[stage_id][-1][ACTION_KEY] = stored_action_result
                 action_batch_size = len(action_result)
-                if self.single_env_rollout:
-                    env_action = action_result.batch["action"][:1].cpu().numpy()
-                    env_critic_values = action_result.batch["critic_value"][:1].cpu().numpy()
-                else:
-                    env_action = action_result.batch["action"].cpu().numpy()
-                    env_critic_values = action_result.batch["critic_value"].cpu().numpy()
-                action_data = DataProto.from_dict(
-                    non_tensors={
-                        "actions": env_action,
-                        "critic_values": env_critic_values,
-                    },
-                    meta_info={"stage_id": stage_id},
-                )
-                env_ref = self.env_wg.env_interact_step(action_data)
+                action_result = action_result[:1] if self.single_env_rollout else action_result
+                trajectories[stage_id][-1][ACTION_KEY] = action_result
+                action_result.meta_info["stage_id"] = stage_id
+                env_ref = self.env_wg.env_interact_step(action_result)
 
                 # get results from env worker and process human intervention
                 env_result: DataProto = await asyncio.to_thread(env_ref.get)
-                feedback = DataProto.from_dict(tensors={field: env_result.batch[field] for field in FEEDBACK_FIELDS})
+                feedback = get_dataproto_from_prefix(env_result, FEEDBACK_KEY, ".")
                 intervention_info = get_dataproto_from_prefix(env_result, INTERVENTION_INFO_KEY, ".")
                 next_obs = get_dataproto_from_prefix(env_result, OBS_KEY, ".")
 
@@ -247,7 +198,7 @@ class EnvLoop:
                 if has_intervention:
                     expanded_steps = self._expand_single_env_intervention_steps(
                         current_obs=current_slot[OBS_KEY],
-                        rollout_action=stored_action_result,
+                        rollout_action=action_result,
                         feedback=feedback,
                         intervention_info=intervention_info,
                         max_chunks=self.max_interactions - step_idx,
@@ -315,12 +266,7 @@ class EnvLoop:
 
         batch_dict = {}
         for field_key in [OBS_KEY, ACTION_KEY, FEEDBACK_KEY]:
-            for key in flat_trajs[0][field_key].batch.keys():
-                per_step_values = [step[field_key].batch[key] for step in flat_trajs]
-                batch_dict[f"{field_key}.{key}"] = torch.stack(per_step_values, dim=1)
-            for key in flat_trajs[0][field_key].non_tensor_batch.keys():
-                per_step_values = [step[field_key].non_tensor_batch[key] for step in flat_trajs]
-                batch_dict[f"{field_key}.{key}"] = np.stack(per_step_values, axis=1)
+            batch_dict.update(stack_dataproto_with_padding([step[field_key] for step in flat_trajs], field_key))
 
         print(f"Final batch dict: {DataProto.from_single_dict(batch_dict, meta_info=meta_info)}")
         return DataProto.from_single_dict(batch_dict, meta_info=meta_info)
