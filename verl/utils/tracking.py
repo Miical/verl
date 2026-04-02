@@ -131,9 +131,6 @@ class Tracking:
             from volcengine_ml_platform import wandb as vemlp_wandb
 
             volcengine_ml_platform.init(
-                ak=os.environ["VOLC_ACCESS_KEY_ID"],
-                sk=os.environ["VOLC_SECRET_ACCESS_KEY"],
-                region=os.environ["MLP_TRACKING_REGION"],
             )
 
             vemlp_wandb.init(

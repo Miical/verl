@@ -277,6 +277,9 @@ class RobActorRolloutRefWorker(ActorRolloutRefWorker):
     def init_model(self):
         # This is used to import external_lib into the huggingface systems
         import_external_libs(self.config.model.get("external_lib", None))
+        
+        # Initialize QAT config before _build_model_optimizer
+        #self._init_qat_config()
 
         from omegaconf import OmegaConf
 
@@ -342,6 +345,7 @@ class RobActorRolloutRefWorker(ActorRolloutRefWorker):
                 lr_scheduler=self.actor_lr_scheduler,
                 processing_class=self.processor if self.processor is not None else self.tokenizer,
                 checkpoint_config=self.config.actor.checkpoint,
+                trust_remote_code=self.config.model.trust_remote_code,
             )
 
         torch.distributed.barrier()

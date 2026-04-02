@@ -62,7 +62,7 @@ MAX_EPISODE_STEPS=300                          # max episode steps for each env
                                                # max_interactions = MAX_EPISODE_STEPS / num_action_chunks
 
 # Training Config
-MINI_BATCH_SIZE=1024                           # mini batch size (batch size per GPU, automatically multiplied by ROLLOUT_N)
+MINI_BATCH_SIZE=1024                           # (batch size per GPU, automatically multiplied by ROLLOUT_N)
 MICRO_BATCH_SIZE=8                             # micro batch size (per GPU, for gradient accumulation, should divide MINI_BATCH_SIZE)
 
 
