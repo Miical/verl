@@ -312,7 +312,8 @@ class RobDataParallelSACActor(BaseSACActor):
             )
             if self.bc_loss_coef > 0:
                 bc_loss = self.actor_module.bc_loss(
-                    state_features=s0_state_features,
+                    obs=s0,
+                    tokenizer=self.tokenizer,
                     actions={"full_action": a0_actions},
                     valids=micro_batch.batch["info.valids"],
                 )

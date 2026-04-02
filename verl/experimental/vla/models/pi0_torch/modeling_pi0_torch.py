@@ -28,6 +28,7 @@ from verl.protocol import DataProto
 from verl.utils.device import get_device_name
 
 from ...sac.base import SupportSACTraining, ModelOutput
+from ...sft.base import SupportSFTTraining
 from ..modules.mlp import MLP
 from .configuration_pi0_torch import PI0TorchConfig
 from .model.modeling_pi0 import PI0Model, make_att_2d_masks
@@ -47,7 +48,7 @@ def beta_schedule(step, beta0, beta_min, T):
     return beta
 
 
-class PI0ForActionPrediction(PreTrainedModel, SupportSACTraining):
+class PI0ForActionPrediction(PreTrainedModel, SupportSACTraining, SupportSFTTraining):
     config_class = PI0TorchConfig
     base_model_prefix = "pi0_torch"
 
@@ -214,15 +215,46 @@ class PI0ForActionPrediction(PreTrainedModel, SupportSACTraining):
 
     def bc_loss(
         self,
-        state_features: tuple[tuple[torch.Tensor, torch.Tensor, torch.Tensor], torch.Tensor],
+        obs: DataProto,
+        tokenizer: torch.nn.Module,
         actions: dict[str, torch.Tensor],
         valids: torch.Tensor,
     ) -> torch.Tensor:
         """Calculate the BC loss for the actor."""
 
-        prefix_features, states = state_features
+        pi0_input_cls, pi0_output_cls = self._get_pi0_policy_classes()
+        pi0_input = pi0_input_cls.from_env_obs(obs)
+
+        with torch.no_grad():
+            states = self.state_normalize_transform(pi0_input.state)
+            images, _ = self.image_transform.call_batch(pi0_input.images)
+            lang_tokens, lang_masks = self.prompt_tokenizer_transform.call_batch(
+                {"task": pi0_input.task, "observation.state": states}, tokenizer
+            )
+            prefix_features = self.model.embed_prefix(
+                images=images,
+                img_masks=pi0_input.img_masks,
+                lang_tokens=lang_tokens,
+                lang_masks=lang_masks,
+            )
+
         _, prefix_pad_masks, _ = prefix_features
-        action_tensor = actions["full_action"]
+        action_tensor = pi0_output_cls.from_model_output(
+            {
+                "full_action": actions["full_action"],
+                "log_probs": torch.zeros(actions["full_action"].shape[0], device=actions["full_action"].device),
+            }
+        ).action
+        action_tensor = torch.nn.functional.pad(
+            action_tensor,
+            (
+                0,
+                self.model.max_action_dim - action_tensor.shape[-1],
+                0,
+                self.model.n_action_steps - action_tensor.shape[1],
+            ),
+            value=0.0,
+        )
 
         batch_size = action_tensor.shape[0]
         device = action_tensor.device
@@ -428,6 +460,13 @@ class PI0ForActionPrediction(PreTrainedModel, SupportSACTraining):
 
         for method in forward_methods:
             register_fsdp_forward_method(self, method)
+
+    @override
+    def sft_init(self):
+        """Initialize SFT-related components."""
+
+        self.freeze_vision_tower()
+        register_fsdp_forward_method(self, "bc_loss")
 
     @torch.no_grad()
     @override
