@@ -49,8 +49,10 @@ def create_env_batch(obs, rews, dones, infos, meta=None):
     return ret_dict
 
 
-def create_env_batch_dataproto(obs, rews, terminations, truncations, infos, meta=None):
-    ret_dict = {"obs": obs, "rews": rews, "terminations": terminations, "truncations": truncations, "infos": infos}
+def create_env_batch_dataproto(obs, rews, terminations, truncations, successes, infos, meta=None, valid_mask=None):
+    ret_dict = {"obs": obs, "rews": rews, "terminations": terminations, "truncations": truncations, "successes": successes, "infos": infos}
+    if valid_mask is not None:
+        ret_dict["valid_mask"] = valid_mask
     if meta is not None:
         ret_dict.update(meta=meta)
 
@@ -62,8 +64,14 @@ def create_env_batch_dataproto(obs, rews, terminations, truncations, infos, meta
         "rews": ret_dict["rews"],
         "terminations": ret_dict["terminations"],
         "truncations": ret_dict["truncations"],
+        "successes": ret_dict["successes"],
     }
-    non_tensor_batch = {"task_descriptions": obs["task_descriptions"]}
+    if "valid_mask" in ret_dict:
+        tensor_batch["valid_mask"] = ret_dict["valid_mask"]
+    non_tensor_batch = {
+        "task_descriptions": obs["task_descriptions"],
+        "task_assignment_keys": obs.get("task_assignment_keys", [""] * len(obs["task_descriptions"])),
+    }
     output = DataProto.from_dict(tensors=tensor_batch, non_tensors=non_tensor_batch)
 
     return output
@@ -130,6 +138,20 @@ class EnvWorker(Worker, DistProfilerExtension):
                         stage_id=stage_id,
                     )
                 )
+
+        elif self.cfg.train.simulator_type == "isaac_multitask":
+            from verl.experimental.vla.envs.isaac_env.isaac_multitask_env import IsaacMultiTaskEnv
+
+            for stage_id in range(self.stage_num):
+                self.simulator_list.append(
+                    EnvManager(
+                        self.cfg.train,
+                        rank=self._rank,
+                        world_size=self._world_size,
+                        env_cls=IsaacMultiTaskEnv,
+                        stage_id=stage_id,
+                    )
+                )
         else:
             raise NotImplementedError(f"Simulator type {self.cfg.train.simulator_type} not implemented")
 
@@ -138,6 +160,10 @@ class EnvWorker(Worker, DistProfilerExtension):
     def init_simulator(self):
         for i in range(self.stage_num):
             self.simulator_list[i].start_simulator()
+
+        if self.cfg.train.simulator_type == "isaac_multitask":
+            for i in range(self.stage_num):
+                self.simulator_list[i].init_env()
         return
 
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="env"), blocking=False)
@@ -161,9 +187,12 @@ class EnvWorker(Worker, DistProfilerExtension):
 
         env_info_list = {}
 
-        extracted_obs, chunk_rewards, chunk_terminations, chunk_truncations, infos = self.simulator_list[
-            stage_id
-        ].chunk_step(chunk_actions, chunk_values=chunk_values)
+        extracted_obs, chunk_rewards, chunk_terminations, chunk_truncations, infos = (
+            self.simulator_list[stage_id].chunk_step(chunk_actions, chunk_values=chunk_values)
+        )
+        # for IsaacLab Multitask, we need to extract the successes and valid_mask from the infos
+        chunk_successes = infos.pop("successes", torch.zeros_like(chunk_terminations))
+        valid_mask = infos.pop("valid_mask", None)
         chunk_dones = torch.logical_or(chunk_terminations, chunk_truncations)
 
         if chunk_dones.any():
@@ -177,8 +206,10 @@ class EnvWorker(Worker, DistProfilerExtension):
             rews=chunk_rewards,
             terminations=chunk_terminations,
             truncations=chunk_truncations,
+            successes=chunk_successes,
             infos=infos,
             meta=env_info_list,
+            valid_mask=valid_mask,
         )
         return env_batch
 
@@ -193,11 +224,13 @@ class EnvWorker(Worker, DistProfilerExtension):
     def reset_envs_to_state_ids(self, data: DataProto):
         """Reset environments to specified state IDs.
 
-        Args:
-            state_ids: State IDs to reset environments to
+        For ``isaac_multitask`` mode this performs a simple ``reset()`` since the
+        env is persistent and tasks are pre-assigned at creation time.
         """
         state_ids_list = list(data.non_tensor_batch["state_ids"])
         task_ids_list = list(data.non_tensor_batch["task_ids"])
+
+        is_multitask = self.cfg.train.simulator_type == "isaac_multitask"
 
         assert len(state_ids_list) == self.cfg.train.num_envs * self.stage_num, (
             f"state_ids_list length is {len(state_ids_list)}, but should be {self.cfg.train.num_envs * self.stage_num}"
@@ -216,28 +249,32 @@ class EnvWorker(Worker, DistProfilerExtension):
                     == 1
                 ), "rollout.n should equal to num_envs for isaac"
 
-            result = self.simulator_list[stage_id].reset_envs_to_state_ids(
-                state_ids_list[stage_id * self.cfg.train.num_envs : (stage_id + 1) * self.cfg.train.num_envs],
-                task_ids_list[stage_id * self.cfg.train.num_envs : (stage_id + 1) * self.cfg.train.num_envs],
-            )
+            if is_multitask:
+                result = self.simulator_list[stage_id].reset()
+            else:
+                result = self.simulator_list[stage_id].reset_envs_to_state_ids(
+                    state_ids_list[stage_id * self.cfg.train.num_envs : (stage_id + 1) * self.cfg.train.num_envs],
+                    task_ids_list[stage_id * self.cfg.train.num_envs : (stage_id + 1) * self.cfg.train.num_envs],
+                )
             result_list.append(result)
+
+        return self._pack_reset_results(result_list)
+
+    def _pack_reset_results(self, result_list: list) -> DataProto:
+        """Convert a list of per-stage reset results into a single DataProto."""
         output_tensor_dict = {}
         output_non_tensor_dict = {}
 
-        # Handle nested 'images_and_states'
         images_and_states_list = [d[0]["images_and_states"] for d in result_list]
         if images_and_states_list:
-            # Assuming all dicts in the list have the same keys
             for k in images_and_states_list[0].keys():
                 if isinstance(images_and_states_list[0][k], torch.Tensor):
                     output_tensor_dict[k] = torch.cat([d[k] for d in images_and_states_list])
 
-        # Handle 'task_descriptions'
         task_descriptions_list = [d[0]["task_descriptions"] for d in result_list]
         output_non_tensor_dict["task_descriptions"] = list(itertools.chain.from_iterable(task_descriptions_list))
 
-        output = DataProto.from_dict(tensors=output_tensor_dict, non_tensors=output_non_tensor_dict)
-        return output
+        return DataProto.from_dict(tensors=output_tensor_dict, non_tensors=output_non_tensor_dict)
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     @DistProfiler.annotate(color="gray", role="env_finish_rollout")

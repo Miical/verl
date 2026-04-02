@@ -26,6 +26,11 @@ logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 @dataclass
 class _DualPoolState:
+    """Per-task state holding separate positive (success) and negative (failure)
+    ring buffers. Splitting by outcome allows controlling the positive/negative
+    ratio during sampling, which is critical for sparse-reward multi-task
+    training where some tasks rarely succeed.
+    """
     positive_pool: Optional[TensorDict] = None
     negative_pool: Optional[TensorDict] = None
     positive_size: int = 0
@@ -35,13 +40,20 @@ class _DualPoolState:
 
 
 class SACReplayPool:
-    """Task-aware SAC Replay Pool.
+    """Task-aware SAC Replay Pool (rewritten from the original single-pool design).
 
-    For each task_id we maintain two independent pools:
-    - positive pool
-    - negative pool
+    Original design used a single flat ring buffer shared across all tasks.
+    This was replaced with per-task dual pools (positive/negative) because:
+    1. Multi-task training has severe task imbalance — easy tasks flood the
+       buffer and starve hard tasks of positive samples.
+    2. Positive/negative split lets us enforce a target ratio (e.g. 50/50)
+       so the critic sees enough success signals to learn from.
 
-    `single_pool_capacity` is the size of each single pool.
+    For each task_id we maintain two independent ring buffers:
+    - positive pool (samples where success==True)
+    - negative pool (all other samples)
+
+    `single_pool_capacity` is the capacity of each individual ring buffer.
     """
 
     def __init__(
@@ -63,7 +75,11 @@ class SACReplayPool:
         self.rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
 
     def add_batch(self, batch: TensorDict, task_ids: Sequence[Any]):
-        """Add a batch of samples into task-specific positive/negative pools."""
+        """Add a batch of samples into task-specific positive/negative pools.
+
+        Changed from original: now requires task_ids to route each sample to the
+        correct task pool, and uses positive_sample_mask to split pos/neg.
+        """
 
         if batch.batch_size[0] == 0:
             return
@@ -108,13 +124,14 @@ class SACReplayPool:
     ) -> TensorDict | tuple[TensorDict, dict]:
         """Sample a batch from all task-specific pools."""
 
-        # ========== 临时修复开始：处理样本不足的情况 ==========
-        # 原代码：
-        # assert self.size >= batch_size, "Not enough samples in replay pool to sample the requested batch size."
+        # Graceful fallback: early training iterations may not yet have enough
+        # samples. Original code asserted, which killed training on cold start.
         if self.size < batch_size:
-            batch_size = self.size  # 样本不够时，有多少用多少
-        # ========== 临时修复结束 ==========
+            batch_size = self.size
 
+        # Enforce the target positive/negative ratio in the sampled batch.
+        # If one side is insufficient, fill the deficit from the other side
+        # (preferring whichever has more remaining capacity).
         positive_sample_ratio = max(0.0, min(1.0, float(positive_sample_ratio)))
         target_positive = int(round(batch_size * positive_sample_ratio))
         target_negative = batch_size - target_positive
@@ -174,11 +191,35 @@ class SACReplayPool:
         if not return_sample_info:
             return sampled_batch
 
+        # Expose per-task positive pool sizes for WandB monitoring.
+        # task_positive_min/max highlight task imbalance — a large gap means
+        # some tasks are rarely succeeding and may need curriculum adjustment.
+        per_task_positive = {
+            task_id: pool_state.positive_size
+            for task_id, pool_state in self.task_pools.items()
+        }
+        min_task_positive = min(per_task_positive.values()) if per_task_positive else 0
+        max_task_positive = max(per_task_positive.values()) if per_task_positive else 0
+        dones = sampled_batch["dones"].bool()
+        if dones.dim() > 1:
+            dones = dones.any(dim=-1)
+        done_count = dones.sum().item()
+        if done_count > 0:
+            positive = sampled_batch["positive_sample_mask"].bool()
+            if positive.dim() > 1:
+                positive = positive.any(dim=-1)
+            success_rate = (positive & dones).sum().item() / done_count
+        else:
+            success_rate = 0.0
+
         sample_info = {
             "actual_positive_sample_ratio": sampled_positive / max(batch_size, 1),
             "positive_size": self.positive_size,
             "negative_size": self.negative_size,
             "task_count": len(self.task_pools),
+            "task_positive_min": min_task_positive,
+            "task_positive_max": max_task_positive,
+            "success_rate": success_rate,
         }
         return sampled_batch, sample_info
 
@@ -193,7 +234,11 @@ class SACReplayPool:
         return self.sample_batch(source.batch_size[0])
 
     def save(self, directory: str):
-        """Save the replay pool to a directory."""
+        """Save the replay pool to a directory.
+
+        Serialization format changed from v1 (single pool tensor + meta) to v3
+        (per-task dual pools with positions), so old checkpoints are incompatible.
+        """
 
         os.makedirs(directory, exist_ok=True)
         filepath = f"{directory}/sac_replay_pool_rank_{self.rank}.pt"
@@ -349,6 +394,11 @@ class SACReplayPool:
         return pool_state
 
     def _extract_positive_mask(self, batch: TensorDict) -> torch.Tensor:
+        """Extract a per-sample boolean from positive_sample_mask.
+
+        The mask may be (B,) or (B, H) depending on whether flatten_trajectories
+        has been applied; we reduce to (B,) so each sample is classified once.
+        """
         positive_mask = batch["positive_sample_mask"].to(torch.bool)
         if positive_mask.ndim == 1:
             return positive_mask
@@ -363,13 +413,23 @@ class SACReplayPool:
         )
 
     def _sample_from_task_pools(self, batch_size: int, is_positive_pool: bool) -> TensorDict:
+        """Distribute the requested batch_size across all tasks that have data.
+
+        For positive pools, equal_per_task=True ensures every task contributes
+        the same number of positive samples regardless of pool size. This
+        prevents easy tasks from dominating the positive signal. For negative
+        pools, allocation is proportional to pool size (round-robin).
+        """
         task_sizes = {
             task_id: (pool_state.positive_size if is_positive_pool else pool_state.negative_size)
             for task_id, pool_state in self.task_pools.items()
             if (pool_state.positive_size if is_positive_pool else pool_state.negative_size) > 0
         }
 
-        allocation = self._allocate_counts_across_tasks(task_sizes, batch_size)
+        equal_per_task = is_positive_pool
+        allocation = self._allocate_counts_across_tasks(
+            task_sizes, batch_size, equal_per_task=equal_per_task,
+        )
 
         sampled_parts = []
         for task_id, count in allocation.items():
@@ -399,36 +459,69 @@ class SACReplayPool:
         size = pool_state.positive_size if is_positive_pool else pool_state.negative_size
         assert pool is not None
 
-        idx = torch.randperm(size, device=self.pool_device)[:batch_size]
+        if batch_size <= size:
+            idx = torch.randperm(size, device=self.pool_device)[:batch_size]
+        else:
+            # Oversampling with replacement: when equal_per_task allocates more
+            # samples than a task's pool holds (e.g. hard task with few successes),
+            # we sample with replacement so scarce positive data is reused rather
+            # than silently dropped.
+            idx = torch.randint(0, size, (batch_size,), device=self.pool_device)
+
         return TensorDict(
             {key: value.index_select(0, idx).to(self.sample_device) for key, value in pool.items()},
             batch_size=[batch_size],
             device=self.sample_device,
         )
 
-    def _allocate_counts_across_tasks(self, task_sizes: dict[str, int], total_count: int) -> dict[str, int]:
-        total_available = sum(task_sizes.values())
-        if total_count > total_available:
-            raise ValueError(
-                f"Requested {total_count} samples but only {total_available} available across task pools."
-            )
+    def _allocate_counts_across_tasks(
+        self,
+        task_sizes: dict[str, int],
+        total_count: int,
+        equal_per_task: bool = False,
+    ) -> dict[str, int]:
+        """Decide how many samples each task contributes.
 
-        allocation: dict[str, int] = {task_id: 0 for task_id in task_sizes}
-        task_order = list(task_sizes.keys())
+        Two modes:
+        - equal_per_task=False (negative pool): round-robin proportional to pool
+          size, never exceeding what a task actually has.
+        - equal_per_task=True (positive pool): flat split (total/N per task).
+          May allocate more than a task's pool size — caller handles this via
+          oversampling (randint with replacement).
+        """
+        if not equal_per_task:
+            total_available = sum(task_sizes.values())
+            if total_count > total_available:
+                raise ValueError(
+                    f"Requested {total_count} samples but only {total_available} available across task pools."
+                )
 
-        remaining = total_count
-        while remaining > 0:
-            progressed = False
-            for task_id in task_order:
-                if allocation[task_id] < task_sizes[task_id]:
-                    allocation[task_id] += 1
-                    remaining -= 1
-                    progressed = True
-                    if remaining == 0:
-                        break
+            allocation: dict[str, int] = {task_id: 0 for task_id in task_sizes}
+            task_order = list(task_sizes.keys())
 
-            if not progressed:
-                raise RuntimeError("No eligible task pool left while allocation is still remaining.")
+            remaining = total_count
+            while remaining > 0:
+                progressed = False
+                for task_id in task_order:
+                    if allocation[task_id] < task_sizes[task_id]:
+                        allocation[task_id] += 1
+                        remaining -= 1
+                        progressed = True
+                        if remaining == 0:
+                            break
+
+                if not progressed:
+                    raise RuntimeError("No eligible task pool left while allocation is still remaining.")
+
+            return allocation
+
+        num_tasks = len(task_sizes)
+        base = total_count // num_tasks
+        extra = total_count % num_tasks
+
+        allocation = {}
+        for i, task_id in enumerate(task_sizes):
+            allocation[task_id] = base + (1 if i < extra else 0)
 
         return allocation
 

@@ -74,6 +74,9 @@ def compute_response_mask(config, data: DataProto) -> torch.Tensor:
 
 
 def compute_avg_positive_trajectory_length(batch: DataProto) -> float:
+    """Average trajectory length of successful episodes (episode mode only).
+    Used to monitor whether the agent learns to solve tasks faster over time.
+    """
     dones = batch.batch["dones"].bool()                    # (B, T)
     positive_mask = batch.batch["positive_sample_mask"]    # (B, T)
     positive_traj = positive_mask.any(dim=1)               # (B,)
@@ -89,19 +92,37 @@ def compute_avg_positive_trajectory_length(batch: DataProto) -> float:
 
 
 def flatten_trajectories(data: DataProto) -> DataProto:
+    """Reshape (B, H, ...) trajectories into (B*H, ...) flat transitions.
+
+    Also flattens non_tensor_batch (e.g. task_ids) by repeating each entry
+    H times so it stays aligned with the flattened tensor batch.
+    Original code only handled tensors; non_tensor_batch was added for
+    per-task replay pool support (see CHANGELOG: "Propagate real task_ids").
+    """
     batch_size, num_steps = data.batch["action"].shape[:2]
     new_batch_fields = {}
     for key, tensor in data.batch.items():
         if len(tensor.shape) >= 2 and tensor.shape[0] == batch_size and tensor.shape[1] == num_steps:
-            # (B, S, H, W) -> (B*S, H, W)
             new_shape = (batch_size * num_steps, *tensor.shape[2:])
             new_batch_fields[key] = tensor.reshape(new_shape)
         elif len(tensor.shape) == 1 and tensor.shape[0] == batch_size:
-            # [e1, e2] -> [e1, e1, ..., e2, e2, ...] (S times each)
             new_batch_fields[key] = tensor.repeat_interleave(num_steps)
         else:
             new_batch_fields[key] = tensor
-    new_data = DataProto.from_dict(tensors=new_batch_fields, meta_info=data.meta_info)
+
+    new_non_tensor = {}
+    if data.non_tensor_batch is not None:
+        for key, value in data.non_tensor_batch.items():
+            if hasattr(value, '__len__') and len(value) == batch_size:
+                new_non_tensor[key] = np.repeat(value, num_steps)
+            else:
+                new_non_tensor[key] = value
+
+    new_data = DataProto.from_dict(
+        tensors=new_batch_fields,
+        non_tensors=new_non_tensor if new_non_tensor else None,
+        meta_info=data.meta_info,
+    )
     return new_data
 
 
@@ -243,6 +264,90 @@ class RobRaySACTrainer(RayPPOTrainer):
         reset_future = self.env_wg.reset_envs_to_state_ids(reset_prompts)
         return reset_future
 
+    def _process_episode_batch(self, batch: DataProto, metrics: dict) -> DataProto:
+        """Process rollout batch in episode mode (fixed-length trajectories).
+
+        Derives rewards and dones from the `complete` flag set by env. The last
+        step gets a -1 reward as a timeout penalty. Positive samples are entire
+        trajectories that contain at least one success.
+        """
+        complete_any = batch.batch["complete"].any(dim=-1)  # (B, T)
+        dones_step = complete_any.clone()
+        dones_step[:, -2] = True
+        batch.batch["dones"] = dones_step.float()
+        sparse_rewards = complete_any.float()
+        batch.batch["valids"] = (~batch.batch["complete"]).any(dim=-1).float()
+        step_penalty = float(self.config.env.train.get("step_penalty", 0.0))
+        batch.batch["rewards"] = sparse_rewards - step_penalty * batch.batch["valids"]
+        batch.batch["rewards"][:, -2] = -1.0
+        batch.batch["positive_sample_mask"] = sparse_rewards.any(dim=-1).unsqueeze(-1).repeat_interleave(
+            batch.batch["action"].shape[1], dim=-1
+        )
+
+        average_reward = sparse_rewards.any(dim=-1).mean(dtype=torch.float32).item()
+        metrics["data/trajectory_avg_reward"] = average_reward
+        metrics["data/avg_positive_trajectory_length"] = compute_avg_positive_trajectory_length(batch)
+        return batch
+
+    def _process_rolling_batch(self, batch: DataProto, metrics: dict) -> DataProto:
+        """Process rollout batch in rolling mode using IsaacLab signals directly.
+
+        Unlike episode mode which derives rewards from `complete` flags, rolling
+        mode receives env_rewards, terminated, truncated, and success tensors
+        from IsaacLab. Key design decisions:
+        - valid_mask zeros out rewards from post-reset garbage steps (mid-chunk reset)
+        - positive_sample_mask uses `success` signal, not reward magnitude
+        - success_rate is per-episode (counted at done boundaries), not per-env
+        See CHANGELOG entries for details on each signal.
+        """
+        env_rewards = batch.batch["env_rewards"]  # (B, H, chunk) or (B, H)
+        terminated = batch.batch["terminated"]    # (B, H, chunk) or (B, H)
+        truncated = batch.batch["truncated"]      # (B, H, chunk) or (B, H)
+        success = batch.batch["success"]          # (B, H, chunk) or (B, H)
+
+        valid_mask = batch.batch.get("valid_mask", None)  # (B, H, chunk) or None
+
+        if env_rewards.dim() > 2:
+            if valid_mask is not None:
+                rewards_per_step = (env_rewards * valid_mask.float()).sum(dim=-1)
+            else:
+                rewards_per_step = env_rewards.sum(dim=-1)
+            terminated_any = terminated.any(dim=-1)          # (B, H)
+            truncated_any = truncated.any(dim=-1)            # (B, H)
+        else:
+            rewards_per_step = env_rewards
+            terminated_any = terminated.bool()
+            truncated_any = truncated.bool()
+
+        done_any = (terminated_any | truncated_any).float()
+
+        batch.batch["rewards"] = rewards_per_step
+        batch.batch["dones"] = done_any
+        if valid_mask is not None and valid_mask.dim() > 2:
+            batch.batch["valids"] = valid_mask.any(dim=-1).float()
+        else:
+            batch.batch["valids"] = torch.ones_like(done_any)
+        success_per_trajectory = success.any(dim=-1) if success.dim() > 2 else success.bool()
+        if success_per_trajectory.dim() > 1:
+            success_per_trajectory = success_per_trajectory.any(dim=-1)  # (B,)
+        batch.batch["positive_sample_mask"] = success_per_trajectory.unsqueeze(-1).repeat_interleave(
+            batch.batch["action"].shape[1], dim=-1
+        )
+
+        # Per-episode success rate: only count at episode boundaries (done=True)
+        success_per_step = success.any(dim=-1).float() if success.dim() > 2 else success.float()
+        total_episodes = done_any.sum().item()
+        total_successes = (success_per_step * done_any).sum().item()
+
+        average_reward = rewards_per_step.mean().item()
+        metrics["data/trajectory_avg_reward"] = average_reward
+        metrics["data/trajectory_avg_episode_reward"] = rewards_per_step.sum(dim=-1).mean().item()
+        metrics["data/done_rate"] = done_any.mean().item()
+        metrics["data/completed_episodes"] = total_episodes
+        metrics["data/successful_episodes"] = total_successes
+        metrics["data/success_rate"] = total_successes / max(total_episodes, 1)
+        return batch
+
     def fit(self):
         from omegaconf import OmegaConf
 
@@ -270,7 +375,7 @@ class RobRaySACTrainer(RayPPOTrainer):
             if self.config.trainer.get("val_only", False):
                 return
 
-        # add tqdm
+        # total_training_steps accounts for the rollout_interval inner loop
         self.total_training_steps = self.config.trainer.total_epochs * len(self.train_dataloader) * self.config.trainer.rollout_interval
         progress_bar = tqdm(total=self.total_training_steps, initial=self.global_steps, desc="Training Progress")
 
@@ -294,13 +399,17 @@ class RobRaySACTrainer(RayPPOTrainer):
             print(f"Starting epoch {epoch}, dataloader length: {dataloader_len}")
 
             for dataloader_step in range(dataloader_len):
+                # Inner loop: rollout_interval > 1 allows multiple SAC updates per
+                # rollout batch. Only the first iteration (training_step==0) runs
+                # env rollout; the rest re-use the replay pool with fresh samples.
                 for training_step in range(self.config.trainer.rollout_interval):
                     metrics = {}
                     timing_raw = {}
                     task_ids_from_dataloader = None
 
                     need_rollout = (training_step == 0)
-                    # need_rollout = False
+                    # Moved up from below so it's available before _reset_envs guard
+                    is_rolling = self.config.env.train.get("rollout_horizon", 0) > 0
                     is_last_step = self.global_steps >= self.total_training_steps
 
                     # start profiling
@@ -336,17 +445,23 @@ class RobRaySACTrainer(RayPPOTrainer):
                         gen_batch.meta_info["n_samples"] = self.config.actor_rollout_ref.rollout.n
                         gen_batch.meta_info["pad_token_id"] = self.tokenizer.pad_token_id
                         gen_batch = gen_batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
-                        if dataloader_step == 0:
+                        # Rolling mode manages its own resets via env_loop._initial_reset();
+                        # calling _reset_envs here would fail because gen_batch has fewer
+                        # state_ids than the env expects (1 stage vs NUM_STAGE stages).
+                        if dataloader_step == 0 and not is_rolling:
                             reset_future = self._reset_envs(gen_batch)
 
                     with marked_timer("step", timing_raw):
                         if need_rollout:
                             # generate a batch
                             with marked_timer("gen", timing_raw, color="red"):
-                                batch = self.async_rollout_manager.generate_sequences(gen_batch, reset_future)
+                                if is_rolling:
+                                    batch = self.async_rollout_manager.generate_sequences(gen_batch)
+                                else:
+                                    batch = self.async_rollout_manager.generate_sequences(gen_batch, reset_future)
 
-                            # prepare for next batch's env reset
-                            if dataloader_step != dataloader_len - 1:
+                            # prepare for next batch's env reset (episode mode only)
+                            if not is_rolling and dataloader_step != dataloader_len - 1:
                                 next_batch: DataProto = DataProto.from_single_dict(next_batch_dict)
                                 next_gen_batch = self._get_gen_batch(next_batch)
                                 next_gen_batch = next_gen_batch.repeat(
@@ -354,36 +469,42 @@ class RobRaySACTrainer(RayPPOTrainer):
                                 )
                                 reset_future = self._reset_envs(next_gen_batch)
 
-                            complete_any = batch.batch["complete"].any(dim=-1)  # (B, T)
-                            dones_step = complete_any.clone()
-                            dones_step[:, -2] = True
-                            batch.batch["dones"] = dones_step.float()
-                            sparse_rewards = complete_any.float()
-                            batch.batch["valids"] = (~batch.batch["complete"]).any(dim=-1).float()
-                            step_penalty = float(self.config.env.train.get("step_penalty", 0.0))
-                            batch.batch["rewards"] = sparse_rewards - step_penalty * batch.batch["valids"]
-                            batch.batch["rewards"][:, -2] = -1.0
-                            batch.batch["positive_sample_mask"] = sparse_rewards.any(dim=-1).unsqueeze(-1).repeat_interleave(
-                                batch.batch["action"].shape[1], dim=-1
-                            )
-
-                            average_reward = sparse_rewards.any(dim=-1).mean(dtype=torch.float32).item()
-                            metrics["data/trajectory_avg_reward"] = average_reward
-                            metrics["data/avg_positive_trajectory_length"] = compute_avg_positive_trajectory_length(batch)
+                            if is_rolling:
+                                batch = self._process_rolling_batch(batch, metrics)
+                            else:
+                                batch = self._process_episode_batch(batch, metrics)
 
                             batch = add_transition_prefixes(batch)
-                            assert task_ids_from_dataloader is not None
-                            rollout_level_task_ids = [
-                                task_id
-                                for task_id in task_ids_from_dataloader
-                                for _ in range(self.config.actor_rollout_ref.rollout.n)
-                            ]
-                            batch.batch["task_ids"] = torch.tensor(
-                                rollout_level_task_ids,
-                                dtype=torch.long,
-                                device=batch.batch["dones"].device,
-                            )
+
+                            # Propagate real task_ids for per-task replay pool balancing.
+                            # Rolling mode gets task_ids from env_worker via task_assignment_keys;
+                            # episode mode gets them from the dataloader.
+                            if is_rolling:
+                                if "task_assignment_keys" in batch.non_tensor_batch:
+                                    batch.non_tensor_batch["task_ids"] = batch.non_tensor_batch["task_assignment_keys"]
+                                else:
+                                    raise RuntimeError(
+                                        "Rolling mode requires 'task_assignment_keys' in non_tensor_batch "
+                                        "but it was not found. Check env_worker task assignment logic."
+                                    )
+                            else:
+                                assert task_ids_from_dataloader is not None
+                                rollout_level_task_ids = [
+                                    task_id
+                                    for task_id in task_ids_from_dataloader
+                                    for _ in range(self.config.actor_rollout_ref.rollout.n)
+                                ]
+                                batch.non_tensor_batch["task_ids"] = np.array(
+                                    rollout_level_task_ids, dtype=object
+                                )
                             batch = flatten_trajectories(batch)
+
+                            # Shuffle to break task-grouped ordering before FSDP sharding.
+                            # Without this, each FSDP rank always receives the same subset
+                            # of tasks (env indices are task-grouped), so per-rank replay
+                            # pools never see all tasks.
+                            shuffle_idx = torch.randperm(len(batch))
+                            batch = batch[shuffle_idx]
 
                             batch.meta_info["global_token_num"] = [0]
 
@@ -392,6 +513,8 @@ class RobRaySACTrainer(RayPPOTrainer):
                                 actor_output = self.actor_rollout_wg.update_actor(batch)
                             actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
                         else:
+                            # Non-rollout iterations (rollout_interval > 1): no new env
+                            # data, just sample from replay pool for additional SAC updates
                             with marked_timer("update_actor", timing_raw, color="red"):
                                 actor_output = self.actor_rollout_wg.update_actor(DataProto(meta_info={
                                     "empty_batch": True, 

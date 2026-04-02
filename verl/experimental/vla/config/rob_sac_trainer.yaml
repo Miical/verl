@@ -18,6 +18,7 @@ env:
   train:
     simulator_type: libero
     max_episode_steps: 512
+    rollout_horizon: 0
     reward_coef: 1.0
     step_penalty: 0.001
     only_eval: False

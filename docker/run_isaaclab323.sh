@@ -9,9 +9,10 @@ docker run \
     -e "ACCEPT_EULA=Y" \
     -it --gpus all \
     -v /dev/shm:/dev/shm:rw \
-    -v ~/iCode/RL/verl:/root/code/verl \
-    -v ~/iCode/RL/RobotLearningLab:/root/RobotLearningLab \
+    -v ~/Projects/verl:/root/code/verl \
+    -v ~/Projects/RobotLearningLab:/root/RobotLearningLab \
     -v /home/billyw/iDataset/VLA/openpi/checkpoint/pi05_libero_torch:/root/data/pi05_libero_torch \
     -v /home/billyw/iDataset/VLA/openpi/libero_rl:/root/data/libero_rl \
+    -v ~/Projects/verl/video:/root/video \
     verl-isaac-vla:latest \
     bash

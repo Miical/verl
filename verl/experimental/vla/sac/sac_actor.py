@@ -389,7 +389,7 @@ class RobDataParallelSACActor(BaseSACActor):
     @override
     def update_policy(self, data: DataProto):
         if "empty_batch" not in data.meta_info:
-            task_ids = data.batch["task_ids"]
+            task_ids = data.non_tensor_batch["task_ids"]
             self.replay_pool.add_batch(data.select([
                 "a0.full_action",
                 "a1.full_action",
@@ -516,7 +516,10 @@ class RobDataParallelSACActor(BaseSACActor):
             "sac/actor_replay_sampled_ratio": actor_replay_sample_info["actual_positive_sample_ratio"] if update_actor else 0.0,
             "sac/replay_pool_positive_size": critic_replay_sample_info["positive_size"],
             "sac/replay_pool_negative_size": critic_replay_sample_info["negative_size"],
+            "sac/replay_success_rate": critic_replay_sample_info["success_rate"],
             "sac/replay_task_count": critic_replay_sample_info["task_count"],
+            "sac/replay_task_positive_min": critic_replay_sample_info["task_positive_min"],
+            "sac/replay_task_positive_max": critic_replay_sample_info["task_positive_max"],
 
             "sac/alpha": self._get_alpha().detach().item(),
             "sac/actor_ema_enabled": float(self.actor_ema_enabled),

@@ -13,5 +13,6 @@
 # limitations under the License.
 
 from .isaac_env import IsaacEnv
+from .isaac_multitask_env import IsaacMultiTaskEnv
 
-__all__ = ["IsaacEnv"]
+__all__ = ["IsaacEnv", "IsaacMultiTaskEnv"]
