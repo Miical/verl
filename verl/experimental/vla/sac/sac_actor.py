@@ -99,6 +99,7 @@ def split_nested_dicts_or_tuples(data: dict | tuple, split_num: int) -> list[dic
     else:
         raise TypeError("Input data must be a torch.Tensor, dict, or tuple.")
 
+
 def valid_mean(x: torch.Tensor, valid: torch.Tensor) -> torch.Tensor:
     """Compute the mean of tensor `x` over valid entries indicated by `valid` mask.
 
@@ -147,10 +148,10 @@ class RobDataParallelSACActor(BaseSACActor):
         self.actor_ema_shadow: dict[str, torch.Tensor] = {}
         self.actor_ema_initialized = False
         self.bc_loss_coef = float(self.sac_config.get("bc_loss_coef", 0.5))
-    
+
     def _init_critic(self):
         """Initialize the critic optimizer."""
-        
+
         self.critic_optimizer = torch.optim.Adam(
             self.actor_module.sac_get_critic_parameters(),
             lr=self.config.critic_lr,
@@ -313,7 +314,9 @@ class RobDataParallelSACActor(BaseSACActor):
         critic_loss = per_critic.sum()
         return critic_loss
 
-    def _forward_critic(self, micro_batch: TensorDict, resample=True) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def _forward_critic(
+        self, micro_batch: TensorDict, resample=True
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         s0 = get_dict_from_prefix(micro_batch, "s0.")
         s1 = get_dict_from_prefix(micro_batch, "s1.")
         a0 = get_dict_from_prefix(micro_batch, "a0.")
@@ -325,7 +328,10 @@ class RobDataParallelSACActor(BaseSACActor):
                 state_features = self.actor_module.sac_forward_state_features(s)
                 s0_state_features, s1_state_features = split_nested_dicts_or_tuples(state_features, 2)
                 if resample:
-                    a1_actions, log_probs_1 = self.actor_module.sac_forward_actor(s1_state_features)
+                    a1_actions, log_probs_1, _ = self.actor_module.sac_forward_actor(
+                        s1_state_features,
+                        is_first_micro_batch=False,
+                    )
                     a1 = {"full_action": a1_actions}
                 else:
                     log_probs_1 = None
@@ -355,13 +361,20 @@ class RobDataParallelSACActor(BaseSACActor):
             )
         return critic_loss, q_values_0, q_values_1
 
-    def _forward_actor(self, micro_batch: TensorDict) -> tuple[torch.Tensor, Optional[torch.Tensor], torch.Tensor]:
+    def _forward_actor(
+        self,
+        micro_batch: TensorDict,
+        is_first_micro_batch: bool,
+    ) -> tuple[torch.Tensor, Optional[torch.Tensor], torch.Tensor, dict[str, float]]:
         micro_batch = micro_batch.to(get_device_id())
         s0 = get_dict_from_prefix(micro_batch, "s0.")
 
         with torch.autocast(device_type=get_device_name(), dtype=torch.bfloat16):
             s0_state_features = self.actor_module.sac_forward_state_features(s0)
-            a0_actions, log_probs_0 = self.actor_module.sac_forward_actor(s0_state_features)
+            a0_actions, log_probs_0, actor_forward_metrics = self.actor_module.sac_forward_actor(
+                s0_state_features,
+                is_first_micro_batch=is_first_micro_batch,
+            )
             q_values_0 = self.actor_module.sac_forward_critic(
                 {"full_action": a0_actions},
                 s0_state_features,
@@ -384,30 +397,45 @@ class RobDataParallelSACActor(BaseSACActor):
                 actor_loss = sac_loss + self.bc_loss_coef * bc_loss
             else:
                 actor_loss = sac_loss
-        return actor_loss, log_probs_0, q_values_0
+        return actor_loss, log_probs_0, q_values_0, actor_forward_metrics
+
+    def _force_set_lr(self, opt: torch.optim.Optimizer, lr: float):
+        for pg in opt.param_groups:
+            pg["lr"] = lr
 
     @override
     def update_policy(self, data: DataProto):
+        if not self.actor_ema_initialized:
+            self._init_actor_ema()
+
+        # self._force_set_lr(self.actor_optimizer, 5e-6)
+        # self._force_set_lr(self.critic_optimizer, 1e-4)
+
         if "empty_batch" not in data.meta_info:
             task_ids = data.batch["task_ids"]
-            self.replay_pool.add_batch(data.select([
-                "a0.full_action",
-                "a1.full_action",
-                "s0.states",
-                "s1.states",
-                "s0.images",
-                "s1.images",
-                "s0.image_masks",
-                "s1.image_masks",
-                "s0.lang_tokens",
-                "s1.lang_tokens",
-                "s0.lang_masks",
-                "s1.lang_masks",
-                "rewards",
-                "dones",
-                "valids",
-                "positive_sample_mask"
-            ]).batch, task_ids=task_ids)
+            self.replay_pool.add_batch(
+                data.select(
+                    [
+                        "a0.full_action",
+                        "a1.full_action",
+                        "s0.states",
+                        "s1.states",
+                        "s0.images",
+                        "s1.images",
+                        "s0.image_masks",
+                        "s1.image_masks",
+                        "s0.lang_tokens",
+                        "s1.lang_tokens",
+                        "s0.lang_masks",
+                        "s1.lang_masks",
+                        "rewards",
+                        "dones",
+                        "valids",
+                        "positive_sample_mask",
+                    ]
+                ).batch,
+                task_ids=task_ids,
+            )
 
         replay_positive_sample_ratio = float(self.sac_config.get("critic_replay_positive_sample_ratio", 0.5))
         critic_batch, critic_replay_sample_info = self.replay_pool.sample_batch(
@@ -422,6 +450,7 @@ class RobDataParallelSACActor(BaseSACActor):
         actor_logprobs_list, actor_qvalues_list = [], []
         critic_qvalues_0_list, critic_qvalues_1_list = [], []
         actor_loss_list, critic_loss_list, alpha_loss_list = [], [], []
+        actor_forward_metrics: dict[str, float] = {}
 
         # Training critic
         self.critic_optimizer.zero_grad()
@@ -429,17 +458,20 @@ class RobDataParallelSACActor(BaseSACActor):
             logger.info(f"[{batch_idx + 1}/{len(micro_batches)}] critic micro batch ")
 
             micro_batch = micro_batch.to(get_device_id())
-            raw_critic_loss, q_values_0, q_values_1 = self._forward_critic(micro_batch, resample=global_steps > self.config.critic_warmup_steps)
+            raw_critic_loss, q_values_0, q_values_1 = self._forward_critic(micro_batch, resample=True)
             (raw_critic_loss / grad_accum_steps).backward()
             critic_loss_list.append(raw_critic_loss.detach().item())
             critic_qvalues_0_list.append(q_values_0.mean(dim=-1).detach())
             critic_qvalues_1_list.append(q_values_1.detach())
-        critic_grad_norm = torch.nn.utils.clip_grad_norm_(self.actor_module.sac_get_critic_parameters(), 
-                                                          max_norm=self.config.grad_clip)
+        critic_grad_norm = torch.nn.utils.clip_grad_norm_(
+            self.actor_module.sac_get_critic_parameters(), max_norm=self.config.grad_clip
+        )
         self.critic_optimizer.step()
         self.critic_scheduler.step()
 
-        update_actor = (global_steps >= self.config.critic_warmup_steps and global_steps % self.config.actor_update_interval == 0)
+        update_actor = (
+            global_steps >= self.config.critic_warmup_steps and global_steps % self.config.actor_update_interval == 0
+        )
         if update_actor:
             replay_positive_sample_ratio = float(self.sac_config.get("actor_replay_positive_sample_ratio", 0.5))
             actor_batch, actor_replay_sample_info = self.replay_pool.sample_batch(
@@ -455,12 +487,16 @@ class RobDataParallelSACActor(BaseSACActor):
                 logger.info(f"[{batch_idx + 1}/{len(micro_batches)}] actor micro batch ")
 
                 micro_batch = micro_batch.to(get_device_id())
-                raw_actor_loss, log_probs, q_values = self._forward_actor(micro_batch)
+                raw_actor_loss, log_probs, q_values, actor_forward_metrics_mb = self._forward_actor(
+                    micro_batch,
+                    is_first_micro_batch=(batch_idx == 0),
+                )
                 (raw_actor_loss / grad_accum_steps).backward()
                 actor_loss_list.append(raw_actor_loss.detach().item())
                 if log_probs is not None:
                     actor_logprobs_list.append(log_probs.detach())
                 actor_qvalues_list.append(q_values.detach())
+                actor_forward_metrics.update(actor_forward_metrics_mb)
             actor_grad_norm = self._optimizer_step()
             self._update_actor_ema()
             self._apply_actor_ema_to_actor_module()
@@ -481,7 +517,6 @@ class RobDataParallelSACActor(BaseSACActor):
                 self.alpha_optimizer.step()
                 self.alpha_scheduler.step()
 
-
         # Update target networks
         self.actor_module.sac_update_target_network(self.sac_config.tau)
 
@@ -492,18 +527,26 @@ class RobDataParallelSACActor(BaseSACActor):
         # Log metrics
         positive_qvalue_mean = (
             torch.cat(critic_qvalues_0_list)[
-                (critic_batch["positive_sample_mask"].to(torch.bool) & critic_batch["valids"].to(torch.bool))
-                .to(torch.cat(critic_qvalues_0_list).device)
-            ].mean().detach().item()
+                (critic_batch["positive_sample_mask"].to(torch.bool) & critic_batch["valids"].to(torch.bool)).to(
+                    torch.cat(critic_qvalues_0_list).device
+                )
+            ]
+            .mean()
+            .detach()
+            .item()
             if critic_qvalues_0_list
             and (critic_batch["positive_sample_mask"].to(torch.bool) & critic_batch["valids"].to(torch.bool)).any()
             else 0.0
         )
         negative_qvalue_mean = (
             torch.cat(critic_qvalues_0_list)[
-                (~critic_batch["positive_sample_mask"].to(torch.bool) & critic_batch["valids"].to(torch.bool))
-                .to(torch.cat(critic_qvalues_0_list).device)
-            ].mean().detach().item()
+                (~critic_batch["positive_sample_mask"].to(torch.bool) & critic_batch["valids"].to(torch.bool)).to(
+                    torch.cat(critic_qvalues_0_list).device
+                )
+            ]
+            .mean()
+            .detach()
+            .item()
             if critic_qvalues_0_list
             and (~critic_batch["positive_sample_mask"].to(torch.bool) & critic_batch["valids"].to(torch.bool)).any()
             else 0.0
@@ -511,48 +554,60 @@ class RobDataParallelSACActor(BaseSACActor):
         metrics = {
             "data/reward_mean": valid_mean(critic_batch["rewards"], critic_batch["valids"]).detach().item(),
             "data/valid_ratio": critic_batch["valids"].float().mean().item(),
-            "data/positive_sample_ratio": valid_mean(critic_batch["positive_sample_mask"].float(), critic_batch["valids"]).detach().item(),
             "sac/critic_replay_sampled_ratio": critic_replay_sample_info["actual_positive_sample_ratio"],
-            "sac/actor_replay_sampled_ratio": actor_replay_sample_info["actual_positive_sample_ratio"] if update_actor else 0.0,
+            "sac/actor_replay_sampled_ratio": actor_replay_sample_info["actual_positive_sample_ratio"]
+            if update_actor
+            else 0.0,
             "sac/replay_pool_positive_size": critic_replay_sample_info["positive_size"],
             "sac/replay_pool_negative_size": critic_replay_sample_info["negative_size"],
             "sac/replay_task_count": critic_replay_sample_info["task_count"],
-
             "sac/alpha": self._get_alpha().detach().item(),
             "sac/actor_ema_enabled": float(self.actor_ema_enabled),
             "sac/actor_ema_decay": self.actor_ema_decay,
             "sac/replay_pool_size": len(self.replay_pool),
-
             "critic/loss": sum(critic_loss_list) / len(critic_loss_list) if critic_loss_list else 0.0,
             "critic/lr": self.critic_optimizer.param_groups[0]["lr"],
             "critic/grad_norm": critic_grad_norm.detach().item(),
             "critic/qvalue0_mean": (
                 valid_mean(torch.cat(critic_qvalues_0_list), critic_batch["valids"]).detach().item()
-                if critic_qvalues_0_list else 0.0
+                if critic_qvalues_0_list
+                else 0.0
             ),
             "critic/qvalue1_mean": (
                 valid_mean(torch.cat(critic_qvalues_1_list), critic_batch["valids"]).detach().item()
-                if critic_qvalues_1_list else 0.0
+                if critic_qvalues_1_list
+                else 0.0
             ),
             "critic/positive_qvalue_mean": positive_qvalue_mean,
             "critic/negative_qvalue_mean": negative_qvalue_mean,
             "critic/diff_pos_neg_qvalue_mean": positive_qvalue_mean - negative_qvalue_mean,
         }
         if update_actor:
-            metrics.update({
-                "actor/loss": sum(actor_loss_list) / len(actor_loss_list),
-                "actor/lr": self.actor_optimizer.param_groups[0]["lr"],
-                "actor/grad_norm": actor_grad_norm.detach().item(),
-                "actor/logprob_mean": (
-                    valid_mean(torch.cat(actor_logprobs_list), actor_batch["valids"]).detach().item()
-                    if actor_logprobs_list else 0.0
-                ),
-                "actor/qvalue_mean": valid_mean(torch.cat(actor_qvalues_list), actor_batch["valids"]).detach().item(),
-
-                "sac/alpha_lr": self.alpha_optimizer.param_groups[0]["lr"] if self.auto_entropy and actor_logprobs_list else 0.0,
-                "sac/alpha_loss": sum(alpha_loss_list) / len(alpha_loss_list) if self.auto_entropy and alpha_loss_list else 0.0,
-                "sac/alpha_grad_norm": alpha_grad_norm.detach().item() if self.auto_entropy and actor_logprobs_list else 0.0,
-            })
+            metrics.update(
+                {
+                    "actor/loss": sum(actor_loss_list) / len(actor_loss_list),
+                    "actor/lr": self.actor_optimizer.param_groups[0]["lr"],
+                    "actor/grad_norm": actor_grad_norm.detach().item(),
+                    "actor/logprob_mean": (
+                        valid_mean(torch.cat(actor_logprobs_list), actor_batch["valids"]).detach().item()
+                        if actor_logprobs_list
+                        else 0.0
+                    ),
+                    "actor/qvalue_mean": valid_mean(torch.cat(actor_qvalues_list), actor_batch["valids"])
+                    .detach()
+                    .item(),
+                    "sac/alpha_lr": self.alpha_optimizer.param_groups[0]["lr"]
+                    if self.auto_entropy and actor_logprobs_list
+                    else 0.0,
+                    "sac/alpha_loss": sum(alpha_loss_list) / len(alpha_loss_list)
+                    if self.auto_entropy and alpha_loss_list
+                    else 0.0,
+                    "sac/alpha_grad_norm": alpha_grad_norm.detach().item()
+                    if self.auto_entropy and actor_logprobs_list
+                    else 0.0,
+                }
+            )
+            metrics.update({f"actor/{k}": v for k, v in actor_forward_metrics.items()})
 
         return metrics
 

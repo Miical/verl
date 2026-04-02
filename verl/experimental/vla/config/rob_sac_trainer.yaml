@@ -26,7 +26,7 @@ env:
       video_base_dir: /tmp/videos
     num_envs: 16
     seed: 42
-    task_suite_name: libero_object
+    task_suite_name: libero_spatial
     init_params:
       camera_depths: False
       camera_heights: 256
@@ -43,14 +43,19 @@ actor_rollout_ref:
   model:
     override_config:
       sac_enable: True
-      double_q: True
+      flow_sde_enable: False 
+      flow_sde_noise_level: 0.065
+      flow_sde_rollout_noise_scale: 1.0
+      flow_sde_train_noise_scale: 1.0
+      flow_sde_initial_beta: 1.0
+      flow_sde_beta_min: 0.02
+      flow_sde_beta_schedule_T: 4000
   actor:
     sac:
       gamma: 0.99
       tau: 1.0
       bc_loss_coef: 0
       initial_alpha: 0
-      replay_positive_sample_ratio: 0.9
       critic_replay_positive_sample_ratio: 0.5
       actor_replay_positive_sample_ratio: 0.8
       auto_entropy: False
@@ -59,14 +64,15 @@ actor_rollout_ref:
       target_entropy: -64.0
     critic_lr: 0.0001
     critic_weight_decay: 0
-    critic_warmup_steps: 500
+    warm_rollout_steps: 5
+    critic_warmup_steps: 200
     actor_update_interval: 1
     actor_ema_enabled: true
     actor_ema_decay: 0.95
-    replay_pool_save_interval: 300
+    replay_pool_save_interval: 500
     num_images_in_input: 1
     traj_mini_batch_size: 16
-    replay_pool_single_size: 1000
+    replay_pool_single_size: 2000
     replay_pool_save_dir: /tmp/replay_pools
     fsdp_config:
       wrap_policy:

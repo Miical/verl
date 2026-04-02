@@ -14,13 +14,13 @@
 
 from __future__ import annotations
 
+import math
 from typing import Literal
 
 import torch
 from onnx_ir import Tensor
 from torch import nn
 from torch.distributed.fsdp import register_fsdp_forward_method
-from torch.distributions import Normal
 from transformers import PreTrainedModel
 from typing_extensions import override
 
@@ -38,6 +38,12 @@ from .pi0_utils import (
     Unnormalize,
 )
 from .policy.base import Pi0Output
+
+
+def beta_schedule(step, beta0, beta_min, T):
+    progress = min(step / T, 1.0)
+    beta = beta_min + (beta0 - beta_min) * 0.5 * (1 + math.cos(math.pi * progress))
+    return beta
 
 
 class PI0ForActionPrediction(PreTrainedModel, SupportSACTraining):
@@ -66,11 +72,37 @@ class PI0ForActionPrediction(PreTrainedModel, SupportSACTraining):
         self.state_unnormalize_transform = Unnormalize(self.state_norm_stats, use_quantiles=self.pi05_enabled)
         self.action_unnormalize_transform = Unnormalize(self.action_norm_stats, use_quantiles=self.pi05_enabled)
 
+        # Flow SDE parameters
         self._to(get_device_name())
+        self.flow_sde_enable = bool(getattr(config, "flow_sde_enable", True))
+        self.flow_sde_noise_level = float(getattr(config, "flow_sde_noise_level", 0.5))
+        self.flow_sde_rollout_noise_scale = float(getattr(config, "flow_sde_rollout_noise_scale", 1.0))
+        self.flow_sde_train_noise_scale = float(getattr(config, "flow_sde_train_noise_scale", 1.0))
+        self.flow_sde_initial_beta = float(getattr(config, "flow_sde_initial_beta", 1.0))
+        self.flow_sde_beta_min = float(getattr(config, "flow_sde_beta_min", 0.02))
+        self.flow_sde_beta_schedule_T = int(getattr(config, "flow_sde_beta_schedule_T", 2000))
+        self.register_buffer("flow_sde_step", torch.zeros((), dtype=torch.long))
 
         ##### SAC Algorithm Support #####
         if getattr(self.config, "sac_enable", False):
-            head_num = 2 if getattr(self.config, "double_q", True) else 1
+            head_num = int(getattr(self.config, "critic_head_num", 10))
+            attn_heads = int(getattr(self.config, "critic_prefix_attn_heads", 8))
+
+            self.critic_state_token = nn.Parameter(torch.zeros(1, 1, 2048))
+            self.target_state_token = nn.Parameter(torch.zeros(1, 1, 2048))
+            nn.init.normal_(self.critic_state_token, mean=0.0, std=0.02)
+            self.target_state_token.data.copy_(self.critic_state_token.data)
+
+            self.critic_prefix_cross_attn = nn.MultiheadAttention(
+                embed_dim=2048,
+                num_heads=attn_heads,
+                batch_first=True,
+            )
+            self.target_prefix_cross_attn = nn.MultiheadAttention(
+                embed_dim=2048,
+                num_heads=attn_heads,
+                batch_first=True,
+            )
 
             self.critic_heads = nn.ModuleList(
                 [
@@ -99,6 +131,7 @@ class PI0ForActionPrediction(PreTrainedModel, SupportSACTraining):
             )
 
             self.target_network_heads.load_state_dict(self.critic_heads.state_dict())
+            self.target_prefix_cross_attn.load_state_dict(self.critic_prefix_cross_attn.state_dict())
 
     def _to(self, device: torch.device | str):
         self.state_normalize_transform.to(device)
@@ -150,6 +183,7 @@ class PI0ForActionPrediction(PreTrainedModel, SupportSACTraining):
         self,
         env_obs: DataProto,
         tokenizer,
+        validate: bool = False,
     ) -> tuple[Pi0Output, dict, dict]:
         """Run one forward pass from raw inputs to final action sequence.
 
@@ -181,15 +215,27 @@ class PI0ForActionPrediction(PreTrainedModel, SupportSACTraining):
             {"task": pi0_input.task, "observation.state": state}, tokenizer
         )
 
-        # Inference
-        pred_action = self.model.sample_actions(images, pi0_input.img_masks, lang_tokens, lang_masks, state=state)
+        if self.flow_sde_enable and not validate:
+            prefix_features = self.model.embed_prefix(
+                images=images,
+                img_masks=pi0_input.img_masks,
+                lang_tokens=lang_tokens,
+                lang_masks=lang_masks,
+            )
+            pred_action, rollout_log_probs = self._sample_actions_flow_sde(
+                state_features=(prefix_features, state),
+                noise_scale=self.flow_sde_rollout_noise_scale,
+                requires_grad=False,
+                return_log_prob=True,
+            )
+        else:
+            pred_action = self.model.sample_actions(images, pi0_input.img_masks, lang_tokens, lang_masks, state=state)
+            rollout_log_probs = torch.zeros(pred_action.shape[0], device=pred_action.device, dtype=torch.float32)
 
         # Output transforms
         from .policy.libero_policy import LiberoPi0Output
 
-        pi0_output = LiberoPi0Output.from_model_output({
-            "full_action": self.action_unnormalize_transform(pred_action)
-        })
+        pi0_output = LiberoPi0Output.from_model_output({"full_action": self.action_unnormalize_transform(pred_action)})
         s = {
             "states": state,
             "images": torch.stack(images, dim=1),
@@ -199,6 +245,7 @@ class PI0ForActionPrediction(PreTrainedModel, SupportSACTraining):
         }
         a = {
             "full_action": pred_action,
+            "log_probs": rollout_log_probs,
         }
 
         return pi0_output, s, a
@@ -214,6 +261,14 @@ class PI0ForActionPrediction(PreTrainedModel, SupportSACTraining):
         policy.model = PI0Model.from_pretrained(pretrained_model_name_or_path)
         return policy
 
+    # def load_state_dict(self, state_dict, strict: bool = True, assign: bool = False):
+    #     filtered_state_dict = {
+    #         key: value
+    #         for key, value in state_dict.items()
+    #         if key.startswith("model.")
+    #     }
+    #     return super().load_state_dict(filtered_state_dict, strict=False, assign=assign)
+
     def freeze_vision_tower(self) -> None:
         """Freeze the vision tower parameters."""
 
@@ -222,7 +277,7 @@ class PI0ForActionPrediction(PreTrainedModel, SupportSACTraining):
         vision_tower = self.model.paligemma_with_expert.vision_tower
         vision_tower.requires_grad_(False)
         vision_tower.eval()
-    
+
     def bc_loss(
         self,
         state_features: tuple[tuple[torch.Tensor, torch.Tensor, torch.Tensor], torch.Tensor],
@@ -276,6 +331,132 @@ class PI0ForActionPrediction(PreTrainedModel, SupportSACTraining):
 
         return q_values
 
+    def _cross_attention_pool_prefix(
+        self,
+        prefix_embs: torch.Tensor,
+        prefix_pad_masks: torch.Tensor,
+        use_target_network: bool,
+    ) -> torch.Tensor:
+        cross_attn = self.target_prefix_cross_attn if use_target_network else self.critic_prefix_cross_attn
+        state_token = self.target_state_token if use_target_network else self.critic_state_token
+
+        batch_size = prefix_embs.shape[0]
+        query = state_token.expand(batch_size, -1, -1)
+        key_padding_mask = ~prefix_pad_masks.to(dtype=torch.bool)
+
+        pooled, _ = cross_attn(
+            query=query,
+            key=prefix_embs,
+            value=prefix_embs,
+            key_padding_mask=key_padding_mask,
+            need_weights=False,
+        )
+        return pooled.squeeze(1)
+
+    def _gaussian_log_prob(
+        self,
+        sample: torch.Tensor,
+        mean: torch.Tensor,
+        std: torch.Tensor,
+    ) -> torch.Tensor:
+        std_safe = std.clamp_min(1e-6)
+        log_prob = -0.5 * (((sample - mean) / std_safe) ** 2 + 2.0 * torch.log(std_safe) + math.log(2.0 * math.pi))
+        return log_prob.mean(dim=(-1, -2))
+
+    def flow_sde_beta(self) -> torch.Tensor:
+        beta = beta_schedule(
+            int(self.flow_sde_step.item()),
+            beta0=self.flow_sde_initial_beta,
+            beta_min=self.flow_sde_beta_min,
+            T=self.flow_sde_beta_schedule_T,
+        )
+        return torch.tensor(beta, device=self.flow_sde_step.device, dtype=torch.float32)
+
+    def _sample_actions_flow_sde(
+        self,
+        state_features: tuple[tuple[torch.Tensor, torch.Tensor, torch.Tensor], torch.Tensor],
+        noise_scale: float,
+        requires_grad: bool,
+        return_log_prob: bool,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """
+        add noise to the action sampling process using Flow-SDE method.
+        see https://arxiv.org/abs/2510.25889
+        """
+
+        prefix_features, states = state_features
+        prefix_embs, prefix_pad_masks, _ = prefix_features
+        batch_size = prefix_embs.shape[0]
+        device = prefix_embs.device
+        beta = self.flow_sde_beta().to(device=device, dtype=prefix_embs.dtype)
+
+        past_key_values = self._build_kv_cache_from_prefix(prefix_features)
+        actions_shape = (batch_size, self.model.n_action_steps, self.model.max_action_dim)
+        x_t = torch.randn(actions_shape, device=device, dtype=prefix_embs.dtype)
+
+        timesteps = torch.linspace(1.0, 0.0, self.model.num_steps + 1, dtype=torch.float32, device=device)
+        step_log_probs: list[torch.Tensor] = []
+
+        for idx in range(self.model.num_steps):
+            t_cur = timesteps[idx]
+            t_next = timesteps[idx + 1]
+            delta = (t_cur - t_next).clamp_min(1e-6)
+
+            if requires_grad:
+                v_t = self.model.denoise_step(
+                    states,
+                    prefix_pad_masks,
+                    past_key_values,
+                    x_t,
+                    t_cur.expand(batch_size),
+                )
+            else:
+                with torch.no_grad():
+                    v_t = self.model.denoise_step(
+                        states,
+                        prefix_pad_masks,
+                        past_key_values,
+                        x_t,
+                        t_cur.expand(batch_size),
+                    )
+
+            t_cur_safe = t_cur.clamp(min=1e-4, max=1.0 - 1e-4)
+            t_cur_exp = t_cur_safe.view(1, 1, 1)
+            t_next_exp = t_next.view(1, 1, 1)
+            delta_exp = delta.view(1, 1, 1)
+
+            x0_pred = x_t - v_t * t_cur_exp
+            x1_pred = x_t + v_t * (1.0 - t_cur_exp)
+
+            if noise_scale > 0:
+                sigma_schedule = self.flow_sde_noise_level * noise_scale * torch.sqrt(t_cur_safe / (1.0 - t_cur_safe))
+                sigma = beta * sigma_schedule
+                sigma_exp = sigma.view(1, 1, 1)
+                x0_weight = 1.0 - t_next_exp
+                x1_weight = t_next_exp - sigma_exp.pow(2) * delta_exp / (2.0 * t_cur_exp)
+                x_mean = x0_pred * x0_weight + x1_pred * x1_weight
+                sigma_t = torch.sqrt(delta_exp) * sigma_exp
+                eps = torch.randn_like(x_t)
+                x_prev = x_mean + sigma_t * eps
+            else:
+                x0_weight = 1.0 - t_next_exp
+                x1_weight = t_next_exp
+                x_mean = x0_pred * x0_weight + x1_pred * x1_weight
+                sigma_t = torch.zeros_like(x_mean)
+                x_prev = x_mean
+
+            if return_log_prob:
+                step_log_probs.append(self._gaussian_log_prob(x_prev, x_mean, sigma_t))
+
+            x_t = x_prev
+
+        if return_log_prob:
+            log_probs = torch.stack(step_log_probs, dim=1).sum(dim=1)
+        else:
+            log_probs = None
+
+        return x_t, log_probs
+
     def _build_kv_cache_from_prefix(
         self,
         prefix_features: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
@@ -316,50 +497,23 @@ class PI0ForActionPrediction(PreTrainedModel, SupportSACTraining):
             tuple[torch.Tensor, torch.Tensor, torch.Tensor],
             torch.Tensor,
         ],
-    ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        prefix_features, states = state_features
-
-        prefix_embs, prefix_pad_masks, _ = prefix_features
-        batch_size = prefix_embs.shape[0]
-        device = prefix_embs.device
-
-        past_key_values = self._build_kv_cache_from_prefix(prefix_features)
-
-        actions_shape = (batch_size, self.model.n_action_steps, self.model.max_action_dim)
-        dt = -1.0 / float(self.model.num_steps)
-        t_grid = torch.arange(1.0, -dt / 2, dt, dtype=torch.float32, device=device)
-
-        with torch.no_grad():
-            a0 = self.model.sample_noise(actions_shape, device=device)
-            for tt in t_grid:
-                v_prev = self.model.denoise_step(
-                    states,
-                    prefix_pad_masks,
-                    past_key_values,
-                    a0,
-                    tt.expand(batch_size),
-                )
-                a0 = a0 + dt * v_prev
-            a0 = a0.detach()
-
-        z = self.model.sample_noise(actions_shape, device=device)
-        gamma1 = torch.empty((batch_size,), device=device).uniform_(0, 1).pow(1 / 1.5)
-        gamma2 = torch.empty((batch_size,), device=device).uniform_(0, 1).pow(1 / 1.0)
-        t = (gamma1 / (gamma1 + gamma2)) * 0.999 + 0.001
-        t = t.to(dtype=torch.float32, device=device)
-        t_expanded = t[:, None, None]
-        a_t = (1.0 - t_expanded) * a0 + t_expanded * z
-
-        v_theta = self.model.denoise_step(
-            states,
-            prefix_pad_masks,
-            past_key_values,
-            a_t,
-            t,
+        is_first_micro_batch: bool = False,
+    ) -> tuple[torch.Tensor, torch.Tensor | None, dict[str, float]]:
+        actions, log_probs = self._sample_actions_flow_sde(
+            state_features=state_features,
+            noise_scale=self.flow_sde_train_noise_scale,
+            requires_grad=True,
+            return_log_prob=True,
         )
-        a0_hat = a_t - t_expanded * v_theta
-
-        return a0_hat, None
+        if is_first_micro_batch:
+            self.flow_sde_step.add_(1)
+        actor_metrics: dict[str, float] = {}
+        if self.flow_sde_enable:
+            actor_metrics = {
+                "flow_sde_beta": float(self.flow_sde_beta().item()),
+                "flow_sde_step": float(self.flow_sde_step.item()),
+            }
+        return actions, log_probs, actor_metrics
 
     @override
     def sac_forward_critic(
@@ -377,30 +531,39 @@ class PI0ForActionPrediction(PreTrainedModel, SupportSACTraining):
         critic_head = self.target_network_heads if use_target_network else self.critic_heads
         for p in critic_head.parameters():
             p.requires_grad_(requires_grad)
+        prefix_cross_attn = self.target_prefix_cross_attn if use_target_network else self.critic_prefix_cross_attn
+        for p in prefix_cross_attn.parameters():
+            p.requires_grad_(requires_grad)
+        if use_target_network:
+            self.target_state_token.requires_grad_(requires_grad)
+        else:
+            self.critic_state_token.requires_grad_(requires_grad)
 
         prefix_features, states = state_features
-        prefix_embs, _, _ = prefix_features
-        mean_prefix_embs = prefix_embs.mean(dim=1, keepdim=False)  # (B, 2048)
+        prefix_embs, prefix_pad_masks, _ = prefix_features
+        pooled_prefix_embs = self._cross_attention_pool_prefix(
+            prefix_embs=prefix_embs,
+            prefix_pad_masks=prefix_pad_masks,
+            use_target_network=use_target_network,
+        )  # (B, 2048)
         actions = a["full_action"][:, :10, :7]  # (B, 10, 7)
         flattened_actions = actions.reshape(actions.shape[0], -1)  # (B, 70)
-        critic_input = torch.cat([mean_prefix_embs, states, flattened_actions], dim=-1)  # (B, 2150)
+        critic_input = torch.cat([pooled_prefix_embs, states, flattened_actions], dim=-1)
 
         q_values = self._multi_heads_value(critic_head, critic_input, method=method)
 
         return q_values
-    
+
     @override
     def sac_get_critic_parameters(self) -> list[torch.nn.Parameter]:
         critic_head_params = [p for head in self.critic_heads for p in head.parameters()]
-        return critic_head_params
+        critic_prefix_cross_attn_params = list(self.critic_prefix_cross_attn.parameters())
+        return critic_head_params + critic_prefix_cross_attn_params + [self.critic_state_token]
 
     @override
     def sac_get_named_actor_parameters(self) -> list[tuple[str, torch.nn.Parameter]]:
-        return [
-            (name, param)
-            for name, param in self.model.named_parameters()
-            if param.requires_grad
-        ]
+        named_parameters = [(name, param) for name, param in self.model.named_parameters() if param.requires_grad]
+        return named_parameters
 
     @override
     def sac_forward_state_features(
@@ -424,3 +587,11 @@ class PI0ForActionPrediction(PreTrainedModel, SupportSACTraining):
             for k in t_sd.keys():
                 t_sd[k].mul_(1.0 - tau).add_(h_sd[k], alpha=tau)
             t_head.load_state_dict(t_sd, strict=True)
+
+        t_cross_attn_sd = self.target_prefix_cross_attn.state_dict()
+        cross_attn_sd = self.critic_prefix_cross_attn.state_dict()
+        for k in t_cross_attn_sd.keys():
+            t_cross_attn_sd[k].mul_(1.0 - tau).add_(cross_attn_sd[k], alpha=tau)
+        self.target_prefix_cross_attn.load_state_dict(t_cross_attn_sd, strict=True)
+
+        self.target_state_token.data.mul_(1.0 - tau).add_(self.critic_state_token.data, alpha=tau)

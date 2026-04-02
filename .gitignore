@@ -7,3 +7,7 @@
 __pycache__/
 .ipynb_checkpoints/
 outputs/
+*.log
+wandb/
+verl/experimental/vla/wandb/
+*.wandb

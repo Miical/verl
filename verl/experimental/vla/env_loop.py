@@ -70,11 +70,7 @@ class EnvLoop:
 
         reset_results = reset_future.get()
 
-        try:
-            loop = asyncio.get_event_loop()
-        except RuntimeError:
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
+        loop = asyncio.get_event_loop()
         self.rollout_wg.switch_to_rollout()
         output = loop.run_until_complete(self.run(prompts, reset_results))
         self.rollout_wg.switch_to_train()
@@ -113,7 +109,7 @@ class EnvLoop:
         async def _stage_loop(stage_id: int):
             for step_idx in range(self.max_interactions):
                 if stage_id == 0:
-                    logger.info(f"[{step_idx}/{self.max_interactions}] rollout step")
+                    print(f"[{step_idx}/{self.max_interactions - 1}] rollout step")
                 action_result: DataProto = await asyncio.to_thread(rollout_futures[stage_id].get)
 
                 trajectories[stage_id][-1]["action"] = action_result
