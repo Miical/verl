@@ -1,4 +1,6 @@
 set -x
+CONFIG_DIR="./config"
+CONFIG_NAME="rob_sac_trainer.yaml"
 libero_train_path=$HOME/data/libero_rl/train.parquet
 libero_test_path=$HOME/data/libero_rl/test.parquet
 
@@ -61,6 +63,8 @@ fi
 export VERL_LOGGING_LEVEL=INFO
 
 $PYTHON -m verl.experimental.vla.main_sac \
+    --config-path $CONFIG_DIR \
+    --config-name $CONFIG_NAME \
     data.train_files="$train_files" \
     data.val_files="$test_files" \
     data.train_batch_size=$TRAIN_BATCH_SIZE \

@@ -1,10 +1,9 @@
-#!/bin/bash
 set -x
-
-echo "remember to set ray param < --resources='{\"sim\"/\"actor_rollout\":1}' > if using disagg sim"
-
+CONFIG_DIR="./config"
+CONFIG_NAME="rob_ppo_trainer.yaml"
 libero_train_path=$HOME/data/libero_rl/train.parquet
 libero_test_path=$HOME/data/libero_rl/test.parquet
+
 
 train_files=$libero_train_path
 test_files=$libero_test_path
@@ -13,26 +12,17 @@ OUTPUT_DIR=${MLP_MODEL_OUTPUT:-"$HOME/models/vla_libero_grpo"}
 VIDEO_OUTPUT=${MLP_MODEL_OUTPUT:-"$HOME"}/video
 SFT_MODEL_PATH=${SFT_MODEL_PATH:-"$HOME/data/Openvla-oft-SFT-libero10-trajall"}
 
-# for rollout and train
 NUM_NODES=1
-# for simulator
-SIM_NODES=1
-NUM_ENV_GPUS=8
-NUM_ROLLOUT_GPUS=8
-STAGE_NUM=2
-BATCH_SIZE=16
+NUM_GPUS=8
+NUM_ENV_GPUS=4
 # rollout.n should equal to num_envs for isaac env
 ROLLOUT_N=8
-
-# 512 is required for libero benchmark, but you can reduce it in debugging to run faster
-MAX_EPISODE_STEPS=512
-
 # isaac or libero
 # libero means original libero benchmark with mujoco sim
 # isaac means libero benchmark using isaac sim
 SIM_TYPE=${SIM_TYPE:-"isaac"}
-PROJECT_NAME="vla-disagg-issac"
-EXPERIMENT_NAME="${SIM_TYPE}_rl"
+PROJECT_NAME="vla_libero_RL"
+EXPERIMENT_NAME="${SIM_TYPE}_reinforce_plus_plus"
 
 ISSC_PYTHON="/workspace/isaaclab/_isaac_sim/python.sh"
 PYTHON=python
@@ -42,28 +32,35 @@ fi
 
 # avoiding warnings
 mkdir /root/LIBERO/libero/libero/../datasets
+gpu_name=$(nvidia-smi --query-gpu=name --format=csv,noheader,nounits | head -n 1)
+
+# force osmesa in Hopper
+if echo "$gpu_name" | grep "NVIDIA H"; then
+    echo "enable MUJOCO_GL=osmesa in Hopper"
+    export MUJOCO_GL=osmesa
+fi
 
 
 $PYTHON -m verl.experimental.vla.main_ppo \
+    --config-path $CONFIG_DIR \
+    --config-name $CONFIG_NAME \
     data.train_files="$train_files" \
     data.val_files="$test_files" \
-    data.train_batch_size=${BATCH_SIZE} \
-    data.val_batch_size=${BATCH_SIZE} \
+    data.train_batch_size=8 \
+    data.val_batch_size=8 \
     actor_rollout_ref.rollout.n=$ROLLOUT_N \
     env.train.num_envs=$ROLLOUT_N \
     data.max_prompt_length=256 \
     data.max_response_length=128 \
-    env.rollout.pipeline_stage_num=$STAGE_NUM \
+    env.rollout.pipeline_stage_num=2 \
     env.train.simulator_type=$SIM_TYPE \
     env.actor.model.num_action_chunks=8 \
     env.actor.model.action_dim=7 \
     env.train.only_eval=False \
-    env.train.max_episode_steps=$MAX_EPISODE_STEPS \
+    env.train.max_episode_steps=512 \
     env.train.video_cfg.save_video=True \
     env.train.video_cfg.video_base_dir=${VIDEO_OUTPUT} \
     env.train.seed=42 \
-    env.disagg_sim.enable=True \
-    env.disagg_sim.nnodes=$SIM_NODES \
     +actor_rollout_ref.algorithm='grpo' \
     actor_rollout_ref.actor.fsdp_config.model_dtype=bfloat16 \
     actor_rollout_ref.model.path=$SFT_MODEL_PATH \
@@ -95,16 +92,15 @@ $PYTHON -m verl.experimental.vla.main_ppo \
     trainer.project_name=$PROJECT_NAME \
     trainer.experiment_name=$EXPERIMENT_NAME \
     trainer.default_local_dir=$OUTPUT_DIR \
-    trainer.n_gpus_per_node=$NUM_ROLLOUT_GPUS \
+    trainer.n_gpus_per_node=$NUM_GPUS \
     +trainer.n_env_gpus_per_node=$NUM_ENV_GPUS \
-    +trainer.n_rollout_gpus_per_node=$NUM_ROLLOUT_GPUS \
+    +trainer.n_rollout_gpus_per_node=$((NUM_GPUS - NUM_ENV_GPUS)) \
     trainer.nnodes=$NUM_NODES \
     trainer.save_freq=30 \
-    trainer.test_freq=-1 \
+    trainer.test_freq=30 \
     trainer.total_epochs=20 \
     trainer.val_only=False \
     trainer.total_training_steps=10000 \
     algorithm.adv_estimator=reinforce_plus_plus \
     trainer.val_before_train=False  $@
-
 

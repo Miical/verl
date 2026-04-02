@@ -1,46 +1,49 @@
 set -x
-libero_train_path=$HOME/data/libero_rl/libero_spatial/train.parquet
-libero_test_path=$HOME/data/libero_rl/libero_spatial/test.parquet
+CONFIG_DIR="./config"
+CONFIG_NAME="rob_sac_trainer.yaml"
+libero_train_path=/root/data/libero_rl/libero_spatial/task_2_pick_up_the_black_bowl_from_table_center_and_place_it_on_the_plate/train.parquet
+libero_test_path=/root/data/libero_rl/libero_spatial/task_2_pick_up_the_black_bowl_from_table_center_and_place_it_on_the_plate/test.parquet
 
 train_files=$libero_train_path
 test_files=$libero_test_path
 
-OUTPUT_DIR=${MLP_MODEL_OUTPUT:-"$HOME/models/vla_libero_grpo"}
-VIDEO_OUTPUT=${MLP_MODEL_OUTPUT:-"$HOME"}/video
-SFT_MODEL_PATH=${SFT_MODEL_PATH:-"$HOME/data/pi05_libero_torch"}
+OUTPUT_DIR=${MLP_MODEL_OUTPUT:-"/veRL/veRL/liujincheng/output/models/vla_libero_grpo"}
+VIDEO_OUTPUT=/home/miical/videos
+SFT_MODEL_PATH=${SFT_MODEL_PATH:-"/file_system/liujincheng/models/pi05_libero_torch"}
 TOKENIZER_PATH="$SFT_MODEL_PATH"
 
 # Physical Node Config
-NUM_GPUS=8                                     # total number of gpus per node
+NUM_GPUS=2                                     # total number of gpus per node
 
 # Role Config
 NUM_NODES=1                                    # number of nodes for rollout
 SIM_NODES=1                                    # number of nodes for sim                
-NUM_ENV_GPUS=4                                 # number of gpus for env workers per node
-NUM_ROLLOUT_GPUS=8                             # number of gpus for rollout workers per node
+NUM_ENV_GPUS=0                                 # number of gpus reserved for env workers per node
+NUM_ENV_WORKERS=1                              # number of env workers per node; set >0 even when NUM_ENV_GPUS=0 for CPU-only sim
+NUM_ROLLOUT_GPUS=2                             # number of gpus for rollout workers per node
 
 # Rollout Config
 # NOTE: TRAIN_BATCH_SIZE * ROLLOUT_N == NUM_ENV_GPUS * NUM_STAGE * NUM_ENV
-TRAIN_BATCH_SIZE=64                            # batch size for dataloaders per step
-ROLLOUT_N=1                                    # response number for each prompt (for GRPO)
-NUM_STAGE=2                                    # number of pipeline stages
-NUM_ENV=8                                      # number of envs per env worker
+TRAIN_BATCH_SIZE=1                             # batch size for dataloaders per step
+ROLLOUT_N=8                                    # response number for each prompt (for GRPO)
+NUM_STAGE=1                                    # number of pipeline stages
+NUM_ENV=1                                      # number of envs per env worker
 
 NUM_ACTION_CHUNKS=10                           # number of action chunks
-MAX_EPISODE_STEPS=220                          # max episode steps for each env
+MAX_EPISODE_STEPS=250                          # max episode steps for each env
                                                # max_interactions = MAX_EPISODE_STEPS / num_action_chunks
 
 # Training Config
-MINI_BATCH_SIZE=1024                           # mini batch size (batch size per GPU, automatically multiplied by ROLLOUT_N)
-MICRO_BATCH_SIZE=16                            # micro batch size (per GPU, for gradient accumulation, should divide MINI_BATCH_SIZE)
+MINI_BATCH_SIZE=4                             # mini batch size (batch size per GPU, automatically multiplied by ROLLOUT_N)
+MICRO_BATCH_SIZE=4                             # micro batch size (per GPU, for gradient accumulation, should divide MINI_BATCH_SIZE)
 
 
 
-# isaac or libero
-# libero means original libero benchmark with mujoco sim
-# isaac means libero benchmark using isaac sim
-SIM_TYPE=${SIM_TYPE:-"libero"}
-PROJECT_NAME="pi05-libero-sac"
+# libero, isaac, or lerobot
+# lerobot currently uses a scaffold env implementation for integration work
+SIM_TYPE=${SIM_TYPE:-"lerobot"}
+LEROBOT_CONFIG_PATH=${LEROBOT_CONFIG_PATH:-"/home/miical/Projects/myrob/hilserl/env_config.json"}
+PROJECT_NAME="pi05-lerobot-sac"
 EXPERIMENT_NAME="${SIM_TYPE}_reinforce_plus_plus"
 
 ISSC_PYTHON="/workspace/isaaclab/_isaac_sim/python.sh"
@@ -62,18 +65,24 @@ fi
 export VERL_LOGGING_LEVEL=INFO
 
 $PYTHON -m verl.experimental.vla.main_sac \
+    --config-path $CONFIG_DIR \
+    --config-name $CONFIG_NAME \
     data.train_files="$train_files" \
     data.val_files="$test_files" \
     data.train_batch_size=$TRAIN_BATCH_SIZE \
     data.val_batch_size=$TRAIN_BATCH_SIZE \
+    data.shuffle=True \
+    data.seed=55 \
     actor_rollout_ref.rollout.n=$ROLLOUT_N \
     env.train.num_envs=$NUM_ENV \
+    +env.train.single_env_rollout=True \
     data.max_prompt_length=256 \
     data.max_response_length=128 \
     env.disagg_sim.enable=True \
     env.disagg_sim.nnodes=$SIM_NODES \
     env.rollout.pipeline_stage_num=$NUM_STAGE \
     env.train.simulator_type=$SIM_TYPE \
+    env.train.lerobot_config_path=$LEROBOT_CONFIG_PATH \
     env.actor.model.num_action_chunks=$NUM_ACTION_CHUNKS \
     env.actor.model.action_dim=7 \
     env.train.only_eval=False \
@@ -119,11 +128,12 @@ $PYTHON -m verl.experimental.vla.main_sac \
     trainer.default_local_dir=$OUTPUT_DIR \
     trainer.n_gpus_per_node=$NUM_GPUS \
     +trainer.n_env_gpus_per_node=$NUM_ENV_GPUS \
+    +trainer.n_env_workers_per_node=$NUM_ENV_WORKERS \
     +trainer.n_rollout_gpus_per_node=$NUM_ROLLOUT_GPUS \
     +trainer.rollout_interval=20 \
     trainer.nnodes=$NUM_NODES \
     trainer.save_freq=500 \
-    trainer.test_freq=10 \
+    trainer.test_freq=-1 \
     trainer.total_epochs=1000 \
     trainer.val_only=False \
     algorithm.adv_estimator=reinforce_plus_plus \
