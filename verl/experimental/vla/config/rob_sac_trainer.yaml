@@ -43,6 +43,7 @@ env:
 actor_rollout_ref:
   model:
     override_config:
+      policy_type: lerobot
       sac_enable: True
       flow_sde_enable: True
       flow_sde_noise_level: 0.065

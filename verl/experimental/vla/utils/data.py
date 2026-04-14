@@ -30,6 +30,25 @@ def get_dataproto_from_prefix(data: DataProto, prefix: str, separator: str = "")
     return DataProto.from_dict(tensors=tensor_batch, non_tensors=non_tensor_batch, meta_info=data.meta_info)
 
 
+def get_dataproto_keys_by_prefix(data: DataProto, prefixes: tuple[str, ...]) -> tuple[list[str], list[str]]:
+    """Collect DataProto keys whose names start with any of the given prefixes.
+
+    Returns:
+        A tuple of (batch_keys, non_tensor_batch_keys).
+    """
+
+    def _key_has_prefix(key: str | tuple) -> bool:
+        if isinstance(key, tuple):
+            key_name = ".".join(str(part) for part in key)
+        else:
+            key_name = str(key)
+        return key_name.startswith(prefixes)
+
+    batch_keys = [key for key in data.batch.keys() if _key_has_prefix(key)]
+    non_tensor_batch_keys = [key for key in data.non_tensor_batch.keys() if _key_has_prefix(key)]
+    return batch_keys, non_tensor_batch_keys
+
+
 def slice_dataproto_batch(data: DataProto, start: int, end: int) -> DataProto:
     return DataProto.from_dict(
         tensors={key: value[:, start:end] for key, value in data.batch.items()},

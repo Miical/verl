@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from typing import Any
+
 import torch
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from omegaconf import OmegaConf
@@ -20,6 +22,45 @@ class RobSFTActor:
         self.processor = processor
         self.actor_module.sft_init()
         self.device = get_device_name()
+        actor_cfg = self.config.actor if hasattr(self.config, "actor") else self.config
+        ema_enabled = actor_cfg.get("actor_ema_enabled", self.config.get("actor_ema_enabled", True))
+        ema_decay = actor_cfg.get("actor_ema_decay", self.config.get("actor_ema_decay", 0.995))
+        self.actor_ema_enabled = bool(ema_enabled)
+        self.actor_ema_decay = float(ema_decay)
+        self.actor_ema_shadow: dict[str, torch.Tensor] = {}
+        self.actor_ema_initialized = False
+
+    def _init_actor_ema(self):
+        if self.actor_ema_initialized:
+            return
+
+        self.actor_ema_shadow = {}
+        if not self.actor_ema_enabled:
+            self.actor_ema_initialized = True
+            return
+
+        for name, param in self.actor_module.named_parameters():
+            self.actor_ema_shadow[name] = param.detach().clone().to(dtype=torch.float32)
+        self.actor_ema_initialized = True
+
+    @torch.no_grad()
+    def _update_actor_ema(self):
+        if not self.actor_ema_enabled:
+            return
+
+        one_minus_decay = 1.0 - self.actor_ema_decay
+        for name, param in self.actor_module.named_parameters():
+            shadow = self.actor_ema_shadow[name]
+            shadow.mul_(self.actor_ema_decay).add_(param.detach().to(dtype=torch.float32), alpha=one_minus_decay)
+
+    @torch.no_grad()
+    def _apply_actor_ema_to_actor_module(self):
+        if not self.actor_ema_enabled:
+            return
+
+        for name, param in self.actor_module.named_parameters():
+            shadow = self.actor_ema_shadow[name]
+            param.copy_(shadow.to(device=param.device, dtype=param.dtype))
 
     def _extract_obs(self, micro_batch: DataProto) -> DataProto:
         return micro_batch
@@ -42,9 +83,19 @@ class RobSFTActor:
         if batch is not None and "info.valids" in batch:
             return batch["info.valids"].float()
         return torch.ones(len(micro_batch), device=get_device_id(), dtype=torch.float32)
+    
+    
+    def _force_set_lr(self, opt: torch.optim.Optimizer, lr: float):
+        for pg in opt.param_groups:
+            pg["lr"] = lr
 
     def update_policy(self, data: DataProto) -> dict[str, float]:
+        if not self.actor_ema_initialized:
+            self._init_actor_ema()
+
         self.actor_module.train()
+
+        self._force_set_lr(self.actor_optimizer, 5e-5)
 
         actor_config = self.config.actor
         mini_batch_size = int(actor_config.ppo_mini_batch_size)
@@ -83,6 +134,8 @@ class RobSFTActor:
 
         grad_norm = torch.nn.utils.clip_grad_norm_(self.actor_module.parameters(), max_norm=actor_config.grad_clip)
         self.actor_optimizer.step()
+        self._update_actor_ema()
+        self._apply_actor_ema_to_actor_module()
 
         if isinstance(self.actor_module, FSDP):
             torch.cuda.empty_cache()
@@ -92,6 +145,8 @@ class RobSFTActor:
         return {
             "loss": mean_loss,
             "grad_norm": grad_norm_value,
+            "sft/actor_ema_enabled": float(self.actor_ema_enabled),
+            "sft/actor_ema_decay": self.actor_ema_decay,
         }
 
     def summary(self) -> dict[str, Any]:

@@ -125,15 +125,15 @@ class LeRobotEnv(gym.Env):
         )
 
     def _task_description(self, task_id: int) -> str:
-        return f"lerobot_task_{task_id}"
+        return f"Grab the white objects and put them in the plate."
 
     def _wrap_runtime_obs(self, runtime_obs: dict) -> dict:
         return {
             "images_and_states": to_tensor(
                 {
-                    "full_image": runtime_obs["observation.images.top"].permute(0, 2, 3, 1),
-                    "wrist_image": runtime_obs["observation.images.wrist"].permute(0, 2, 3, 1),
-                    "state": runtime_obs["observation.state"],
+                    "observation.images.top": runtime_obs["observation.images.top"],
+                    "observation.images.wrist": runtime_obs["observation.images.wrist"],
+                    "observation.state": runtime_obs["observation.state"],
                 }
             ),
             "task_descriptions": list(self.task_descriptions),
@@ -141,8 +141,8 @@ class LeRobotEnv(gym.Env):
 
     def add_new_frames(self, obs, plot_infos):
         info_item = {k: v if np.size(v) == 1 else v[0] for k, v in plot_infos.items()}
-        top_image = (obs["images_and_states"]["full_image"][0].detach().cpu().numpy() * 255).clip(0, 255).astype(np.uint8)
-        wrist_image = (obs["images_and_states"]["wrist_image"][0].detach().cpu().numpy() * 255).clip(0, 255).astype(np.uint8)
+        top_image = (obs["images_and_states"]["observation.images.top"].permute(0, 2, 3, 1)[0].detach().cpu().numpy() * 255).clip(0, 255).astype(np.uint8)
+        wrist_image = (obs["images_and_states"]["observation.images.wrist"].permute(0, 2, 3, 1)[0].detach().cpu().numpy() * 255).clip(0, 255).astype(np.uint8)
         top_image = put_info_on_image(top_image, info_item)
         wrist_image = put_info_on_image(wrist_image, info_item)
         self.render_images.append(np.concatenate([top_image, wrist_image], axis=1))

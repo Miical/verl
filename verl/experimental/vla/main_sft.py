@@ -37,9 +37,7 @@ def main(config):
         ray_init_kwargs = OmegaConf.create({**ray_init_kwargs, "runtime_env": runtime_env})
         logger.info(f"ray init kwargs: {ray_init_kwargs}")
         ray.init(**OmegaConf.to_container(ray_init_kwargs))
-    task_options = {"num_cpus": 1}
-    task_options["resources"] = {"train_rollout": 0.001}
-    ray.get(main_task.options(**task_options).remote(config))
+    ray.get(main_task.remote(config))
 
 
 @ray.remote

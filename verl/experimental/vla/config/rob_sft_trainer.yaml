@@ -32,6 +32,8 @@ actor_rollout_ref:
       attn_implementation: eager
   actor:
     strategy: fsdp2
+    actor_ema_enabled: False 
+    actor_ema_decay: 0.995
     ppo_mini_batch_size: 2
     ppo_micro_batch_size_per_gpu: 1
     grad_clip: 1.0

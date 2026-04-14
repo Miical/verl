@@ -8,6 +8,7 @@ import time
 
 import draccus
 import gymnasium as gym
+import numpy as np
 
 from lerobot.rl.gym_manipulator import (
     GymManipulatorConfig, 
@@ -58,11 +59,6 @@ def step_env_and_process_transition(
         Processed transition with updated state.
     """
 
-    raw = env.get_raw_joint_positions()
-    neutral_action = torch.tensor(
-        [raw[f"{k}.pos"] for k in env.robot.bus.motors], dtype=torch.float32
-    )
-    action = neutral_action
     # Create action transition
     transition[TransitionKey.ACTION] = action
     transition[TransitionKey.OBSERVATION] = (

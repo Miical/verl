@@ -31,6 +31,7 @@ from verl.experimental.vla.sac.replay_pool import SACReplayPool
 from verl.experimental.vla.sac.base import BaseSACActor, SupportSACTraining
 from verl.experimental.vla.utils.data import (
     get_dataproto_from_prefix,
+    get_dataproto_keys_by_prefix,
     split_nested_dicts_or_tuples,
     valid_mean,
 )
@@ -336,26 +337,15 @@ class RobDataParallelSACActor(BaseSACActor):
 
         if "empty_batch" not in data.meta_info:
             task_ids = data.batch["info.task_ids"]
+            replay_batch_keys, replay_non_tensor_batch_keys = get_dataproto_keys_by_prefix(
+                data,
+                prefixes=("t0.", "t1.", "info."),
+            )
+
             self.replay_pool.add_batch(
                 data.select(
-                    batch_keys=[
-                        "t0.obs.state",
-                        "t0.obs.full_image",
-                        "t0.obs.wrist_image",
-                        "t0.action.action",
-                        "info.rewards",
-                        "info.dones",
-                        "info.valids",
-                        "info.positive_sample_mask",
-                        "t1.obs.state",
-                        "t1.obs.full_image",
-                        "t1.obs.wrist_image",
-                        "t1.action.action",
-                    ],
-                    non_tensor_batch_keys=[
-                        "t0.obs.task_descriptions", 
-                        "t1.obs.task_descriptions"
-                    ],
+                    batch_keys=replay_batch_keys,
+                    non_tensor_batch_keys=replay_non_tensor_batch_keys,
                 ),
                 task_ids=task_ids,
             )

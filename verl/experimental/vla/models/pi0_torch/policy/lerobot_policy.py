@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
+
 from typing_extensions import override
 
 import torch
@@ -27,6 +29,8 @@ LEROBOT_IMAGE_CROP_SIZE = 480
 
 
 class LerobotPi0Input(Pi0Input):
+    _debug_dump_count = 0
+
     @staticmethod
     def _center_crop(image: torch.Tensor, crop_size: int) -> torch.Tensor:
         image = image.detach().cpu().float().squeeze()
@@ -44,6 +48,53 @@ class LerobotPi0Input(Pi0Input):
             mode="bilinear",
             align_corners=False,
         ).squeeze(0)
+
+    @staticmethod
+    def _save_debug_image(image: torch.Tensor, image_path: str):
+        image = image.detach().cpu().float()
+        if image.ndim == 4:
+            image = image[0]
+
+        if image.max() > 1.0:
+            image = image / 255.0
+        image = image.clamp(0.0, 1.0)
+        image_uint8 = (image * 255.0).to(torch.uint8).permute(1, 2, 0).numpy()
+
+        try:
+            from PIL import Image
+
+            Image.fromarray(image_uint8).save(image_path)
+        except Exception:
+            torch.save(image, image_path + ".pt")
+
+    @classmethod
+    def _debug_dump_inputs(
+        cls,
+        cam_high: torch.Tensor,
+        left_wrist: torch.Tensor,
+        state: torch.Tensor,
+        task: list,
+    ):
+        debug_max_dumps = int(os.getenv("VERL_PI0_DEBUG_MAX_DUMPS", "200"))
+        if cls._debug_dump_count >= debug_max_dumps:
+            return
+
+        debug_dir = os.getenv("VERL_PI0_DEBUG_DIR", "./outputs/pi0_input_debug")
+        os.makedirs(debug_dir, exist_ok=True)
+
+        dump_id = cls._debug_dump_count
+        cls._debug_dump_count += 1
+
+        print(
+            f"[Pi0Input Debug] dump_id={dump_id}, cam_high={tuple(cam_high.shape)}, "
+            f"left_wrist={tuple(left_wrist.shape)}, state={tuple(state.shape)}"
+        )
+        if len(task) > 0:
+            print(f"[Pi0Input Debug] task[0]={task[0]}")
+            print(f"[Pi0Input Debug] state[0]={state[0].detach().cpu().tolist()}")
+
+        cls._save_debug_image(cam_high[0], os.path.join(debug_dir, f"dump_{dump_id:06d}_cam_high.png"))
+        cls._save_debug_image(left_wrist[0], os.path.join(debug_dir, f"dump_{dump_id:06d}_left_wrist.png"))
 
     @override
     @classmethod
@@ -86,12 +137,20 @@ class LerobotPi0Input(Pi0Input):
         ]
 
         # Process other data
-        input.task = list(env_obs.non_tensor_batch["task"])
+        task_key = "task_descriptions" if "task_descriptions" in env_obs.non_tensor_batch else "task"
+        input.task = list(env_obs.non_tensor_batch[task_key])
 
         state = env_obs.batch["observation.state"]
         input.state = torch.nn.functional.pad(
             state, (0, max(0, PI0_MAX_STATE_DIM - state.shape[-1])), "constant", 0
         ).to(device=device, dtype=torch.float32)
+
+        # cls._debug_dump_inputs(
+        #     cam_high=input.images["observation.images.cam_high"],
+        #     left_wrist=input.images["observation.images.cam_left_wrist"],
+        #     state=input.state,
+        #     task=input.task,
+        # )
 
         return input
 
